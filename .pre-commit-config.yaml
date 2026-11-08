@@ -1,0 +1,53 @@
+# Pre-commit hooks — see https://pre-commit.com
+# Install: pre-commit install   |   Update: pre-commit autoupdate
+exclude: >-
+  (^node_modules/|^packages/web/node_modules/|^packages/web/dist/|^dist/)
+repos:
+  # ---- Secret scanning (the reason this file exists) ----
+  # Local hook: gitleaks binary must be on PATH (avoids Go toolchain download,
+  # which proxy.golang.org blocks on this machine). Install:
+  #   curl -LO https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_windows_x64.zip
+  - repo: local
+    hooks:
+      - id: gitleaks
+        name: gitleaks (secret scanning)
+        description: Detect hardcoded secrets in staged changes
+        entry: gitleaks git --pre-commit --redact --staged --verbose
+        language: system
+        pass_filenames: false
+
+  # ---- Commit hygiene (CLAUDE.md convention 14) ----
+  # Policy lives in .commit-hygiene.toml; the same script also runs in the CI
+  # `hygiene` job (which is what covers server-side/agent commits — a local
+  # hook cannot be installed in someone else's clone).
+  - repo: local
+    hooks:
+      - id: commit-identity
+        name: commit identity (email policy)
+        description: Reject author/committer emails containing a banned substring
+        entry: python scripts/check_commit_hygiene.py identity
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: url-policy
+        name: URL policy (example-family hosts)
+        description: Reject URL hosts that are neither example-family nor allowlisted
+        entry: python scripts/check_commit_hygiene.py urls
+        language: system
+        pass_filenames: true
+        types: [text]
+
+  # ---- Basic hygiene ----
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ["--maxkb=2048"]
+        # Vendored tree-sitter grammars for the offline container image are
+        # intentional binaries; libtree_sitter_c_sharp.so alone is ~6 MB.
+        exclude: ^docker/ts-grammars/
+      - id: check-merge-conflict
+      - id: check-toml

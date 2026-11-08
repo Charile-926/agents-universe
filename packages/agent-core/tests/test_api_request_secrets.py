@@ -1,0 +1,535 @@
+"""Tests for api_request secret resolution (user tokens + multi-secret auth)."""
+import base64
+import json
+
+from unittest.mock import AsyncMock, Mock, patch
+
+import httpx
+
+import pytest
+
+from agent_core.tools.api_request import ApiRequestTool
+from api_request_fakes import FakeResponse, FakeSession, _mock_stream_response, make_context
+
+
+async def _run(params, http, session=None):
+    return await ApiRequestTool().execute(params, make_context(http=http, session=session))
+
+
+def _sent_headers(http) -> dict:
+    return http.stream.call_args.kwargs["headers"]
+
+
+@pytest.mark.asyncio
+async def test_user_scope_bearer_resolves_token():
+    http = _mock_stream_response(AsyncMock(), FakeResponse(200, {"ok": True}))
+    session = FakeSession()
+
+    with patch("agent_core.tools._auth.get_token_optional", new=AsyncMock(return_value="tok-123")):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/health",
+                "base_url": "https://api.example.com",
+                "auth_type": "bearer",
+                "secret_ref": "svc:token",
+                "secret_scope": "user",
+            },
+            http,
+            session,
+        )
+
+    assert result["status"] == 200
+    assert _sent_headers(http)["Authorization"] == "Bearer tok-123"
+    assert session.calls == []  # no prompt needed when token exists
+
+
+@pytest.mark.asyncio
+async def test_string_numeric_params_coerced_to_int():
+    """LLM 常把数字参数传成字符串（"30000"）——str/int 混比此前直接抛
+    TypeError 让整个调用失败。字符串必须被 int() 后再夹取。"""
+    http = _mock_stream_response(AsyncMock(), FakeResponse(200, {"ok": True}))
+
+    with patch("agent_core.tools._auth.get_token_optional", new=AsyncMock(return_value="tok")):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/health",
+                "base_url": "https://api.example.com",
+                "max_response_chars": "30000",
+                "timeout_seconds": "45",
+            },
+            http,
+            session=FakeSession(),
+        )
+
+    assert result["status"] == 200
+    assert http.stream.call_args.kwargs["timeout"] == 45.0
+
+
+@pytest.mark.asyncio
+async def test_string_numeric_params_fallback_on_garbage():
+    """不可解析的字符串（"abc"）回退默认值，而不是 500 或 TypeError。"""
+    http = _mock_stream_response(AsyncMock(), FakeResponse(200, {"ok": True}))
+
+    with patch("agent_core.tools._auth.get_token_optional", new=AsyncMock(return_value="tok")):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/health",
+                "base_url": "https://api.example.com",
+                "max_response_chars": "abc",
+                "timeout_seconds": None,
+            },
+            http,
+            session=FakeSession(),
+        )
+
+    assert result["status"] == 200
+    assert http.stream.call_args.kwargs["timeout"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_user_scope_missing_token_prompts_with_user_vault_flag():
+    http = _mock_stream_response(AsyncMock(), FakeResponse(200, {"ok": True}))
+    session = FakeSession(result="secret_saved")
+
+    with patch(
+        "agent_core.tools._auth.get_token_optional",
+        new=AsyncMock(side_effect=[None, "tok-after-prompt"]),
+    ):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/health",
+                "base_url": "https://api.example.com",
+                "auth_type": "bearer",
+                "secret_ref": "svc:token",
+                "secret_scope": "user",
+            },
+            http,
+            session,
+        )
+
+    assert result["status"] == 200
+    prompt = session.calls[0]
+    assert prompt["service_key"] == "svc:token"
+    assert prompt["secret"] is True
+    assert prompt["save_to_user_tokens"] is True
+    assert prompt["save_to_project_secrets"] is False
+    assert _sent_headers(http)["Authorization"] == "Bearer tok-after-prompt"
+
+
+@pytest.mark.asyncio
+async def test_project_scope_missing_token_prompts_to_project_secrets():
+    http = _mock_stream_response(AsyncMock(), FakeResponse(200, {"ok": True}))
+    session = FakeSession(result="secret_saved")
+
+    with patch(
+        "agent_core.tools._auth.get_secret_optional",
+        new=AsyncMock(side_effect=[None, "proj-secret"]),
+    ):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/health",
+                "base_url": "https://api.example.com",
+                "auth_type": "bearer",
+                "secret_ref": "svc:token",
+                "secret_scope": "project",
+            },
+            http,
+            session,
+        )
+
+    assert result["status"] == 200
+    prompt = session.calls[0]
+    assert prompt["save_to_project_secrets"] is True
+    assert prompt["save_to_user_tokens"] is False
+    assert _sent_headers(http)["Authorization"] == "Bearer proj-secret"
+
+
+@pytest.mark.asyncio
+async def test_basic_auth_uses_multi_secret_refs():
+    http = _mock_stream_response(AsyncMock(), FakeResponse(200, {"ok": True}))
+
+    with patch(
+        "agent_core.tools._auth.get_token_optional",
+        new=AsyncMock(side_effect=["svc-user", "svc-pass"]),
+    ):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/health",
+                "base_url": "https://api.example.com",
+                "auth_type": "basic",
+                "secret_refs": {"username": "svc:user", "password": "svc:pass"},
+                "secret_scope": "user",
+            },
+            http,
+        )
+
+    assert result["status"] == 200
+    expected = "Basic " + base64.b64encode(b"svc-user:svc-pass").decode()
+    assert _sent_headers(http)["Authorization"] == expected
+
+
+@pytest.mark.asyncio
+async def test_custom_header_with_multi_secret_template():
+    http = _mock_stream_response(AsyncMock(), FakeResponse(200, {"ok": True}))
+
+    with patch(
+        "agent_core.tools._auth.get_token_optional",
+        new=AsyncMock(side_effect=["u1", "p1"]),
+    ):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/health",
+                "base_url": "https://api.example.com",
+                "auth_type": "custom_header",
+                "auth_header_name": "X-Service-Auth",
+                "auth_prefix": "{username}:{password}",
+                "secret_refs": {"username": "svc:user", "password": "svc:pass"},
+                "secret_scope": "user",
+            },
+            http,
+        )
+
+    assert result["status"] == 200
+    assert _sent_headers(http)["X-Service-Auth"] == "u1:p1"
+
+
+@pytest.mark.asyncio
+async def test_body_field_auth_injects_json_body():
+    http = _mock_stream_response(AsyncMock(), FakeResponse(200, {"ok": True}))
+
+    params = {
+        "integration_key": "svc",
+        "method": "POST",
+        "path": "/submit",
+        "base_url": "https://api.example.com",
+        "auth_type": "body_field",
+        "auth_field_name": "apiKey",
+        "secret_ref": "svc:key",
+        "secret_scope": "user",
+        "json_body": {"q": 1},
+    }
+    with patch("agent_core.tools._auth.get_token_optional", new=AsyncMock(return_value="k-9")):
+        result = await _run(
+            params,
+            http,
+            FakeSession(),  # POST → confirmation gate; auto-allow it
+        )
+
+    assert result["status"] == 200
+    assert http.stream.call_args.kwargs["json"] == {"q": 1, "apiKey": "k-9"}
+    # The caller's params dict is the tool_call args: persisted to the DB,
+    # streamed to the UI and replayed into history. Injecting the secret by
+    # aliasing it leaked the plaintext there.
+    assert params["json_body"] == {"q": 1}
+
+
+@pytest.mark.asyncio
+async def test_missing_secret_after_prompt_returns_error():
+    session = FakeSession(result="secret_saved")
+
+    with patch("agent_core.tools._auth.get_token_optional", new=AsyncMock(return_value=None)):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/health",
+                "base_url": "https://api.example.com",
+                "auth_type": "bearer",
+                "secret_ref": "svc:token",
+                "secret_scope": "user",
+            },
+            AsyncMock(),
+            session,
+        )
+
+    assert "not available after prompt" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_api_request_no_confirm_keeps_prod_gate():
+    """api_request_no_confirm 只绕过写操作确认，prd 环境的确认保留。"""
+    http = _mock_stream_response(AsyncMock(), FakeResponse(200, {"ok": True}))
+    session = FakeSession(result="allow")
+    ctx = make_context(http=http, session=session)
+    ctx.api_request_no_confirm = True
+
+    result = await ApiRequestTool().execute(
+        {
+            "integration_key": "svc",
+            "method": "POST",
+            "path": "/submit",
+            "base_url": "https://api.example.com",
+            "environment": "prd",
+            "auth_type": "none",
+            "json_body": {"q": 1},
+        },
+        ctx,
+    )
+
+    assert result["status"] == 200
+    assert len(session.calls) == 1  # prd 环境仍走确认门
+
+
+@pytest.mark.asyncio
+async def test_headers_only_redacts_secret_values():
+    """headers_only responses must scrub resolved secret VALUES like the
+    text/json bodies — an echo-anything gateway would otherwise leak the
+    token via a header (Authorization echoed back, etc.)."""
+    http = _mock_stream_response(
+        AsyncMock(),
+        FakeResponse(
+            200,
+            headers={
+                "content-type": "application/json",
+                "x-echo": "Bearer tok-123",
+                "x-other": "harmless",
+                "set-cookie": "session=abc",
+            },
+        ),
+    )
+
+    with patch("agent_core.tools._auth.get_token_optional", new=AsyncMock(return_value="tok-123")):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/health",
+                "base_url": "https://api.example.com",
+                "auth_type": "bearer",
+                "secret_ref": "svc:token",
+                "secret_scope": "user",
+                "response_mode": "headers_only",
+            },
+            http,
+        )
+
+    assert result["headers"]["x-echo"] == "Bearer [REDACTED:_default]"
+    assert result["headers"]["x-other"] == "harmless"
+    assert "set-cookie" not in result["headers"]
+
+
+@pytest.mark.asyncio
+async def test_stringified_path_params_coerce_to_dict():
+    """LLM 把对象参数传成 JSON 字符串时不能抛 AttributeError，而应正常解析。"""
+    http = _mock_stream_response(AsyncMock(), FakeResponse(200, {"ok": True}))
+
+    with patch("agent_core.tools._auth.get_token_optional", new=AsyncMock(return_value="tok")):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/users/{id}",
+                "base_url": "https://api.example.com",
+                "path_params": '{"id": "42"}',
+            },
+            http,
+            session=FakeSession(),
+        )
+
+    assert result["status"] == 200
+    assert http.stream.call_args.args[1] == "https://api.example.com/users/42"
+
+
+@pytest.mark.asyncio
+async def test_stringified_query_params_coerce_to_dict():
+    http = _mock_stream_response(AsyncMock(), FakeResponse(200, {"ok": True}))
+
+    with patch("agent_core.tools._auth.get_token_optional", new=AsyncMock(return_value="tok")):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/search",
+                "base_url": "https://api.example.com",
+                "query_params": '{"q": "alpha", "limit": "10"}',
+            },
+            http,
+            session=FakeSession(),
+        )
+
+    assert result["status"] == 200
+    assert http.stream.call_args.kwargs["params"] == {"q": "alpha", "limit": "10"}
+
+
+@pytest.mark.asyncio
+async def test_unparseable_dict_field_returns_clear_error():
+    """不可解析的字符串必须返回工具错误，而不是异常传播成泛化失败。"""
+    http = _mock_stream_response(AsyncMock(), FakeResponse(200, {"ok": True}))
+
+    result = await _run(
+        {
+            "integration_key": "svc",
+            "method": "GET",
+            "path": "/x",
+            "base_url": "https://api.example.com",
+            "path_params": "not-a-dict",
+        },
+        http,
+        session=FakeSession(),
+    )
+
+    assert "must be a JSON object" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_stringified_secret_refs_coerce_to_dict():
+    http = _mock_stream_response(AsyncMock(), FakeResponse(200, {"ok": True}))
+
+    with patch(
+        "agent_core.tools._auth.get_token_optional",
+        new=AsyncMock(side_effect=["svc-user", "svc-pass"]),
+    ):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/health",
+                "base_url": "https://api.example.com",
+                "auth_type": "basic",
+                "secret_refs": '{"username": "svc:user", "password": "svc:pass"}',
+                "secret_scope": "user",
+            },
+            http,
+        )
+
+    assert result["status"] == 200
+    expected = "Basic " + base64.b64encode(b"svc-user:svc-pass").decode()
+    assert _sent_headers(http)["Authorization"] == expected
+
+
+@pytest.mark.asyncio
+async def test_illegal_header_error_does_not_echo_secret():
+    """h11 puts the offending header value in LocalProtocolError, and a stored
+    secret with a control character is rejected as an illegal header value —
+    the tool returned and logged that message verbatim, printing the secret
+    into the LLM context, the message history and the server log."""
+    secret = "sk-live-SUPERSECRET123\n"
+    http = AsyncMock()
+    http.stream = Mock(
+        side_effect=httpx.LocalProtocolError(
+            f"Illegal header value {('Bearer ' + secret).encode()!r}"
+        )
+    )
+
+    with patch(
+        "agent_core.tools._auth.get_token_optional", new=AsyncMock(return_value=secret)
+    ):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/health",
+                "base_url": "https://api.example.com",
+                "auth_type": "bearer",
+                "secret_ref": "svc:token",
+                "secret_scope": "user",
+            },
+            http,
+        )
+
+    blob = json.dumps(result)
+    assert "SUPERSECRET" not in blob, blob
+    assert "[REDACTED" in blob  # the rest of the message is still reported
+
+
+@pytest.mark.asyncio
+async def test_invalid_url_error_is_structured_and_redacts_secrets():
+    """httpx.InvalidURL is not a RequestError; it escaped execute() as an
+    unhandled exception. Its message quotes the URL, so secrets in it must be
+    scrubbed before the message reaches the LLM."""
+    secret = "sk-live-SUPERSECRET123"
+    http = AsyncMock()
+    http.stream = Mock(
+        side_effect=httpx.InvalidURL(f"Invalid character in URL: '{secret}'")
+    )
+
+    with patch(
+        "agent_core.tools._auth.get_token_optional", new=AsyncMock(return_value=secret)
+    ):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/health",
+                "base_url": "https://api.example.com",
+                "auth_type": "bearer",
+                "secret_ref": "svc:token",
+                "secret_scope": "user",
+            },
+            http,
+        )
+
+    assert "Invalid request URL" in result["error"]
+    assert "SUPERSECRET" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_non_ascii_header_value_returns_structured_error():
+    """httpx encodes header values as ASCII; a non-ASCII secret raised an
+    uncaught UnicodeEncodeError instead of an actionable result."""
+    http = AsyncMock()
+    http.stream = Mock(
+        side_effect=UnicodeEncodeError("ascii", "ключ", 0, 1, "ordinal not in range(128)")
+    )
+
+    with patch(
+        "agent_core.tools._auth.get_token_optional", new=AsyncMock(return_value="ключ")
+    ):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/health",
+                "base_url": "https://api.example.com",
+                "auth_type": "bearer",
+                "secret_ref": "svc:token",
+                "secret_scope": "user",
+            },
+            http,
+        )
+
+    assert "ASCII" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("template", ["{username!q}", "{}"])
+async def test_malformed_auth_prefix_returns_error_instead_of_raising(template):
+    """str.format raises more than KeyError: a bad conversion (`!q`) is a
+    ValueError and a positional `{}` is an IndexError; both escaped as tool
+    crashes."""
+    http = _mock_stream_response(AsyncMock(), FakeResponse(200, {"ok": True}))
+
+    with patch(
+        "agent_core.tools._auth.get_token_optional", new=AsyncMock(return_value="u1")
+    ):
+        result = await _run(
+            {
+                "integration_key": "svc",
+                "method": "GET",
+                "path": "/health",
+                "base_url": "https://api.example.com",
+                "auth_type": "custom_header",
+                "auth_header_name": "X-Service-Auth",
+                "auth_prefix": template,
+                "secret_refs": {"username": "svc:user"},
+                "secret_scope": "user",
+            },
+            http,
+        )
+
+    assert "auth_prefix" in result["error"]
+    assert "u1" not in result["error"]

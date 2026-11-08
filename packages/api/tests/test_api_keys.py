@@ -1,0 +1,158 @@
+"""Tests for POST /api/tokens... (provider API key) test endpoint — the
+raw SDK exception must never leak the key value back to the client."""
+
+from __future__ import annotations
+
+import importlib
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    ("provider", "client_attr"),
+    [("openai", "AsyncOpenAI"), ("anthropic", "AsyncAnthropic")],
+)
+async def test_api_key_test_closes_the_sdk_client_on_success(
+    client, monkeypatch, provider, client_attr
+):
+    """The SDK client owns a pooled httpx client; a connectivity test that
+    never closes it leaks a connection pool per call."""
+    resp = await client.put(
+        f"/api/api-keys/{provider}", json={"value": "test-key-1234567890"}
+    )
+    assert resp.status_code == 200
+
+    module = importlib.import_module(provider)
+    closed: list[bool] = []
+
+    class _Models:
+        async def list(self):
+            return []
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.models = _Models()
+
+        async def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(module, client_attr, _FakeClient)
+
+    resp = await client.post(f"/api/api-keys/{provider}/test")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is True
+    assert closed == [True]
+
+
+@pytest.mark.parametrize(
+    ("provider", "client_attr"),
+    [("openai", "AsyncOpenAI"), ("anthropic", "AsyncAnthropic")],
+)
+async def test_api_key_test_closes_the_sdk_client_on_failure(
+    client, monkeypatch, provider, client_attr
+):
+    resp = await client.put(
+        f"/api/api-keys/{provider}", json={"value": "test-key-1234567890"}
+    )
+    assert resp.status_code == 200
+
+    module = importlib.import_module(provider)
+    closed: list[bool] = []
+
+    class _Models:
+        async def list(self):
+            raise RuntimeError("provider rejected the key")
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.models = _Models()
+
+        async def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(module, client_attr, _FakeClient)
+
+    resp = await client.post(f"/api/api-keys/{provider}/test")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is False
+    assert closed == [True]
+
+
+@pytest.mark.parametrize(
+    ("provider", "client_attr"),
+    [("openai", "AsyncOpenAI"), ("anthropic", "AsyncAnthropic")],
+)
+async def test_api_key_test_bounds_the_sdk_timeout(
+    client, monkeypatch, provider, client_attr
+):
+    """The SDK default is a 600s read timeout while this handler holds a
+    pooled DB connection for the whole request — a blackholed provider would
+    pin a pool slot for ten minutes and, under concurrent tests, exhaust the
+    pool app-wide."""
+    resp = await client.put(
+        f"/api/api-keys/{provider}", json={"value": "test-key-1234567890"}
+    )
+    assert resp.status_code == 200
+
+    module = importlib.import_module(provider)
+    captured: dict = {}
+
+    class _Models:
+        async def list(self):
+            return []
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+            self.models = _Models()
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(module, client_attr, _FakeClient)
+
+    resp = await client.post(f"/api/api-keys/{provider}/test")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is True
+    assert captured.get("timeout") is not None
+    assert captured["timeout"] <= 60
+
+
+async def test_api_key_test_does_not_leak_key_in_error(client):
+    """OpenAI's 401 body echoes the key ('Incorrect API key provided: sk-...')
+    — the endpoint must return a sanitized error, not the SDK exception text."""
+    # Configure a key.
+    resp = await client.put("/api/api-keys/openai", json={"value": "sk-leakme-1234567890"})
+    assert resp.status_code == 200
+
+    class _FakeOpenAIError(Exception):
+        def __str__(self):
+            return "Incorrect API key provided: sk-leakme-1234567890. You can find your API key at https://platform.openai.com/api-keys"
+
+    import api.routers.api_keys as mod
+
+    class _FakeAsyncOpenAI:
+        def __init__(self, *a, **k):
+            pass
+
+        async def models(self):
+            raise _FakeOpenAIError("bad key")
+
+    original = mod.AsyncOpenAI if hasattr(mod, "AsyncOpenAI") else None
+    mod.AsyncOpenAI = _FakeAsyncOpenAI
+    try:
+        resp = await client.post("/api/api-keys/openai/test")
+    finally:
+        if original:
+            mod.AsyncOpenAI = original
+        else:
+            del mod.AsyncOpenAI
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    # The key value must not appear anywhere in the response.
+    assert "sk-leakme-1234567890" not in str(body)
+    assert "leakme" not in str(body)
+    # A useful, generic error is returned.
+    assert body["error"]

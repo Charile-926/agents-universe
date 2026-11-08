@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  agent-core:
+    name: agent-core (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          cd packages/agent-core
+          pip install -e ".[test]"
+      # The browser tests launch a real headless Chromium; without this the
+      # whole module skips (7 tests) and the bbox math they pin goes
+      # unverified. Cached on pyproject.toml so a Playwright bump refetches.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('packages/agent-core/pyproject.toml') }}
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+      - name: Test
+        run: |
+          cd packages/agent-core
+          pytest
+
+  api:
+    name: api (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          pip install -e "packages/agent-core[test]"
+          cd packages/api
+          pip install -e ".[test]"
+      - name: Test
+        run: |
+          cd packages/api
+          pytest
+
+  api-postgres:
+    name: api (pytest, PostgreSQL 16)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: agentsuniverse
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d agentsuniverse"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # conftest setdefaults TEST_DATABASE_URL, so this URL wins; the conftest
+      # alembic fixture then runs the full migration chain against Postgres.
+      # 127.0.0.1, not localhost: asyncpg resolves localhost to IPv6 ::1 first;
+      # the service container only listens on IPv4, so every connect waits out
+      # the IPv6 timeout before falling back (~10s each, hundreds of connects).
+      TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/agentsuniverse
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          pip install -e "packages/agent-core[test]"
+          cd packages/api
+          pip install -e ".[test,postgres]"
+      - name: Test
+        run: |
+          cd packages/api
+          pytest
+
+  web:
+    name: web (vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: packages/web/package-lock.json
+      - name: Install
+        run: npm ci
+        working-directory: packages/web
+      # Fail fast: lint and typecheck before the full vitest run so a
+      # one-line type error doesn't burn the whole test job first.
+      - name: Lint
+        run: npm run lint
+        working-directory: packages/web
+      - name: Typecheck and build
+        run: npm run build
+        working-directory: packages/web
+      - name: Test
+        run: npm test -- --run
+        working-directory: packages/web
+
+  hygiene:
+    name: commit hygiene (identity + URLs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the commit range below references base/before commits
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Commit identity check
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            range="$PR_BASE..$PR_HEAD"
+          elif [ -n "$PUSH_BEFORE" ] \
+            && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] \
+            && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            range="$PUSH_BEFORE..${{ github.sha }}"
+          else
+            range="${{ github.sha }}"  # new branch or force-push: scan history
+          fi
+          echo "identity range: $range"
+          python scripts/check_commit_hygiene.py identity --rev-range "$range"
+
+      - name: URL host check (tracked files)
+        run: python scripts/check_commit_hygiene.py urls --all-files
+
+      - name: Test the hygiene script
+        run: |
+          python -m pip install --disable-pip-version-check pytest
+          python -m pytest scripts/tests -q

@@ -1,0 +1,165 @@
+import { describe, expect, it, vi, afterEach } from 'vitest'
+import { publishApi } from './publish'
+
+function sseStream(frames: string[], chunkSizes?: number[]): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder()
+  const data = encoder.encode(frames.join('\n\n') + '\n\n')
+  const sizes = chunkSizes ?? [data.length]
+  let offset = 0
+  const parts: Uint8Array[] = []
+  for (const size of sizes) {
+    parts.push(data.slice(offset, offset + size))
+    offset += size
+  }
+  return new ReadableStream({
+    start(controller) {
+      for (const p of parts) controller.enqueue(p)
+      controller.close()
+    },
+  })
+}
+
+afterEach(() => {
+  vi.restoreAllMocks()
+})
+
+describe('publishApi.runSession', () => {
+  it('accumulates stream_delta across chunks and reports deltas live', async () => {
+    const deltaA = { type: 'stream_delta', delta: '你好' }
+    const deltaB = { type: 'stream_delta', delta: '，世界' }
+    const end = { type: 'stream_end' }
+    const frames = [
+      `data: ${JSON.stringify(deltaA)}`,
+      `data: ${JSON.stringify(deltaB)}`,
+      `data: ${JSON.stringify(end)}`,
+    ]
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      body: sseStream(frames, [12, 40, 80]),
+    }))
+
+    const seen: string[] = []
+    const text = await publishApi.runSession('p1', 'tok', 'hello', (d) => seen.push(d))
+
+    expect(text).toBe('你好，世界')
+    expect(seen).toEqual(['你好', '，世界'])
+  })
+
+  it('throws ApiError on an SSE error frame', async () => {
+    const frames = [
+      `data: ${JSON.stringify({ type: 'error', message: '模型调用失败' })}`,
+    ]
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      body: sseStream(frames),
+    }))
+
+    await expect(publishApi.runSession('p1', 'tok', 'hello'))
+      .rejects.toThrowError('模型调用失败')
+  })
+
+  it('keeps the partial reply when a later error frame fails the run', async () => {
+    // The page clears its live streaming text in `finally`. Throwing at the
+    // error frame discarded every delta already received, leaving only the
+    // error bubble; the partial answer must travel on the rejection instead.
+    const frames = [
+      `data: ${JSON.stringify({ type: 'stream_delta', delta: '前半段' })}`,
+      `data: ${JSON.stringify({ type: 'error', message: '模型调用失败' })}`,
+    ]
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      body: sseStream(frames),
+    }))
+
+    await expect(publishApi.runSession('p1', 'tok', 'hello')).rejects.toMatchObject({
+      message: '模型调用失败',
+      partialText: '前半段',
+    })
+  })
+
+  it('throws with the server detail on non-ok responses', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      statusText: 'Conflict',
+      json: async () => ({ detail: '该会话已有一轮运行' }),
+    }))
+
+    await expect(publishApi.runSession('p1', 'tok', 'hello'))
+      .rejects.toThrowError('该会话已有一轮运行')
+  })
+
+  it('routes a 401 to the login like every other apiFetch', async () => {
+    // runSession used to use bare fetch, bypassing the client's 401 policy —
+    // an expired session on the embedded page errored forever instead of
+    // bouncing back to SSO login.
+    vi.stubGlobal('location', { href: '' })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 401,
+      statusText: 'Unauthorized',
+      json: async () => ({ detail: 'Not authenticated' }),
+    }))
+
+    await expect(publishApi.runSession('p1', 'tok', 'hello'))
+      .rejects.toMatchObject({ status: 401 })
+    expect(window.location.href).toContain('/auth/login')
+    vi.unstubAllGlobals()
+  })
+
+  it('skips malformed frames without aborting the stream', async () => {
+    const delta = { type: 'stream_delta', delta: 'ok' }
+    const frames = [
+      'data: not-json{{{',
+      `data: ${JSON.stringify(delta)}`,
+      `data: ${JSON.stringify({ type: 'stream_end' })}`,
+    ]
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      body: sseStream(frames, [9, 30, 60]),
+    }))
+
+    const text = await publishApi.runSession('p1', 'tok', 'hello')
+    expect(text).toBe('ok')
+  })
+
+  it('keeps the partial reply when the connection dies mid-stream', async () => {
+    // A reset/timed-out connection rejects reader.read(). The deltas already
+    // rendered live were lost to the page's finally-clear, leaving only a
+    // generic error bubble — the same loss the error-frame path already fixed.
+    const encoder = new TextEncoder()
+    const chunk = encoder.encode(
+      `data: ${JSON.stringify({ type: 'stream_delta', delta: '前半段' })}\n\n`,
+    )
+    let sent = false
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (!sent) {
+          sent = true
+          controller.enqueue(chunk)
+          return
+        }
+        throw new TypeError('network error')
+      },
+    })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      body,
+    }))
+
+    await expect(publishApi.runSession('p1', 'tok', 'hello')).rejects.toMatchObject({
+      message: 'network error',
+      partialText: '前半段',
+    })
+  })
+})

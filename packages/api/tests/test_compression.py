@@ -1,0 +1,1079 @@
+"""Tests for the manual conversation compression endpoint."""
+from __future__ import annotations
+
+import asyncio
+import json
+import uuid
+from types import SimpleNamespace
+
+import pytest
+
+from api.models.conversation import Conversation, Message as DbMessage
+
+
+def _make_messages(conversation_id: str, count: int) -> list[DbMessage]:
+    msgs = []
+    for i in range(count):
+        role = "user" if i % 2 == 0 else "assistant"
+        msgs.append(DbMessage(
+            conversation_id=conversation_id,
+            role=role,
+            content=f"message {i} content " * 20,
+            sequence_num=i + 1,
+        ))
+    return msgs
+
+
+class StubProvider:
+    def __init__(self, summary: str = "summary of earlier conversation"):
+        self._summary = summary
+
+    async def complete(self, messages, tools=None):
+        return SimpleNamespace(message=SimpleNamespace(content=self._summary))
+
+
+async def _seed_conversation(db, project, message_count: int = 20):
+    conv = Conversation(
+        project_id=project.project_id,
+        user_id="test-user",
+        token_budget=128000,
+    )
+    db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
+    for m in _make_messages(str(conv.conversation_id), message_count):
+        db.add(m)
+    await db.commit()
+    return conv
+
+
+@pytest.mark.asyncio
+async def test_compress_success(client, db, make_project, monkeypatch):
+    project = await make_project()
+    conv = await _seed_conversation(db, project, message_count=20)
+
+    import api.services.compression as compression_service
+
+    async def _fake_resolve(db_, user_id):
+        return StubProvider()
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _fake_resolve)
+
+    resp = await client.post(f"/api/conversations/{conv.conversation_id}/compress")
+    assert resp.status_code == 200, resp.text
+
+    data = resp.json()
+    assert data["deleted_count"] == 12
+    assert data["kept_count"] == 8
+    assert "summary of earlier conversation" in data["summary"]
+
+    # Response messages: summary pair first, then the 8 retained messages
+    messages = data["messages"]
+    assert len(messages) == 10
+    assert messages[0]["role"] == "user"
+    assert "[Earlier conversation summary" in messages[0]["content"]
+    assert messages[1]["role"] == "assistant"
+    assert messages[2]["content"].startswith("message 12 content")
+    assert [m["sequence_num"] for m in messages] == list(range(13, 23))
+
+    # DB now holds exactly the same 10 rows
+    result = await db.execute(
+        DbMessage.__table__.select().where(
+            DbMessage.conversation_id == str(conv.conversation_id)
+        )
+    )
+    rows = result.scalars().all()
+    assert len(rows) == 10
+
+
+@pytest.mark.asyncio
+async def test_compress_too_short(client, db, make_project, monkeypatch):
+    project = await make_project()
+    conv = await _seed_conversation(db, project, message_count=5)
+
+    import api.services.compression as compression_service
+
+    monkeypatch.setattr(
+        compression_service,
+        "_resolve_provider",
+        lambda db_, user_id: StubProvider(),
+    )
+
+    resp = await client.post(f"/api/conversations/{conv.conversation_id}/compress")
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_compress_rejects_running_agent(client, db, make_project, monkeypatch):
+    from api.websocket.manager import manager as ws_manager
+
+    project = await make_project()
+    conv = await _seed_conversation(db, project, message_count=20)
+
+    monkeypatch.setattr(ws_manager, "is_session_active", lambda cid: True)
+
+    resp = await client.post(f"/api/conversations/{conv.conversation_id}/compress")
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_compress_llm_failure_leaves_history_intact(client, db, make_project, monkeypatch):
+    project = await make_project()
+    conv = await _seed_conversation(db, project, message_count=20)
+
+    import api.services.compression as compression_service
+
+    class FailingProvider:
+        async def complete(self, messages, tools=None):
+            raise RuntimeError("llm down")
+
+        def scrub(self, text):
+            return text
+
+    async def _failing_resolve(db_, user_id):
+        return FailingProvider()
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _failing_resolve)
+
+    resp = await client.post(f"/api/conversations/{conv.conversation_id}/compress")
+    assert resp.status_code == 502
+
+    result = await db.execute(
+        DbMessage.__table__.select().where(
+            DbMessage.conversation_id == str(conv.conversation_id)
+        )
+    )
+    rows = result.scalars().all()
+    assert len(rows) == 20
+
+
+@pytest.mark.asyncio
+async def test_compress_llm_failure_log_scrubs_provider_key(
+    client, db, make_project, monkeypatch, caplog
+):
+    """The 502 path logs the traceback via provider.scrub, never exc_info —
+    SDK/h11 errors echo the key back and would otherwise land in the log."""
+    import logging as _logging
+
+    project = await make_project()
+    conv = await _seed_conversation(db, project, message_count=20)
+
+    import api.services.compression as compression_service
+
+    bad = "sk-compress-api-leakme\n"
+    escaped = repr(bad.encode("utf-8"))[2:-1]
+
+    class KeyEchoProvider:
+        async def complete(self, messages, tools=None):
+            raise RuntimeError(f"Illegal header value b'Bearer {escaped}'")
+
+        def secret_values(self):
+            return [bad]
+
+        def scrub(self, text):
+            from agent_core.tools._http import redact_secret
+            for v in self.secret_values():
+                text = redact_secret(text, v)
+            return text
+
+    async def _resolve(db_, user_id):
+        return KeyEchoProvider()
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _resolve)
+
+    with caplog.at_level(_logging.DEBUG):
+        resp = await client.post(f"/api/conversations/{conv.conversation_id}/compress")
+
+    assert resp.status_code == 502
+    assert bad not in caplog.text
+    assert escaped not in caplog.text
+    assert "[REDACTED]" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_compress_failure_future_never_logs_the_raw_key(
+    client, db, make_project, monkeypatch, caplog
+):
+    """compress_once parks the failure on a future only followers await; with
+    none, asyncio logs 'Future exception was never retrieved' when the future
+    is collected — formatting the exception WITH its chained provider error,
+    which still carries the key past the scrub. The leader must mark it
+    retrieved: gc.collect() below surfaces exactly that log pre-fix."""
+    import gc
+    import logging as _logging
+
+    project = await make_project()
+    conv = await _seed_conversation(db, project, message_count=20)
+
+    import api.services.compression as compression_service
+
+    bad = "sk-compress-api-leakme\n"
+    escaped = repr(bad.encode("utf-8"))[2:-1]
+
+    class KeyEchoProvider:
+        async def complete(self, messages, tools=None):
+            raise RuntimeError(f"Illegal header value b'Bearer {escaped}'")
+
+        def secret_values(self):
+            return [bad]
+
+        def scrub(self, text):
+            from agent_core.tools._http import redact_secret
+            for v in self.secret_values():
+                text = redact_secret(text, v)
+            return text
+
+    async def _resolve(db_, user_id):
+        return KeyEchoProvider()
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _resolve)
+
+    with caplog.at_level(_logging.DEBUG):
+        resp = await client.post(f"/api/conversations/{conv.conversation_id}/compress")
+        assert resp.status_code == 502
+        # The future is reachable only through the traceback cycle it forms
+        # with its own exception — collect it now so the log fires in-test.
+        gc.collect()
+
+    assert "Future exception was never retrieved" not in caplog.text
+    assert bad not in caplog.text
+    assert escaped not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_compress_failure_error_does_not_chain_to_the_provider_error(
+    db, make_project, monkeypatch
+):
+    """format_exception follows __context__ by default, and the provider
+    error still carries the key there — the 502 CompressionError must be
+    raised with its context suppressed so no downstream formatter (a log, a
+    debugger, asyncio's never-retrieved handler) can print it."""
+    import traceback as _traceback
+
+    from api.services.compression import CompressionError, compress_once
+
+    project = await make_project()
+    conv = await _seed_conversation(db, project, message_count=20)
+
+    import api.services.compression as compression_service
+
+    bad = "sk-compress-api-leakme\n"
+    escaped = repr(bad.encode("utf-8"))[2:-1]
+
+    class KeyEchoProvider:
+        async def complete(self, messages, tools=None):
+            raise RuntimeError(f"Illegal header value b'Bearer {escaped}'")
+
+        def secret_values(self):
+            return [bad]
+
+        def scrub(self, text):
+            from agent_core.tools._http import redact_secret
+            for v in self.secret_values():
+                text = redact_secret(text, v)
+            return text
+
+    async def _resolve(db_, user_id):
+        return KeyEchoProvider()
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _resolve)
+
+    with pytest.raises(CompressionError) as excinfo:
+        await compress_once(db, str(conv.conversation_id), "test-user")
+
+    assert excinfo.value.status_code == 502
+    formatted = "".join(_traceback.format_exception(excinfo.value))
+    assert bad not in formatted
+    assert escaped not in formatted
+
+
+@pytest.mark.asyncio
+async def test_compress_bad_key_returns_400_not_500(client, db, make_project, monkeypatch):
+    """get_provider refuses a header-unsafe API key with a clean ValueError.
+    compress_conversation must turn it into an actionable 400 — pre-fix it
+    escaped compress_once uncaught and the router 500'd."""
+    project = await make_project()
+    conv = await _seed_conversation(db, project, message_count=20)
+
+    import api.services.compression as compression_service
+
+    async def _bad_key_resolve(db_, user_id):
+        raise ValueError(
+            "API key for provider 'openai' contains a control character "
+            "(a pasted trailing newline, perhaps) — re-save it in Settings → "
+            "AI Models without it"
+        )
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _bad_key_resolve)
+
+    resp = await client.post(f"/api/conversations/{conv.conversation_id}/compress")
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["code"] == "COMPRESSION_PROVIDER_INVALID"
+    assert "control character" in detail["message"]
+
+    # Nothing was rewritten: the failure happened before any row was touched.
+    result = await db.execute(
+        DbMessage.__table__.select().where(
+            DbMessage.conversation_id == str(conv.conversation_id)
+        )
+    )
+    assert len(result.scalars().all()) == 20
+
+
+@pytest.mark.asyncio
+async def test_compress_concurrent_requests_share_one_compression(client, db, make_project, monkeypatch):
+    """Two simultaneous POST /compress on the same conversation must not
+    duplicate summary pairs, and must not fail with a lock conflict — the
+    second request shares the first one's in-flight call (singleflight)."""
+    project = await make_project()
+    conv = await _seed_conversation(db, project, message_count=20)
+
+    import api.services.compression as compression_service
+
+    calls = {"n": 0}
+
+    class SlowProvider:
+        async def complete(self, messages, tools=None):
+            calls["n"] += 1
+            await asyncio.sleep(0.1)
+            return SimpleNamespace(message=SimpleNamespace(content="shared summary"))
+
+    async def _slow_resolve(db_, user_id):
+        return SlowProvider()
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _slow_resolve)
+
+    url = f"/api/conversations/{conv.conversation_id}/compress"
+    resp1, resp2 = await asyncio.gather(client.post(url), client.post(url))
+    assert resp1.status_code == 200, resp1.text
+    assert resp2.status_code == 200, resp2.text
+    assert calls["n"] == 1  # singleflight: one LLM call, not two
+
+    result = await db.execute(
+        DbMessage.__table__.select().where(
+            DbMessage.conversation_id == str(conv.conversation_id)
+        )
+    )
+    rows = result.scalars().all()
+    # One summary pair + the 8 retained messages — no duplicated pair.
+    assert len(rows) == 10
+
+
+@pytest.mark.asyncio
+async def test_compress_includes_embedded_tool_outputs(client, db, make_project, monkeypatch):
+    """Assistant rows persist tool outputs inside tool_calls[i]['output'];
+    they must reach the summarization input (as `tool` messages) or the
+    output is deleted with the early rows and lost forever."""
+    project = await make_project()
+    conv = Conversation(
+        project_id=project.project_id,
+        user_id="test-user",
+        token_budget=128000,
+    )
+    db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
+
+    seen: dict = {}
+
+    class CapturingProvider:
+        async def complete(self, messages, tools=None):
+            seen["summary_input"] = "\n".join(
+                m.content if isinstance(m.content, str) else ""
+                for m in messages
+            )
+            return SimpleNamespace(message=SimpleNamespace(content="summary of earlier conversation"))
+
+    import api.services.compression as compression_service
+
+    async def _capture_resolve(db_, user_id):
+        return CapturingProvider()
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _capture_resolve)
+
+    # seq 1-11: user/assistant alternation — the tool-calls row must sit in
+    # the EARLY segment (seq 1-12), or it is retained and never summarized.
+    for i in range(11):
+        role = "user" if i % 2 == 0 else "assistant"
+        db.add(DbMessage(
+            conversation_id=str(conv.conversation_id),
+            role=role,
+            content=f"message {i} content " * 20,
+            sequence_num=i + 1,
+        ))
+    # seq 12: assistant message whose tool result lives in tool_calls output
+    db.add(DbMessage(
+        conversation_id=str(conv.conversation_id),
+        role="assistant",
+        content="assistant with tool output",
+        tool_calls=json.dumps([{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"},
+            "output": {"content": "/data/critical.txt"},
+        }]),
+        sequence_num=12,
+    ))
+    # seq 13-19: user/assistant alternation; seq 20: final assistant reply
+    for i in range(7):
+        role = "user" if i % 2 == 0 else "assistant"
+        db.add(DbMessage(
+            conversation_id=str(conv.conversation_id),
+            role=role,
+            content=f"tail message {i} content " * 20,
+            sequence_num=13 + i,
+        ))
+    db.add(DbMessage(
+        conversation_id=str(conv.conversation_id),
+        role="assistant",
+        content="final assistant content " * 20,
+        sequence_num=20,
+    ))
+    await db.commit()
+
+    resp = await client.post(f"/api/conversations/{conv.conversation_id}/compress")
+    assert resp.status_code == 200, resp.text
+
+    # The embedded tool output reached the summarization LLM
+    assert "/data/critical.txt" in seen["summary_input"]
+
+
+def _make_tool_tail_messages(conversation_id: str) -> list[DbMessage]:
+    """20 messages whose recent-8 window opens with an orphan tool message.
+
+    seq 13 is a `tool` result whose assistant tool_calls partner (seq 12)
+    falls into the early segment — split_early_recent pops seq 13 back into
+    `early`. It is deleted from the DB (the deletion
+    boundary shifts up with the popped kept_count) yet must still reach the
+    summarization input, or its content (e.g. file paths) is lost forever.
+    """
+    msgs = []
+    for i in range(11):  # seq 1-11: user/assistant alternation
+        role = "user" if i % 2 == 0 else "assistant"
+        msgs.append(DbMessage(
+            conversation_id=conversation_id,
+            role=role,
+            content=f"message {i} content " * 20,
+            sequence_num=i + 1,
+        ))
+    # seq 12: assistant declaring a tool call; seq 13: its tool result
+    msgs.append(DbMessage(
+        conversation_id=conversation_id,
+        role="assistant",
+        content="assistant payload",
+        tool_calls=json.dumps([{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "write_file", "arguments": "{}"},
+        }]),
+        sequence_num=12,
+    ))
+    msgs.append(DbMessage(
+        conversation_id=conversation_id,
+        role="tool",
+        content="tool result payload /data/x.txt " * 20,
+        sequence_num=13,
+    ))
+    # seq 14-17: two more user/assistant turns
+    for i in range(4):
+        role = "user" if i % 2 == 0 else "assistant"
+        msgs.append(DbMessage(
+            conversation_id=conversation_id,
+            role=role,
+            content=f"tail message {i} content " * 20,
+            sequence_num=14 + i,
+        ))
+    # seq 18-19: another tool call + result; seq 20: assistant reply
+    msgs.append(DbMessage(
+        conversation_id=conversation_id,
+        role="assistant",
+        content="assistant payload 2",
+        tool_calls=json.dumps([{
+            "id": "call_2",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"},
+        }]),
+        sequence_num=18,
+    ))
+    msgs.append(DbMessage(
+        conversation_id=conversation_id,
+        role="tool",
+        content="tool result payload 2 " * 20,
+        sequence_num=19,
+    ))
+    msgs.append(DbMessage(
+        conversation_id=conversation_id,
+        role="assistant",
+        content="final assistant content " * 20,
+        sequence_num=20,
+    ))
+    return msgs
+
+
+@pytest.mark.asyncio
+async def test_compress_orphan_tool_messages_reach_summary(client, db, make_project, monkeypatch):
+    """A tool message popped out of the recent window (its assistant tool_calls
+    partner fell into the early segment) is deleted from the DB, so it must be
+    part of the summarization input — otherwise its content is lost forever
+    ."""
+    project = await make_project()
+    conv = Conversation(
+        project_id=project.project_id,
+        user_id="test-user",
+        token_budget=128000,
+    )
+    db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
+
+    seen: dict = {}
+
+    class CapturingProvider:
+        async def complete(self, messages, tools=None):
+            last = messages[-1]
+            seen["summary_input"] = last.content if isinstance(last.content, str) else ""
+            return SimpleNamespace(message=SimpleNamespace(content="summary of earlier conversation"))
+
+    import api.services.compression as compression_service
+
+    async def _capture_resolve(db_, user_id):
+        return CapturingProvider()
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _capture_resolve)
+
+    for m in _make_tool_tail_messages(str(conv.conversation_id)):
+        db.add(m)
+    await db.commit()
+
+    resp = await client.post(f"/api/conversations/{conv.conversation_id}/compress")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    # The orphan tool message (seq 13) was popped: 7 kept, 13 deleted
+    assert data["kept_count"] == 7
+    assert data["deleted_count"] == 13
+
+    # Its content (including the file path) reached the summarization input
+    assert "tool result payload" in seen["summary_input"]
+    assert "/data/x.txt" in seen["summary_input"]
+
+    # DB holds the summary pair + the 7 retained messages
+    from sqlalchemy import select
+
+    result = await db.execute(
+        select(DbMessage)
+        .where(DbMessage.conversation_id == str(conv.conversation_id))
+        .order_by(DbMessage.sequence_num)
+    )
+    rows = result.scalars().all()
+    assert len(rows) == 9
+    assert rows[0].content.startswith("[Earlier conversation summary")
+
+
+@pytest.mark.asyncio
+async def test_compress_tool_output_row_inside_recent_window(client, db, make_project, monkeypatch):
+    """An assistant row with embedded tool outputs INSIDE the keep window
+    expands to 1+N messages. The boundary must be computed from the owning
+    ROWS — counting expanded messages lands the boundary one row early,
+    leaving a summarized row duplicated in history next to the summary."""
+    project = await make_project()
+    conv = Conversation(
+        project_id=project.project_id,
+        user_id="test-user",
+        token_budget=128000,
+    )
+    db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
+
+    import api.services.compression as compression_service
+
+    async def _stub_resolve(db_, user_id):
+        return StubProvider()
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _stub_resolve)
+
+    cid = str(conv.conversation_id)
+    for i in range(17):  # seq 1-17: user/assistant alternation
+        db.add(DbMessage(
+            conversation_id=cid,
+            role="user" if i % 2 == 0 else "assistant",
+            content=f"message {i} content " * 20,
+            sequence_num=i + 1,
+        ))
+    # seq 18: assistant whose tool result lives in tool_calls output —
+    # expands to 2 messages (assistant + tool), inside the keep window
+    db.add(DbMessage(
+        conversation_id=cid,
+        role="assistant",
+        content="assistant with tool output",
+        tool_calls=json.dumps([{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"},
+            "output": {"content": "/data/result.txt"},
+        }]),
+        sequence_num=18,
+    ))
+    for i in (18, 19):  # seq 19-20
+        db.add(DbMessage(
+            conversation_id=cid,
+            role="user" if i % 2 == 0 else "assistant",
+            content=f"message {i} content " * 20,
+            sequence_num=i + 1,
+        ))
+    await db.commit()
+
+    resp = await client.post(f"/api/conversations/{cid}/compress")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # 21 expanded messages, 8 kept => rows 14-20 (7 rows) kept, 13 deleted
+    assert data["deleted_count"] == 13
+    assert data["kept_count"] == 7
+
+    from sqlalchemy import select
+
+    result = await db.execute(
+        select(DbMessage)
+        .where(DbMessage.conversation_id == cid)
+        .order_by(DbMessage.sequence_num)
+    )
+    rows = result.scalars().all()
+    assert len(rows) == 9  # summary pair + 7 retained rows
+    assert rows[0].content.startswith("[Earlier conversation summary")
+    # seq 13 was summarized away — it must not linger as a row next to the summary
+    assert not any("message 12 content" in (r.content or "") for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_compress_all_tool_tail_keeps_last_row(client, db, make_project, monkeypatch):
+    """A trailing assistant row with >= RECENT_TURNS_KEEP tool_calls and no
+    final text expands to all-tool messages that split_early_recent pops
+    EVERYTHING back into early — recent_msgs becomes empty. The old boundary
+    then fell on the last row's sequence_num and the DELETE removed the whole
+    history (the user's latest turn, e.g. a mid-plan Stop, vanished forever).
+    The fallback must retain at least the final row."""
+    from agent_core.compressor import RECENT_TURNS_KEEP
+
+    project = await make_project()
+    conv = Conversation(
+        project_id=project.project_id,
+        user_id="test-user",
+        token_budget=128000,
+    )
+    db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
+
+    import api.services.compression as compression_service
+
+    async def _stub_resolve(db_, user_id):
+        return StubProvider()
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _stub_resolve)
+
+    cid = str(conv.conversation_id)
+    for i in range(17):  # seq 1-17: user/assistant alternation
+        db.add(DbMessage(
+            conversation_id=cid,
+            role="user" if i % 2 == 0 else "assistant",
+            content=f"message {i} content " * 20,
+            sequence_num=i + 1,
+        ))
+    # seq 18: assistant with RECENT_TURNS_KEEP tool_calls and NO final text —
+    # the mid-plan-Stop shape. Expands to 1 + N messages, all tool messages
+    # land in the last RECENT_TURNS_KEEP and get popped back to early.
+    db.add(DbMessage(
+        conversation_id=cid,
+        role="assistant",
+        content="",
+        tool_calls=json.dumps([{
+            "id": f"call_{i}",
+            "type": "function",
+            "function": {"name": "run_task", "arguments": "{}"},
+            "output": {"content": f"task {i} output"},
+        } for i in range(RECENT_TURNS_KEEP)]),
+        sequence_num=18,
+    ))
+    await db.commit()
+
+    resp = await client.post(f"/api/conversations/{cid}/compress")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # 17 deleted, the final row survives
+    assert data["deleted_count"] == 17
+    assert data["kept_count"] == 1
+
+    from sqlalchemy import select
+
+    result = await db.execute(
+        select(DbMessage)
+        .where(DbMessage.conversation_id == cid)
+        .order_by(DbMessage.sequence_num)
+    )
+    rows = result.scalars().all()
+    assert len(rows) == 3  # summary pair + the retained final row
+    assert rows[0].content.startswith("[Earlier conversation summary")
+    assert rows[2].content == ""
+    assert rows[2].tool_calls is not None
+
+
+async def _seed_short_fat_conversation(db, project, rows: list[DbMessage]):
+    """Seed a <=RECENT_TURNS_KEEP conversation from prebuilt rows (fat content
+    allowed) and return the conversation id."""
+    conv = Conversation(project_id=project.project_id, user_id="test-user", token_budget=128000)
+    db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
+    cid = str(conv.conversation_id)
+    for i, m in enumerate(rows):
+        m.conversation_id = cid
+        m.sequence_num = i + 1
+        db.add(m)
+    await db.commit()
+    return cid
+
+
+@pytest.mark.asyncio
+async def test_compress_truncates_fat_short_conversation(client, db, make_project):
+    """Few rows but multi-MB embedded tool outputs must not 409 "too short" —
+    the outputs are truncated in the DB so future turns send a slim body."""
+    project = await make_project()
+    big_output = "x" * (5 * 1024 * 1024)
+    cid = await _seed_short_fat_conversation(db, project, [
+        DbMessage(role="user", content="read that file"),
+        DbMessage(role="assistant", content="", tool_calls=json.dumps([{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"},
+            "output": big_output,
+        }])),
+        DbMessage(role="user", content="what is in it?"),
+    ])
+
+    resp = await client.post(f"/api/conversations/{cid}/compress")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["deleted_count"] == 0
+    assert data["kept_count"] == 3
+    assert data["truncated"] == 1
+    assert "已精简" in data["summary"]
+    # Response messages reflect the truncated form
+    tool_calls = data["messages"][1]["tool_calls"]
+    assert len(tool_calls[0]["output"]) == 2001
+    assert tool_calls[0]["output"].endswith("…")
+
+    from sqlalchemy import select
+
+    result = await db.execute(
+        select(DbMessage).where(DbMessage.conversation_id == cid)
+    )
+    rows = result.scalars().all()
+    assert len(rows) == 3
+    saved = json.loads(rows[1].tool_calls)
+    assert saved[0]["output"].endswith("…")
+    assert len(saved[0]["output"]) == 2001
+
+
+@pytest.mark.asyncio
+async def test_compress_fat_short_without_tool_outputs_409(client, db, make_project):
+    """Fat conversation with nothing truncatable: refuse with a specific
+    message and leave the DB untouched (no commit on failure)."""
+    project = await make_project()
+    big_text = "y" * (5 * 1024 * 1024)
+    cid = await _seed_short_fat_conversation(db, project, [
+        DbMessage(role="user", content=big_text),
+        DbMessage(role="assistant", content="ok"),
+        DbMessage(role="user", content="and then?"),
+    ])
+
+    resp = await client.post(f"/api/conversations/{cid}/compress")
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["code"] == "COMPRESSION_NO_TRUNCATABLE_OUTPUT"
+
+    from sqlalchemy import select
+
+    result = await db.execute(
+        select(DbMessage).where(DbMessage.conversation_id == cid)
+    )
+    rows = result.scalars().all()
+    assert len(rows) == 3
+    assert len(rows[0].content) == 5 * 1024 * 1024  # untouched
+
+
+@pytest.mark.asyncio
+async def test_compress_fat_short_tool_row_content_truncated(client, db, make_project):
+    """A standalone role='tool' row with oversized content is truncated in
+    place (the embedded-output path covers tool_calls; this covers content)."""
+    project = await make_project()
+    cid = await _seed_short_fat_conversation(db, project, [
+        DbMessage(role="user", content="run it"),
+        DbMessage(role="assistant", content="done"),
+        DbMessage(role="tool", content="z" * (5 * 1024 * 1024)),
+    ])
+
+    resp = await client.post(f"/api/conversations/{cid}/compress")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["deleted_count"] == 0
+    assert data["kept_count"] == 3
+    assert data["truncated"] == 1
+
+    from sqlalchemy import select
+
+    result = await db.execute(
+        select(DbMessage).where(DbMessage.conversation_id == cid)
+    )
+    rows = result.scalars().all()
+    tool_row = next(r for r in rows if r.role == "tool")
+    assert len(tool_row.content) == 2001
+    assert tool_row.content.endswith("…")
+
+
+# ---------------------------------------------------------------------------
+# Map-reduce summarization for long conversations
+# ---------------------------------------------------------------------------
+
+
+async def _seed_big_conversation(db, project, count: int = 40) -> str:
+    """Seed a conversation whose early text exceeds one summary chunk."""
+    conv = Conversation(
+        project_id=project.project_id,
+        user_id="test-user",
+        token_budget=128000,
+    )
+    db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
+    cid = str(conv.conversation_id)
+    for i in range(count):
+        db.add(DbMessage(
+            conversation_id=cid,
+            role="user" if i % 2 == 0 else "assistant",
+            content=f"message {i} " + "x" * 2000,
+            sequence_num=i + 1,
+        ))
+    await db.commit()
+    return cid
+
+
+@pytest.mark.asyncio
+async def test_compress_map_reduces_long_conversations(client, db, make_project, monkeypatch):
+    """Early text beyond one chunk is summarized map-reduce style: one call
+    per ~30k-char chunk plus a merge; the merged summary is persisted."""
+    project = await make_project()
+    cid = await _seed_big_conversation(db, project, count=40)
+
+    import api.services.compression as compression_service
+
+    calls: list[str] = []
+
+    class MapReduceProvider:
+        async def complete(self, messages, tools=None):
+            user_text = messages[1].content
+            calls.append(user_text[:45])
+            if "Partial summaries to merge" in user_text:
+                return SimpleNamespace(message=SimpleNamespace(content="MERGED SUMMARY"))
+            return SimpleNamespace(message=SimpleNamespace(content="part summary"))
+
+    async def _resolve(db_, user_id):
+        return MapReduceProvider()
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _resolve)
+
+    resp = await client.post(f"/api/conversations/{cid}/compress")
+    assert resp.status_code == 200, resp.text
+
+    data = resp.json()
+    assert data["summary"] == "MERGED SUMMARY"
+    assert data["deleted_count"] == 32
+    assert data["kept_count"] == 8
+    # ~64k chars of early text -> 3 chunks + 1 merge call
+    assert len(calls) == 4
+    assert any("(part 1/3)" in c for c in calls)
+
+    result = await db.execute(
+        DbMessage.__table__.select().where(DbMessage.conversation_id == cid)
+    )
+    rows = result.scalars().all()
+    assert len(rows) == 10
+
+    from sqlalchemy import select as sa_select
+    first = (await db.execute(
+        sa_select(DbMessage.content).where(
+            DbMessage.conversation_id == cid
+        ).order_by(DbMessage.sequence_num).limit(1)
+    )).scalar_one()
+    assert "MERGED SUMMARY" in first
+
+
+@pytest.mark.asyncio
+async def test_compress_chunk_failure_leaves_history_intact(client, db, make_project, monkeypatch):
+    """A failure on any chunk aborts the whole compression with 502 and
+    deletes nothing - the fail-safe must cover the map-reduce path too."""
+    project = await make_project()
+    cid = await _seed_big_conversation(db, project, count=40)
+
+    import api.services.compression as compression_service
+
+    class FlakyProvider:
+        def __init__(self):
+            self.n = 0
+
+        async def complete(self, messages, tools=None):
+            self.n += 1
+            if self.n > 1:
+                raise RuntimeError("chunk 2 failed")
+            return SimpleNamespace(message=SimpleNamespace(content="ok"))
+
+        def scrub(self, text):
+            return text
+
+    async def _resolve(db_, user_id):
+        return FlakyProvider()
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _resolve)
+
+    resp = await client.post(f"/api/conversations/{cid}/compress")
+    assert resp.status_code == 502
+
+    result = await db.execute(
+        DbMessage.__table__.select().where(DbMessage.conversation_id == cid)
+    )
+    rows = result.scalars().all()
+    assert len(rows) == 40
+
+
+@pytest.mark.asyncio
+async def test_compress_total_timeout_502(client, db, make_project, monkeypatch):
+    """A summarization slower than the total timeout fails closed with 502
+    and deletes nothing."""
+    project = await make_project()
+    conv = await _seed_conversation(db, project, message_count=20)
+
+    import api.services.compression as compression_service
+
+    monkeypatch.setattr(compression_service, "_SUMMARY_TOTAL_TIMEOUT", 0.05)
+
+    class HangingProvider:
+        async def complete(self, messages, tools=None):
+            await asyncio.sleep(1.0)
+            return SimpleNamespace(message=SimpleNamespace(content="late"))
+
+        def scrub(self, text):
+            return text
+
+    async def _resolve(db_, user_id):
+        return HangingProvider()
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _resolve)
+
+    resp = await client.post(f"/api/conversations/{conv.conversation_id}/compress")
+    assert resp.status_code == 502
+
+    result = await db.execute(
+        DbMessage.__table__.select().where(
+            DbMessage.conversation_id == str(conv.conversation_id)
+        )
+    )
+    rows = result.scalars().all()
+    assert len(rows) == 20
+
+
+def test_default_model_returns_provider_native_ids():
+    """_default_model must hand each provider one of ITS OWN model ids —
+    pre-fix "google_gemini" fell through to "gpt-4o-mini" and every legacy
+    gemini compression/summary request 404'd on the Gemini API."""
+    from api.services.compression import _default_model
+
+    assert _default_model("google_gemini") == "gemini-2.5-flash"
+    assert _default_model("anthropic").startswith("claude-")
+    assert _default_model("openai").startswith("gpt-")
+
+
+@pytest.mark.asyncio
+async def test_compress_closes_provider_on_success_and_failure(db, make_project, monkeypatch):
+    """_resolve_provider builds an SDK-backed provider that owns an HTTP
+    client; both the success path and the 502 path must close it, or every
+    manual compression leaks a connection pool."""
+    from api.services.compression import CompressionError, compress_conversation
+
+    class ClosableProvider:
+        def __init__(self, fail: bool = False):
+            self.fail = fail
+            self.closed = False
+
+        async def complete(self, messages, tools=None):
+            if self.fail:
+                raise RuntimeError("llm down")
+            return SimpleNamespace(message=SimpleNamespace(content="summary of earlier conversation"))
+
+        async def close(self):
+            self.closed = True
+
+        def scrub(self, text):
+            return text
+
+    import api.services.compression as compression_service
+
+    project = await make_project()
+    success_provider = ClosableProvider()
+
+    async def _resolve_ok(db_, user_id):
+        return success_provider
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _resolve_ok)
+    conv = await _seed_conversation(db, project, message_count=20)
+    await compress_conversation(db, str(conv.conversation_id), "test-user")
+    assert success_provider.closed is True
+
+    failing_provider = ClosableProvider(fail=True)
+
+    async def _resolve_fail(db_, user_id):
+        return failing_provider
+
+    monkeypatch.setattr(compression_service, "_resolve_provider", _resolve_fail)
+    conv2 = await _seed_conversation(db, project, message_count=20)
+    with pytest.raises(CompressionError):
+        await compress_conversation(db, str(conv2.conversation_id), "test-user")
+    assert failing_provider.closed is True
+
+
+@pytest.mark.asyncio
+async def test_follower_does_not_hold_the_global_guard(monkeypatch):
+    """A follower awaiting an in-flight compression must not hold the global
+    singleflight guard — otherwise one slow summarization serializes every
+    other conversation's compress behind it."""
+    import api.services.compression as compression_service
+    from api.services.compression import compress_once
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def _fake_compress(db, conversation_id, user_id):
+        calls.append(conversation_id)
+        if conversation_id == "conv-a":
+            started.set()
+            await release.wait()
+        return {"ok": True, "conversation_id": conversation_id}
+
+    monkeypatch.setattr(compression_service, "compress_conversation", _fake_compress)
+
+    leader = asyncio.create_task(compress_once(None, "conv-a", "u1"))
+    await started.wait()
+    # Follower joins the same key — give it a tick to reach the guard.
+    follower = asyncio.create_task(compress_once(None, "conv-a", "u1"))
+    await asyncio.sleep(0)
+
+    # An unrelated conversation must complete WHILE conv-a is still running.
+    other = asyncio.create_task(compress_once(None, "conv-b", "u1"))
+    other_result = await asyncio.wait_for(other, timeout=1.0)
+    assert other_result["conversation_id"] == "conv-b"
+    assert calls == ["conv-a", "conv-b"]
+
+    release.set()
+    assert (await leader)["conversation_id"] == "conv-a"
+    assert (await follower)["conversation_id"] == "conv-a"

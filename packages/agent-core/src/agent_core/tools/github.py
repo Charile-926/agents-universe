@@ -1,0 +1,715 @@
+"""GitHub tool (public GitHub and GitHub Enterprise) — PR management, commit search, repository info."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+from typing import Any
+
+import httpx
+
+from .base import Tool, ToolContext
+from ._auth import ToolAuthError, get_token
+from ._http import _header_value_problem, ensure_http_client
+from .shell import redact_secrets
+
+_log = logging.getLogger(__name__)
+
+# Cap on a batched PR-detail fetch. A card's PR list is small; the cap keeps a
+# wide jira_key search from fanning out into dozens of concurrent PR reads.
+_MAX_PR_DETAILS = 20
+
+
+def _pr_error(exc: BaseException) -> str:
+    """Render a per-PR failure without echoing a response body.
+
+    The batch path catches its own exceptions, so it cannot reuse the
+    redaction the outer handler applies — never put a response body (which
+    gateways fill with the submitted credential) into the result at all.
+    """
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+        return f"GitHub API returned {exc.response.status_code}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+class GitHubTool(Tool):
+    name = "github"
+    prompt_hint = (
+        "First stop for any PR task — the remote PR diff, reviews, comments, and "
+        "checks are authoritative. Use for GitHub work (public GitHub or GitHub "
+        "Enterprise): search commits/PRs by Jira key, review, approve, merge, or "
+        "create PRs, fork/star repositories, check CI statuses, and search "
+        "repositories or code when hunting for reference material such as skill "
+        "libraries. A card with several PRs: one get_pr_details call, not one "
+        "get_pr_detail per PR."
+    )
+    description = (
+        "GitHub (public or Enterprise): search commits/PRs by Jira key, "
+        "list/detail (one PR or several at once)/approve/merge/create PRs, "
+        "fork a repository, star/check-star a repository, get repository and user info, "
+        "get commit check-runs and combined status, "
+        "search repositories and code (e.g. topic:claude-skills or filename:SKILL.md)."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": [
+                    "search_by_jira_key", "get_repo_info", "get_user",
+                    "list_prs", "get_pr_detail", "get_pr_details",
+                    "approve_pr", "merge_pr", "create_pr",
+                    "get_commit_checks", "add_pr_comment", "fork", "is_starred", "star",
+                    "search_repositories", "search_code",
+                ],
+            },
+            "jira_key": {"type": "string", "description": "Jira issue key to search for"},
+            "repository": {"type": "string", "description": "owner/repo format"},
+            "number": {"type": "integer", "description": "PR number"},
+            "pr_numbers": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": (
+                    "PR numbers for get_pr_details — fetched concurrently, so one "
+                    "call replaces one get_pr_detail per PR"
+                ),
+            },
+            "url": {"type": "string", "description": "Full PR URL (alternative to repository+number)"},
+            "state": {"type": "string", "enum": ["open", "closed", "all"], "default": "open"},
+            "author": {"type": "string"},
+            "reviewer": {"type": "string"},
+            "base": {"type": "string", "description": "Base branch filter for list_prs"},
+            "head": {"type": "string", "description": "Head branch filter for list_prs"},
+            "head_branch": {"type": "string", "description": "Feature branch to open PR from (for create_pr). For a cross-repo (fork) PR use '<fork-owner>:<branch>'; for a same-repo PR use the bare branch name."},
+            "base_branch": {"type": "string", "description": "Target branch for the new PR (for create_pr), defaults to main"},
+            "title": {"type": "string", "description": "PR title (for create_pr)"},
+            "draft": {"type": "boolean", "default": False, "description": "Open as draft PR (for create_pr)"},
+            "merge_method": {"type": "string", "enum": ["merge", "squash", "rebase"], "default": "squash"},
+            "body": {"type": "string", "description": "PR/review/merge comment body"},
+            "commit_title": {"type": "string"},
+            "sha": {"type": "string", "description": "Head SHA for merge verification"},
+            "all_repos": {"type": "boolean", "default": False, "description": "Search across all repos"},
+            "query": {
+                "type": "string",
+                "description": (
+                    "Search query for search_repositories/search_code. Supports GitHub "
+                    "qualifiers, e.g. 'claude skills topic:claude-skills' or 'filename:SKILL.md pdf'."
+                ),
+            },
+            "sort": {
+                "type": "string",
+                "enum": ["best-match", "stars", "updated"],
+                "default": "best-match",
+                "description": "search_repositories ordering",
+            },
+            "limit": {"type": "integer", "default": 30},
+        },
+        "required": ["operation"],
+    }
+
+    async def execute(self, params: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+        operation = params["operation"]
+
+        try:
+            token = await get_token(context, "git")
+        except ToolAuthError as e:
+            search_ops = ("search_repositories", "search_code")
+            if operation in search_ops:
+                # Search runs before any repository is known, so it cannot fall
+                # back to an anonymous call — point at the offline catalog.
+                return {
+                    "error": str(e),
+                    "hint": (
+                        "GitHub search needs the configured Git credential; without it, "
+                        "read the curated skill catalog instead (skill_source with "
+                        "operation=list_sources), which needs no network access."
+                    ),
+                }
+            return {"error": str(e)}
+
+        # h11 echoes an illegal header value back ("Illegal header value
+        # b'...'") — the echo IS the credential, and this tool's except
+        # Exception returns `{e}` to the LLM AND logs it with exc_info.
+        # Refuse before the transport sees the value; never echo it here.
+        problem = _header_value_problem(f"token {token}")
+        if problem:
+            return {
+                "error": (
+                    f"GitHub Authorization header {problem} — "
+                    "re-save the stored Git token without it"
+                )
+            }
+
+        base_url = context.cfg("GIT_BASE_URL").rstrip("/")
+        if not base_url:
+            return {"error": "GIT_BASE_URL is not configured — set it in Settings → Integrations → Git"}
+        api_path = context.cfg("GIT_API_BASE_PATH", "/api/v3")
+        # Match on the host, not the literal string: the setting is free text,
+        # so "https://WWW.GitHub.com/" must reach the public API just like
+        # "github.com" does.
+        base_host = base_url.split("://", 1)[-1].split("/", 1)[0].lower()
+        if base_host in ("github.com", "www.github.com"):
+            # Public GitHub: the API lives at api.github.com and paths are
+            # relative to it — no /api/v3 prefix, unlike GitHub Enterprise.
+            base_url = "https://api.github.com"
+            api_path = ""
+        api_url = f"{base_url}{api_path}"
+        http = ensure_http_client(context, target_url=base_url)
+        headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+
+        try:
+            handler = getattr(self, f"_op_{operation}", None)
+            if not handler:
+                return {"error": f"Unknown operation: {operation}"}
+            return await handler(params, api_url, headers, http)
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response else "error"
+            # Gateways echo the submitted credential back in error bodies
+            # ("Bad credentials: <token>") — the same pattern kong.py
+            # redacts. Redact BEFORE truncating so a credential straddling
+            # the cut is not left half-matched and partially leaked.
+            body = (
+                redact_secrets(e.response.text, {"git": token})[:500]
+                if e.response else ""
+            )
+            _log.warning("github %s HTTP %s: %s", operation, status, body[:200])
+            hint = ""
+            if status == 403:
+                hint = (
+                    " The Git token's account lacks permission for this repository — "
+                    "check that the personal access token has write scope "
+                    "(classic PAT: 'repo'; fine-grained: Contents + Pull requests read-and-write) "
+                    "and that the account is a collaborator with write access."
+                )
+            return {"error": f"GitHub API returned {status}: {body}{hint}"}
+        except Exception as e:
+            _log.warning("github %s failed: %s", operation, e, exc_info=True)
+            return {"error": f"GitHub operation failed: {e}"}
+
+    async def _op_search_by_jira_key(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        jira_key = params.get("jira_key", "")
+        if not jira_key:
+            return {"error": "jira_key is required"}
+        resp = await http.get(
+            f"{api_url}/search/issues",
+            headers=headers,
+            params={"q": f"{jira_key} is:pr", "per_page": 20},
+        )
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
+        prs = [{"number": i["number"], "title": i["title"], "state": i["state"],
+                "repository": i.get("repository_url", "").split("/repos/")[-1],
+                "url": i.get("html_url", "")} for i in items]
+
+        resp2 = await http.get(
+            f"{api_url}/search/commits",
+            headers={**headers, "Accept": "application/vnd.github.cloak-preview+json"},
+            params={"q": jira_key, "per_page": 10},
+        )
+        commits = []
+        if resp2.status_code == 200:
+            for c in resp2.json().get("items", []):
+                commits.append({"sha": c["sha"][:8], "message": c["commit"]["message"][:120],
+                                "repository": c.get("repository", {}).get("full_name", "")})
+
+        return {"jira_key": jira_key, "pull_requests": prs, "commits": commits}
+
+    async def _op_get_repo_info(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        repo = params.get("repository", "")
+        if not repo:
+            return {"error": "repository is required (owner/repo format)"}
+        resp = await http.get(f"{api_url}/repos/{repo}", headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        return {"full_name": data["full_name"], "default_branch": data["default_branch"],
+                "description": data.get("description", ""), "private": data.get("private", True)}
+
+    async def _op_get_user(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        resp = await http.get(f"{api_url}/user", headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        return {"login": data["login"], "name": data.get("name", ""), "email": data.get("email", "")}
+
+    async def _op_list_prs(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        all_repos = params.get("all_repos", False)
+        if all_repos:
+            author = params.get("author")
+            reviewer = params.get("reviewer")
+            state = str(params.get("state") or "open").lower()
+            q_parts = ["is:pr", "archived:false"]
+            # GitHub search has no "any state" value: `is:all` is an unknown
+            # qualifier that matches nothing, while omitting the state term
+            # means every state.
+            if state in ("open", "closed"):
+                q_parts.append(f"is:{state}")
+            if reviewer:
+                q_parts.append(f"review-requested:{reviewer}")
+            if author:
+                q_parts.append(f"author:{author}")
+            resp = await http.get(f"{api_url}/search/issues", headers=headers,
+                                  params={"q": " ".join(q_parts), "per_page": params.get("limit", 30)})
+            resp.raise_for_status()
+            items = resp.json().get("items", [])
+            return {"prs": [{"number": i["number"], "title": i["title"], "state": i["state"],
+                             "repository": i.get("repository_url", "").split("/repos/")[-1],
+                             "url": i.get("html_url", "")} for i in items], "count": len(items)}
+
+        repo = params.get("repository", "")
+        if not repo:
+            return {"error": "repository is required (or set all_repos=true)"}
+        author = params.get("author")
+        reviewer = params.get("reviewer")
+        if author or reviewer:
+            # The list-PRs endpoint has no author/reviewer parameters, so the
+            # old client-side filter only ever inspected the first `limit` PRs
+            # and reported count 0 for matches sitting on later pages. Search
+            # applies the filter server-side, like the all_repos path above.
+            state = str(params.get("state") or "open").lower()
+            q_parts = [f"repo:{repo}", "is:pr"]
+            # Same rule as all_repos: GitHub search has no `is:all` —
+            # omitting the state term is what selects every state.
+            if state in ("open", "closed"):
+                q_parts.append(f"is:{state}")
+            if reviewer:
+                q_parts.append(f"review-requested:{reviewer}")
+            if author:
+                q_parts.append(f"author:{author}")
+            if params.get("base"):
+                q_parts.append(f"base:{params['base']}")
+            if params.get("head"):
+                q_parts.append(f"head:{params['head']}")
+            resp = await http.get(
+                f"{api_url}/search/issues", headers=headers,
+                params={"q": " ".join(q_parts), "per_page": params.get("limit", 30)},
+            )
+            resp.raise_for_status()
+            items = resp.json().get("items", [])
+            return {"prs": [{"number": i["number"], "title": i["title"], "state": i["state"],
+                             "author": i.get("user", {}).get("login", ""),
+                             "url": i.get("html_url", "")} for i in items],
+                    "count": len(items)}
+        query_params: dict[str, Any] = {"state": params.get("state", "open"), "per_page": params.get("limit", 30)}
+        if params.get("base"):
+            query_params["base"] = params["base"]
+        if params.get("head"):
+            query_params["head"] = params["head"]
+        resp = await http.get(f"{api_url}/repos/{repo}/pulls", headers=headers, params=query_params)
+        resp.raise_for_status()
+        prs = resp.json()
+        return {"prs": [{"number": p["number"], "title": p["title"], "state": p["state"],
+                         "author": p.get("user", {}).get("login", ""),
+                         "url": p.get("html_url", "")} for p in prs], "count": len(prs)}
+
+    async def _fetch_pr_detail(
+        self, repo: str, number: int, api_url: str, headers: dict, http: httpx.AsyncClient,
+    ) -> dict:
+        """Fetch one PR's full review context.
+
+        Reviews and conversation comments are part of what the QA/tech-lead
+        workflows mean by "read the PR" — without them the agent kept going
+        back for the discussion by hand.
+        """
+        pr_resp, files_resp, commits_resp, reviews_resp, comments_resp = await asyncio.gather(
+            http.get(f"{api_url}/repos/{repo}/pulls/{number}", headers=headers),
+            http.get(f"{api_url}/repos/{repo}/pulls/{number}/files", headers=headers, params={"per_page": 100}),
+            http.get(f"{api_url}/repos/{repo}/pulls/{number}/commits", headers=headers, params={"per_page": 100}),
+            http.get(f"{api_url}/repos/{repo}/pulls/{number}/reviews", headers=headers, params={"per_page": 50}),
+            http.get(f"{api_url}/repos/{repo}/issues/{number}/comments", headers=headers, params={"per_page": 50}),
+        )
+        pr_resp.raise_for_status()
+        pr = pr_resp.json()
+
+        files = files_resp.json() if files_resp.status_code == 200 else []
+        commits = commits_resp.json() if commits_resp.status_code == 200 else []
+        reviews = reviews_resp.json() if reviews_resp.status_code == 200 else []
+        comments = comments_resp.json() if comments_resp.status_code == 200 else []
+
+        checks = []
+        head_sha = pr.get("head", {}).get("sha", "")
+        if head_sha:
+            cr_resp = await http.get(f"{api_url}/repos/{repo}/commits/{head_sha}/check-runs",
+                                     headers=headers, params={"per_page": 50})
+            if cr_resp.status_code == 200:
+                checks = [{"name": c["name"], "status": c["status"], "conclusion": c.get("conclusion")}
+                          for c in cr_resp.json().get("check_runs", [])]
+
+        return {
+            "repository": repo,
+            "number": pr["number"], "title": pr["title"], "state": pr["state"],
+            "draft": pr.get("draft", False),
+            "author": pr.get("user", {}).get("login", ""),
+            "body": (pr.get("body") or "")[:3000],
+            "base": pr.get("base", {}).get("ref", ""),
+            "head": pr.get("head", {}).get("ref", ""),
+            "head_sha": head_sha,
+            "mergeable": pr.get("mergeable"),
+            "files": [{"filename": f["filename"], "status": f["status"],
+                       "additions": f["additions"], "deletions": f["deletions"]} for f in files[:50]],
+            "commits": [{"sha": c["sha"][:8], "message": c["commit"]["message"][:120]} for c in commits],
+            "checks": checks,
+            "reviews": [{"author": r.get("user", {}).get("login", ""), "state": r.get("state"),
+                         "body": (r.get("body") or "")[:1000], "submitted_at": r.get("submitted_at")}
+                        for r in reviews],
+            "comments": [{"author": c.get("user", {}).get("login", ""),
+                          "body": (c.get("body") or "")[:1000], "created_at": c.get("created_at")}
+                         for c in comments],
+        }
+
+    async def _op_get_pr_detail(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        repo, number = self._resolve_pr(params)
+        if not repo or not number:
+            return {"error": "repository+number or url is required"}
+        return await self._fetch_pr_detail(repo, int(number), api_url, headers, http)
+
+    async def _op_get_pr_details(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        """Fetch several PRs in one call, concurrently.
+
+        A card usually has more than one PR, and the per-PR detail call is
+        several round trips on its own; looping it serially in the agent costs
+        one full turn per PR.
+        """
+        targets: list[tuple[str, int]] = []
+        skipped: list[str] = []
+        jira_key = params.get("jira_key", "")
+        if jira_key:
+            found = await self._op_search_by_jira_key(
+                {"jira_key": jira_key}, api_url, headers, http)
+            if "error" in found:
+                return found
+            for pr in found.get("pull_requests", []):
+                repo = pr.get("repository") or params.get("repository", "")
+                if repo and pr.get("number"):
+                    targets.append((repo, int(pr["number"])))
+        else:
+            repo = params.get("repository", "")
+            numbers = params.get("pr_numbers") or []
+            # Same LLM-stringified-param defense as the confluence batch read:
+            # a bare string would be iterated character by character.
+            if isinstance(numbers, str):
+                numbers = [n.strip() for n in numbers.split(",") if n.strip()]
+            if not repo:
+                return {"error": "repository is required (owner/repo format)"}
+            for entry in numbers:
+                try:
+                    targets.append((repo, int(entry)))
+                except (TypeError, ValueError):
+                    skipped.append(str(entry))
+
+        if not targets:
+            return {"error": "no PRs to fetch — pass repository+pr_numbers, or a jira_key that links PRs"}
+
+        targets = targets[:_MAX_PR_DETAILS]
+        results = await asyncio.gather(
+            *[self._fetch_pr_detail(repo, number, api_url, headers, http) for repo, number in targets],
+            return_exceptions=True,
+        )
+        details = []
+        for (repo, number), result in zip(targets, results):
+            if isinstance(result, BaseException):
+                details.append({"repository": repo, "number": number, "error": _pr_error(result)})
+            else:
+                details.append(result)
+        payload: dict[str, Any] = {"pull_requests": details, "count": len(details)}
+        if skipped:
+            payload["skipped"] = skipped
+        return payload
+
+    async def _op_approve_pr(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        repo, number = self._resolve_pr(params)
+        if not repo or not number:
+            return {"error": "repository+number or url is required"}
+        body = params.get("body", "LGTM")
+        resp = await http.post(f"{api_url}/repos/{repo}/pulls/{number}/reviews",
+                               headers=headers, json={"event": "APPROVE", "body": body})
+        resp.raise_for_status()
+        return {"success": True, "repository": repo, "number": number, "action": "approved"}
+
+    async def _op_merge_pr(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        repo, number = self._resolve_pr(params)
+        if not repo or not number:
+            return {"error": "repository+number or url is required"}
+        payload: dict[str, Any] = {"merge_method": params.get("merge_method", "squash")}
+        if params.get("commit_title"):
+            payload["commit_title"] = params["commit_title"]
+        if params.get("sha"):
+            payload["sha"] = params["sha"]
+        resp = await http.put(f"{api_url}/repos/{repo}/pulls/{number}/merge",
+                              headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        return {"success": True, "merged": data.get("merged", True),
+                "sha": data.get("sha", ""), "message": data.get("message", "")}
+
+    async def _op_get_commit_checks(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        repo = params.get("repository", "")
+        sha = params.get("sha", "")
+        if not repo or not sha:
+            return {"error": "repository and sha are required"}
+
+        check_runs_resp, status_resp = await asyncio.gather(
+            http.get(f"{api_url}/repos/{repo}/commits/{sha}/check-runs",
+                     headers=headers, params={"per_page": 100}),
+            http.get(f"{api_url}/repos/{repo}/commits/{sha}/status", headers=headers),
+        )
+
+        check_runs = []
+        if check_runs_resp.status_code == 200:
+            for c in check_runs_resp.json().get("check_runs", []):
+                check_runs.append({
+                    "name": c["name"],
+                    "status": c["status"],
+                    "conclusion": c.get("conclusion"),
+                    "url": c.get("html_url", ""),
+                })
+
+        combined_state = None
+        statuses = []
+        if status_resp.status_code == 200:
+            data = status_resp.json()
+            combined_state = data.get("state")
+            for s in data.get("statuses", []):
+                statuses.append({
+                    "context": s.get("context"),
+                    "state": s.get("state"),
+                    "description": s.get("description", ""),
+                })
+
+        # queued/waiting/pending check-runs have conclusion=None
+        # and were previously counted as passing — the agent would merge a PR
+        # whose CI hadn't even started. A check passes only when it has
+        # COMPLETED with a success/skipped conclusion.
+        checks_passing = all(
+            c["status"] == "completed" and c["conclusion"] in ("success", "skipped")
+            for c in check_runs
+        )
+        # The legacy Commit Status API reports "pending" for a commit with zero
+        # statuses — the shape of every repo that only uses GitHub Actions. Requiring
+        # combined_state == "success" therefore pinned all_passing to False even with
+        # every check-run green. "No legacy statuses" is neutral; a failed statuses
+        # API call (combined_state None) and a repo with no CI at all still fail
+        # closed.
+        legacy_ok = combined_state == "success" or (
+            combined_state == "pending" and not statuses
+        )
+        all_passing = bool(check_runs or statuses) and checks_passing and legacy_ok
+
+        return {
+            "repository": repo,
+            "sha": sha,
+            "combined_state": combined_state,
+            "all_passing": all_passing,
+            "check_runs": check_runs,
+            "statuses": statuses,
+        }
+
+    async def _op_add_pr_comment(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        repo, number = self._resolve_pr(params)
+        if not repo or not number:
+            return {"error": "repository+number or url is required"}
+        body = params.get("body", "")
+        if not body:
+            return {"error": "body is required"}
+        resp = await http.post(f"{api_url}/repos/{repo}/issues/{number}/comments",
+                               headers=headers, json={"body": body})
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "success": True,
+            "repository": repo,
+            "number": number,
+            "comment_id": data.get("id"),
+            "comment_url": data.get("html_url", ""),
+        }
+
+    async def _op_create_pr(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        repo = params.get("repository", "")
+        if not repo:
+            return {"error": "repository is required (owner/repo format)"}
+        if not params.get("title") or not params.get("head_branch"):
+            return {"error": "title and head_branch are required"}
+        payload: dict[str, Any] = {
+            "title": params["title"],
+            "head": params["head_branch"],
+            "base": params.get("base_branch", "main"),
+            "body": params.get("body", ""),
+            "draft": params.get("draft", False),
+        }
+        resp = await http.post(f"{api_url}/repos/{repo}/pulls", headers=headers, json=payload)
+        if resp.status_code == 422:
+            # GitHub returns 422 for both duplicate-PR and invalid-request cases.
+            # Query the exact owner-qualified head and base before classifying it.
+            # A fork PR head is already '<fork-owner>:<branch>'; a same-repo head
+            # is qualified with the upstream owner.
+            head_branch = params["head_branch"]
+            qualified_head = (
+                head_branch if ":" in head_branch
+                else f"{repo.split('/', 1)[0]}:{head_branch}"
+            )
+            existing_resp = await http.get(
+                f"{api_url}/repos/{repo}/pulls",
+                headers=headers,
+                params={
+                    "state": "open",
+                    "head": qualified_head,
+                    "base": payload["base"],
+                    "per_page": 100,
+                },
+            )
+            existing_resp.raise_for_status()
+            existing = existing_resp.json()
+            if len(existing) == 1:
+                data = existing[0]
+                return {
+                    "status": "already_exists",
+                    "number": data["number"],
+                    "url": data["html_url"],
+                    "title": data.get("title", ""),
+                    "head": data.get("head", {}).get("ref", params["head_branch"]),
+                    "base": data.get("base", {}).get("ref", payload["base"]),
+                }
+            if not existing:
+                return {
+                    "error": (
+                        "GitHub create_pr returned 422, but no unique open PR was found "
+                        f"for {repo}:{params['head_branch']} -> {payload['base']}"
+                    )
+                }
+            return {
+                "error": (
+                    "GitHub create_pr returned 422 and the owner:head/base query found "
+                    f"{len(existing)} open PRs; refusing to choose one"
+                )
+            }
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "success": True,
+            "number": data["number"],
+            "url": data["html_url"],
+            "title": data["title"],
+            "head": data["head"]["ref"],
+            "base": data["base"]["ref"],
+        }
+
+    async def _op_fork(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        """Create a fork of the target repository under the configured Git account.
+
+        POST /repos/{owner}/{repo}/forks is idempotent in effect: if a fork with
+        the same name already exists, GitHub returns 202 with the existing fork.
+        """
+        repo = params.get("repository", "")
+        if not repo:
+            return {"error": "repository is required (owner/repo format)"}
+        resp = await http.post(f"{api_url}/repos/{repo}/forks", headers=headers, json={})
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "status": "forked",
+            "full_name": data.get("full_name", ""),
+            "clone_url": data.get("clone_url", ""),
+            "ssh_url": data.get("ssh_url", ""),
+            "html_url": data.get("html_url", ""),
+            "default_branch": data.get("default_branch", ""),
+            "parent": repo,
+        }
+
+    async def _op_is_starred(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        """Check whether the configured Git account has starred the repository."""
+        repo = params.get("repository", "")
+        if not repo:
+            return {"error": "repository is required (owner/repo format)"}
+        resp = await http.get(f"{api_url}/user/starred/{repo}", headers=headers)
+        if resp.status_code == 204:
+            return {"starred": True, "repository": repo}
+        if resp.status_code == 404:
+            # 404 means "not starred" (the endpoint also 404s for repos the
+            # account cannot see, which is equivalent for our purpose).
+            return {"starred": False, "repository": repo}
+        resp.raise_for_status()
+        return {"starred": True, "repository": repo}
+
+    async def _op_star(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        """Star the repository with the configured Git account (PUT /user/starred/...)."""
+        repo = params.get("repository", "")
+        if not repo:
+            return {"error": "repository is required (owner/repo format)"}
+        resp = await http.put(f"{api_url}/user/starred/{repo}", headers=headers)
+        if resp.status_code == 204:
+            return {"status": "starred", "repository": repo}
+        resp.raise_for_status()
+        return {"status": "starred", "repository": repo}
+
+    async def _op_search_repositories(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        """Find repositories by keyword or qualifier — e.g. skill libraries."""
+        query = (params.get("query") or "").strip()
+        if not query:
+            return {"error": "query is required"}
+        limit = max(1, min(int(params.get("limit", 30) or 30), 100))
+        sort = params.get("sort", "best-match")
+        query_params: dict[str, Any] = {"q": query, "per_page": limit}
+        if sort in ("stars", "updated"):
+            query_params["sort"] = sort
+        resp = await http.get(f"{api_url}/search/repositories", headers=headers, params=query_params)
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
+        return {
+            "query": query,
+            "count": len(items),
+            "repositories": [
+                {
+                    "full_name": r.get("full_name", ""),
+                    "description": (r.get("description") or "")[:200],
+                    "stars": r.get("stargazers_count", 0),
+                    "default_branch": r.get("default_branch", ""),
+                    "clone_url": r.get("clone_url", ""),
+                    "url": r.get("html_url", ""),
+                    "topics": r.get("topics", [])[:10],
+                }
+                for r in items
+            ],
+            "hint": (
+                "Pass a full_name (owner/repo) to the skill_source tool to browse "
+                "the skills it publishes."
+            ),
+        }
+
+    async def _op_search_code(self, params: dict, api_url: str, headers: dict, http: httpx.AsyncClient) -> dict:
+        """Find files by content or path — e.g. filename:SKILL.md across GitHub."""
+        query = (params.get("query") or "").strip()
+        if not query:
+            return {"error": "query is required"}
+        limit = max(1, min(int(params.get("limit", 30) or 30), 100))
+        resp = await http.get(f"{api_url}/search/code", headers=headers, params={"q": query, "per_page": limit})
+        if resp.status_code == 404:
+            # Code search is unavailable on older GitHub Enterprise versions
+            # and on instances where the search index is disabled.
+            return {
+                "error": "Code search is not available on this GitHub instance.",
+                "hint": "Use search_repositories instead, then browse the repository with skill_source.",
+            }
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
+        return {
+            "query": query,
+            "count": len(items),
+            "results": [
+                {
+                    "repository": i.get("repository", {}).get("full_name", ""),
+                    "path": i.get("path", ""),
+                    "url": i.get("html_url", ""),
+                }
+                for i in items
+            ],
+        }
+
+    def _resolve_pr(self, params: dict) -> tuple[str, int | None]:
+        if params.get("url"):
+            m = re.match(r".*/repos?/([^/]+/[^/]+)/pulls?/(\d+)", params["url"])
+            if not m:
+                m = re.match(r"https?://[^/]+/([^/]+/[^/]+)/pull/(\d+)", params["url"])
+            if m:
+                return m.group(1), int(m.group(2))
+        repo = params.get("repository", "")
+        number = params.get("number")
+        return repo, number

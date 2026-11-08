@@ -1,0 +1,393 @@
+"""Shared sandboxed subprocess runner for automation scripts.
+
+Single execution path for both human-triggered runs (the API router's
+/scripts/{id}/run) and agent-triggered runs (the script_writer tool): same
+concurrency slot, same credential-scrubbed env, same log streaming into the
+ScriptRun row. The API router imports from here and re-exports the module-level
+names its tests monkeypatch.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import sys
+from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+_log = logging.getLogger("agents_universe.scripts")
+
+# every POST /scripts/{id}/run spawns a sandboxed subprocess with
+# no concurrency cap - any authenticated user could exhaust server memory by
+# firing unlimited runs. Cap concurrent executions; requests beyond the cap
+# queue for a slot instead of failing, so multi-user access never errors.
+_DEFAULT_CONCURRENCY_LIMIT = 3
+# Ceiling for the configured value: the cap is a memory guard, so raising it is
+# a deliberate choice about the host, not a preference to be discovered by
+# setting a large number.
+_MAX_CONCURRENCY_LIMIT = 16
+_script_semaphore: asyncio.Semaphore | None = None
+
+
+def _concurrency_limit() -> int:
+    """Configured run cap, defaulting to ``_DEFAULT_CONCURRENCY_LIMIT``.
+
+    Configurable because the right number is a property of the host, and the
+    one global pool is shared by human runs, agent runs and scheduled runs (a
+    browser per Playwright run means a slot is not cheap). Read when the
+    semaphore is created, so an unparseable value degrades to the default
+    rather than disabling the cap.
+    """
+    raw = os.environ.get("SCRIPTS_CONCURRENCY_LIMIT", "").strip()
+    if not raw:
+        return _DEFAULT_CONCURRENCY_LIMIT
+    try:
+        limit = int(raw)
+    except ValueError:
+        _log.warning(
+            "SCRIPTS_CONCURRENCY_LIMIT=%r is not an integer; using %d",
+            raw, _DEFAULT_CONCURRENCY_LIMIT,
+        )
+        return _DEFAULT_CONCURRENCY_LIMIT
+    if not 1 <= limit <= _MAX_CONCURRENCY_LIMIT:
+        _log.warning(
+            "SCRIPTS_CONCURRENCY_LIMIT=%d is outside 1..%d; clamping",
+            limit, _MAX_CONCURRENCY_LIMIT,
+        )
+    return max(1, min(limit, _MAX_CONCURRENCY_LIMIT))
+
+# Execution timeout for python/bash scripts (the WS poll loop outlasts it).
+SCRIPT_TIMEOUT = 300
+
+# WS log poll cadence for the stream flusher.
+RUN_POLL_INTERVAL = 2
+
+# Caps for the run log fields (UnicodeText is unbounded - the caps keep giant
+# test output from bloating rows the WS view re-reads on every poll). The
+# streamed log is HEAD-capped: the WS sends incremental diffs of
+# stdout_log + stderr_log, so the stored log must only ever grow - a
+# tail-truncation would shift the diff boundary and garble the client view.
+LOG_CAP = 100_000
+STDERR_CAP = 4000
+
+# Lines kept past the log cap when a caller passes a tail buffer. A test
+# runner's verdict (counts, failed case names) is the LAST thing it prints, so
+# a head-capped log alone cannot answer "did it pass?".
+TAIL_LINES = 200
+
+
+def new_log_tail() -> deque[str]:
+    """Bounded tail buffer for stream_subprocess(tail_acc=...)."""
+    return deque(maxlen=TAIL_LINES)
+
+
+def script_slot_guard() -> asyncio.Semaphore:
+    """Lazily create the slot semaphore for script runs."""
+    global _script_semaphore
+    if _script_semaphore is None:
+        limit = _concurrency_limit()
+        _log.info("script run concurrency limit: %d", limit)
+        _script_semaphore = asyncio.Semaphore(limit)
+    return _script_semaphore
+
+
+def sandbox_env() -> dict[str, str]:
+    """os.environ minus credential-like keys (the same deny lists
+    ToolContext.safe_env applies to LLM-generated code), with the proxy
+    spellings normalized the way every other networked channel normalizes
+    them (resolved URL in all four spellings, ALL_PROXY and empty
+    placeholders dropped) so a script or QA run reaches the network through
+    the same proxy as the shell tool."""
+    import os
+
+    from agent_core.tools.base import ToolContext, apply_proxy_env
+
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        upper = key.upper()
+        if upper in ToolContext._ENV_DENY_EXACT:
+            continue
+        if upper.rsplit("_", 1)[-1] in ToolContext._ENV_DENY_SUFFIXES:
+            continue
+        if any(upper.startswith(p) for p in ToolContext._ENV_DENY_PREFIXES):
+            continue
+        env[key] = value
+    return apply_proxy_env(env)
+
+
+def persist_run_log(run, log_acc: list[str]) -> None:
+    """Head-capped snapshot of the accumulated log. The WS log view polls the
+    DB and sends incremental diffs, so the stored value must only grow."""
+    run.stdout_log = "".join(log_acc)[:LOG_CAP]
+
+
+async def drain_stream(
+    stream, log_acc: list[str], budget: list[int],
+    tail_acc: deque[str] | None = None,
+) -> None:
+    """Append output lines to log_acc in arrival order, up to the log cap.
+
+    budget is a one-element mutable counter of remaining chars; once it hits
+    zero a truncation marker is emitted and further output is dropped.
+    tail_acc, when given, keeps the last lines *regardless* of the cap - the
+    verdict of a test run is printed last, i.e. exactly what a head-capped log
+    loses first."""
+    while True:
+        line = await stream.readline()
+        if not line:
+            break
+        if budget[0] <= 0:
+            if budget[0] == 0:
+                log_acc.append("[executor] output truncated (log cap reached)\n")
+                budget[0] = -1
+            if tail_acc is not None:
+                tail_acc.append(line.decode(errors="replace"))
+            continue
+        text = line.decode(errors="replace")
+        budget[0] -= len(text)
+        if budget[0] < 0:
+            # A single line can overshoot the cap, and the marker above only
+            # fires on exactly zero - clamp so the truncation is never silent.
+            budget[0] = 0
+        log_acc.append(text)
+        if tail_acc is not None:
+            tail_acc.append(text)
+
+
+async def stream_subprocess(
+    db: AsyncSession, run, log_acc: list[str],
+    cmd: list[str], cwd: str, env: dict[str, str], timeout: float,
+    tail_acc: deque[str] | None = None,
+) -> int:
+    """Run a subprocess and stream its output into the run row every ~2s.
+
+    Owns the DB session for the duration - callers must not commit
+    concurrently. Timeout and cancellation kill the whole process tree: a
+    Playwright run spawns chromium children that plain proc.kill() would
+    leave running (and writing) after the run ends. Returns the exit code;
+    raises asyncio.TimeoutError on timeout and re-raises CancelledError
+    after cleanup.
+
+    tail_acc (see drain_stream) survives the log cap so the caller can parse a
+    verdict out of output the stored log had to drop."""
+    from agent_core.sandbox import spawn_in_new_session, terminate_process_tree
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+        **spawn_in_new_session(),
+    )
+    budget = [LOG_CAP - sum(len(s) for s in log_acc)]
+    readers = [
+        asyncio.create_task(drain_stream(proc.stdout, log_acc, budget, tail_acc)),
+        asyncio.create_task(drain_stream(proc.stderr, log_acc, budget, tail_acc)),
+    ]
+    # A stop event (not task cancellation) ends the flusher: cancelling it
+    # mid-commit could poison the session for the terminal-state write that
+    # follows in the caller.
+    stop = asyncio.Event()
+
+    async def _flush_loop() -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=RUN_POLL_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
+            if stop.is_set():
+                return
+            persist_run_log(run, log_acc)
+            await db.commit()
+
+    flusher = asyncio.create_task(_flush_loop())
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        terminate_process_tree(proc)
+        await proc.wait()
+        raise
+    finally:
+        stop.set()
+        await asyncio.gather(flusher, return_exceptions=True)
+        # Readers finish once the exited/killed process closes its pipes.
+        await asyncio.gather(*readers, return_exceptions=True)
+        persist_run_log(run, log_acc)
+        await db.commit()
+    return proc.returncode
+
+
+async def execute_script(
+    run_id: str, content: str, script_type: str, triggered_by: str = "",
+    project_fs: str = "", session_factory: Callable[[], AsyncSession] | None = None,
+) -> None:
+    """Run a script sandboxed the same way agent-core's code_executor runs code.
+
+    this previously executed user content with `sys.executable`/`bash`
+    and no sandbox - any authenticated user could read the server's .env,
+    decrypt the token vault, or reach internal services. Now:
+    - the subprocess env strips credential-like keys (SECRET_KEY, DB
+      connection strings, provider tokens - the framework's safe_env lists);
+    - python scripts run under the sitecustomize audit-hook guard
+      (python_guard_env, strict=True also blocks subprocess), with the script
+      file and cwd inside the project workspace so the guard covers them;
+    - bash scripts are line-validated for path escapes and rejected if they
+      use the framework's blocked commands (curl/wget/node/python3/ssh/...),
+      which would otherwise reach the API itself, Redis, or the metadata
+      endpoint.
+
+    The session factory is parameterized so callers with their own DB wiring
+    (the script_writer tool passes the conversation's session factory) reuse
+    it; the default falls back to the API's AsyncSessionLocal.
+    """
+    try:
+        from api.models.script import ScriptRun
+    except ImportError:
+        _log.warning(
+            "api.models.script unavailable - cannot execute run %s", run_id
+        )
+        return
+
+    if session_factory is None:
+        from api.database import AsyncSessionLocal
+        session_factory = AsyncSessionLocal
+
+    async with session_factory() as db:
+        result = await db.execute(select(ScriptRun).where(ScriptRun.run_id == run_id))
+        run = result.scalar_one_or_none()
+        if not run:
+            return
+
+        run.status = "running"
+        await db.commit()
+
+        if script_type not in ("python", "bash"):
+            run.status = "failed"
+            run.stderr_log = f"Unsupported script_type {script_type!r} (allowed: python, bash)"
+            run.exit_code = -1
+            run.completed_at = datetime.now(timezone.utc)
+            await db.commit()
+            return
+
+        if not project_fs:
+            run.status = "failed"
+            run.stderr_log = "Script execution requires a project workspace"
+            run.exit_code = -1
+            run.completed_at = datetime.now(timezone.utc)
+            await db.commit()
+            return
+
+        script_path = None
+        log_acc: list[str] = []
+        try:
+            from agent_core.sandbox import python_guard_env
+            from agent_core.tools.code_executor import CodeExecutorTool
+
+            project_root = Path(project_fs)
+            # Script file lives inside the project (.tmp/work/scripts/) so the
+            # Python file-access guard can read it; cwd is the project root.
+            work_dir = project_root / ".tmp" / "work" / "scripts"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            ext = ".py" if script_type == "python" else ".sh"
+            script_path = work_dir / f"{run_id}{ext}"
+            script_path.write_text(content, encoding="utf-8")
+
+            if script_type == "bash":
+                # Same gates as code_executor's bash mode: blocked external
+                # commands (curl/wget/node/python3/ssh/...) then line-level
+                # path-escape validation.
+                # ANSI-C quoting ($'\x2fetc\x2fpasswd') decodes at runtime,
+                # after every check below has seen only quote-stripped text:
+                # the shlex unescape turns the token into literal content
+                # while bash still executes the decoded path. Check the RAW
+                # script, like code_executor's bash branch.
+                if "$'" in content:
+                    raise RuntimeError(
+                        "Script uses ANSI-C quoting ($'...'), which is not "
+                        "allowed: it decodes characters after validation."
+                    )
+                # Per-line tokenizing, like code_executor: whole-content
+                # shlex raised on an apostrophe anywhere (e.g. a heredoc
+                # body) and the raw fallback then missed a backslash-
+                # obfuscated command (`c\url ...`), which bash unescapes
+                # back to curl and executes.
+                try:
+                    blocked = CodeExecutorTool._find_blocked_bash(content)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"Script could not be tokenized safely ({exc}); refusing to run."
+                    ) from exc
+                if blocked:
+                    raise RuntimeError(
+                        "Script uses a blocked command (curl/wget/node/python3/ssh/...). "
+                        "Server-side scripts are confined to in-project automation."
+                    )
+                reason = CodeExecutorTool._validate_bash(content, project_root)
+                if reason:
+                    raise RuntimeError(reason)
+
+            env = sandbox_env()
+
+            if script_type == "python":
+                cmd = [sys.executable, str(script_path)]
+                # Arms the sitecustomize audit hook: file reads/writes confined
+                # to the project root; strict=True also blocks subprocess (a
+                # child python could otherwise read outside the guard).
+                # HOME must point inside the project: the guard whitelists
+                # $HOME caches (~/.cache, ~/.npm, ~/.semgrep) for tooling, and
+                # inheriting the server user's HOME would whitelist their real
+                # caches as readable — the same reason code_executor points
+                # HOME at its scratch dir.
+                env["HOME"] = str(work_dir)
+                env.update(python_guard_env(project_root, strict=True))
+            else:
+                cmd = ["bash", str(script_path)]
+
+            exit_code = await stream_subprocess(
+                db, run, log_acc, cmd, str(project_root), env, SCRIPT_TIMEOUT,
+            )
+            run.exit_code = exit_code
+            run.status = "completed" if exit_code == 0 else "failed"
+        except asyncio.TimeoutError:
+            run.status = "failed"
+            run.stderr_log = f"Execution timed out ({SCRIPT_TIMEOUT}s)"
+            run.exit_code = -1
+        except asyncio.CancelledError:
+            # The run row would stay at "running" forever (CancelledError is a
+            # BaseException, bypassing `except Exception` and the tail commit),
+            # blocking project deletion with a phantom running job. Persist a
+            # terminal state, then keep propagating the cancellation.
+            run.status = "failed"
+            run.stderr_log = "Execution cancelled"
+            run.exit_code = -1
+            run.completed_at = datetime.now(timezone.utc)
+            await db.commit()
+            raise
+        except Exception as e:
+            # A failed progress flush leaves the session pending-rollback:
+            # assigning alone would make the final commit raise
+            # PendingRollbackError and strand the row at "running", blocking
+            # project deletion. Roll back and re-fetch on a clean session.
+            await db.rollback()
+            run = await db.get(ScriptRun, run_id)
+            if run is None:
+                return
+            run.status = "failed"
+            run.stderr_log = str(e)[:STDERR_CAP]
+            run.exit_code = -1
+        finally:
+            if script_path is not None:
+                try:
+                    script_path.unlink()
+                except OSError:
+                    pass
+
+        run.completed_at = datetime.now(timezone.utc)
+        await db.commit()

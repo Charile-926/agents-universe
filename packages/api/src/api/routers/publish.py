@@ -1,0 +1,891 @@
+"""Agent-as-a-Service publish router.
+
+Two surfaces live here:
+
+- **Management** (SSO-authenticated, ``/api/publishes*``): create/update/
+  delete publishes and their API keys. The publisher binds one of their
+  model configs (``model_config_id``) — every run, external or embedded,
+  executes under that model.
+- **Public API** (API-Key-authenticated, ``/api/p/{publish_id}*``): SSE
+  conversation stream. A key is required; the key never leaves the request
+  header, is never echoed, and is stored only as a SHA-256 hash.
+
+Rate limiting: a process-wide semaphore bounds concurrent published runs so
+a burst cannot exhaust the publisher's model quota or the event loop.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from fastapi import APIRouter, Body, Depends, Query, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from api.database import get_db
+from api.dependencies.auth import UserInfo, get_current_user
+from api.errors import api_error
+from api.models._compat import now_utc as _now_utc
+from api.models.agent import Agent
+from api.models.project import Project
+from api.models.publish import AgentPublish, PublishKey
+from api.models.user import UserModelConfig
+from api.services.publish import (
+    SSEStream,
+    _find_publish_conversation_id,
+    generate_publish_key,
+    get_or_create_publish_conversation,
+    hash_publish_key,
+    publish_key_hint,
+    require_publish_project_open,
+    sse_format,
+)
+
+_log = logging.getLogger("agents_universe.publish")
+
+router = APIRouter()
+
+# Process-wide cap on concurrent published runs (per worker). Bounded, not a
+# queue: excess calls 429 immediately instead of stacking up.
+_publish_semaphore = asyncio.Semaphore(16)
+
+
+# ── Pydantic bodies ────────────────────────────────────────────────────────
+
+
+class PublishCreate(BaseModel):
+    agent_slug: str = Field(min_length=1, max_length=100)
+    project_id: str = Field(min_length=1, max_length=36)
+    model_config_id: str = Field(min_length=1, max_length=36)
+    title: str | None = Field(None, max_length=255)
+    description: str | None = None
+
+
+class PublishUpdate(BaseModel):
+    title: str | None = Field(None, max_length=255)
+    description: str | None = None
+    page_enabled: bool | None = None
+    api_enabled: bool | None = None
+    model_config_id: str | None = Field(None, max_length=36)
+
+
+class PublishKeyCreate(BaseModel):
+    name: str | None = Field(None, max_length=100)
+
+
+class RunRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=200_000)
+    # Optional client-supplied thread id — the partition key of the API
+    # stream: every (publish, thread_id) pair gets its own conversation, so
+    # multi-turn agents keep their history without sharing it with other
+    # threads of the same publish. Omitted → "default".
+    thread_id: str | None = Field(None, max_length=100)
+
+
+class AbortRequest(BaseModel):
+    # Thread id of the run to stop — must match the thread that started it,
+    # so one caller's abort never kills another caller's thread on the same
+    # publish. Omitted → "default".
+    thread_id: str | None = Field(None, max_length=100)
+
+
+# ── Auth helpers ───────────────────────────────────────────────────────────
+
+
+async def _load_owned_publish(db, publish_id: str, user_id: str) -> AgentPublish:
+    result = await db.execute(
+        select(AgentPublish).where(
+            AgentPublish.publish_id == publish_id,
+            AgentPublish.owner_id == user_id,
+        )
+    )
+    publish = result.scalar_one_or_none()
+    if not publish:
+        raise api_error(404, "PUBLISH_NOT_FOUND", "Publish not found")
+    return publish
+
+
+async def _authorize_publish_key(request: Request, db: AsyncSession, publish_id: str):
+    """Validate the API key and return the publish (or raise 401/403)."""
+    from api.services.publish import authenticate_publish_key
+
+    auth = request.headers.get("authorization") or ""
+    api_key = ""
+    if auth.lower().startswith("bearer "):
+        api_key = auth[7:].strip()
+    else:
+        # X-API-Key header fallback (some HTTP clients set no Authorization).
+        api_key = (request.headers.get("x-api-key") or "").strip()
+    if not api_key:
+        raise api_error(401, "PUBLISH_API_KEY_REQUIRED", "API key required")
+    found = await authenticate_publish_key(db, api_key)
+    if found is None:
+        raise api_error(401, "PUBLISH_API_KEY_INVALID", "Invalid API key")
+    found_pubid, _ = found
+    if found_pubid != publish_id:
+        raise api_error(401, "PUBLISH_API_KEY_MISMATCH", "API key does not match this publish")
+    result = await db.execute(
+        select(AgentPublish).where(AgentPublish.publish_id == publish_id)
+    )
+    publish = result.scalar_one_or_none()
+    if not publish:
+        raise api_error(404, "PUBLISH_NOT_FOUND", "Publish not found")
+    if not publish.api_enabled:
+        raise api_error(403, "PUBLISH_API_DISABLED", "Publish API is disabled")
+    # A key has no identity to check against a whitelist: a private project
+    # cuts off every API caller.
+    await require_publish_project_open(db, publish, None)
+    return publish
+
+
+# ── Management (SSO) ───────────────────────────────────────────────────────
+
+
+@router.get("/api/publishes")
+async def list_publishes(
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(AgentPublish)
+        .where(AgentPublish.owner_id == current_user.user_id)
+        .order_by(AgentPublish.created_at.desc())
+    )
+    publishes = result.scalars().all()
+    return [
+        {
+            "publish_id": str(p.publish_id),
+            "agent_slug": p.agent_slug,
+            "project_id": str(p.project_id),
+            "model_config_id": p.model_config_id,
+            "title": p.title,
+            "description": p.description,
+            "page_enabled": p.page_enabled,
+            "api_enabled": p.api_enabled,
+            "created_at": p.created_at.isoformat(),
+            "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+        }
+        for p in publishes
+    ]
+
+
+@router.post("/api/publishes", status_code=201)
+async def create_publish(
+    body: PublishCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    # Project must exist and the publisher must manage it (creator or
+    # whitelisted member) — publishing exposes the project's resources.
+    proj_result = await db.execute(
+        select(Project).where(
+            Project.project_id == body.project_id,
+            Project.is_active == True,  # noqa: E712
+        )
+    )
+    project = proj_result.scalar_one_or_none()
+    if not project:
+        raise api_error(404, "PROJECT_NOT_FOUND", "Project not found")
+    from api.dependencies.auth import is_project_manager
+    if not await is_project_manager(db, project, current_user.user_id):
+        raise api_error(403, "PUBLISH_FORBIDDEN", "You are not allowed to publish this project")
+
+    # Agent must resolve to a global or this-project agent.
+    agent_result = await db.execute(
+        select(Agent).where(Agent.slug == body.agent_slug)
+    )
+    agent = agent_result.scalar_one_or_none()
+    if agent is None or (agent.project_id is not None and agent.project_id != body.project_id):
+        raise api_error(404, "AGENT_NOT_FOUND", "Agent not found")
+
+    # Model config must be the publisher's own.
+    cfg_result = await db.execute(
+        select(UserModelConfig).where(
+            UserModelConfig.config_id == body.model_config_id,
+            UserModelConfig.user_id == current_user.user_id,
+        )
+    )
+    if cfg_result.scalar_one_or_none() is None:
+        raise api_error(400, "PUBLISH_MODEL_CONFIG_INVALID", "Model config does not exist or does not belong to you")
+
+    # One publish per (publisher, agent) — the DB enforces it too, but a
+    # pre-check turns the duplicate into a clear 409 instead of a 500.
+    existing = (
+        await db.execute(
+            select(AgentPublish.publish_id).where(
+                AgentPublish.owner_id == current_user.user_id,
+                AgentPublish.agent_slug == body.agent_slug,
+            )
+        )
+    ).first()
+    if existing is not None:
+        raise api_error(409, "PUBLISH_ALREADY_EXISTS", "This agent is already published; do not create it again")
+
+    publish = AgentPublish(
+        owner_id=current_user.user_id,
+        agent_slug=body.agent_slug,
+        project_id=body.project_id,
+        model_config_id=body.model_config_id,
+        title=body.title,
+        description=body.description,
+    )
+    db.add(publish)
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Lost the race against a concurrent create: same outcome as the
+        # pre-check, not a 500.
+        await db.rollback()
+        raise api_error(409, "PUBLISH_ALREADY_EXISTS", "This agent is already published; do not create it again") from None
+    return {
+        "publish_id": str(publish.publish_id),
+        "agent_slug": publish.agent_slug,
+        "project_id": str(publish.project_id),
+        "model_config_id": publish.model_config_id,
+        "title": publish.title,
+        "description": publish.description,
+        "page_enabled": publish.page_enabled,
+        "api_enabled": publish.api_enabled,
+        # Same shape as GET/list — the UI prepends this row and renders its
+        # date chip straight away, without a reload.
+        "created_at": publish.created_at.isoformat(),
+        "updated_at": publish.updated_at.isoformat() if publish.updated_at else None,
+    }
+
+
+@router.get("/api/publishes/{publish_id}")
+async def get_publish(
+    publish_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    publish = await _load_owned_publish(db, publish_id, current_user.user_id)
+    return {
+        "publish_id": str(publish.publish_id),
+        "agent_slug": publish.agent_slug,
+        "project_id": str(publish.project_id),
+        "model_config_id": publish.model_config_id,
+        "title": publish.title,
+        "description": publish.description,
+        "page_enabled": publish.page_enabled,
+        "api_enabled": publish.api_enabled,
+        "created_at": publish.created_at.isoformat(),
+        "updated_at": publish.updated_at.isoformat() if publish.updated_at else None,
+    }
+
+
+@router.patch("/api/publishes/{publish_id}")
+async def update_publish(
+    publish_id: str,
+    body: PublishUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    publish = await _load_owned_publish(db, publish_id, current_user.user_id)
+    if body.title is not None:
+        publish.title = body.title
+    if body.description is not None:
+        publish.description = body.description
+    if body.page_enabled is not None:
+        publish.page_enabled = body.page_enabled
+    if body.api_enabled is not None:
+        publish.api_enabled = body.api_enabled
+    if body.model_config_id is not None:
+        cfg_result = await db.execute(
+            select(UserModelConfig).where(
+                UserModelConfig.config_id == body.model_config_id,
+                UserModelConfig.user_id == current_user.user_id,
+            )
+        )
+        if cfg_result.scalar_one_or_none() is None:
+            raise api_error(400, "PUBLISH_MODEL_CONFIG_INVALID", "Model config does not exist or does not belong to you")
+        publish.model_config_id = body.model_config_id
+    publish.updated_at = _now_utc()
+    await db.commit()
+    return {"publish_id": str(publish.publish_id), "updated": True}
+
+
+@router.delete("/api/publishes/{publish_id}", status_code=204)
+async def delete_publish(
+    publish_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    publish = await _load_owned_publish(db, publish_id, current_user.user_id)
+    await db.delete(publish)
+    await db.commit()
+    return None
+
+
+# ── API keys (SSO) ─────────────────────────────────────────────────────────
+
+
+@router.post("/api/publishes/{publish_id}/keys", status_code=201)
+async def create_publish_key(
+    publish_id: str,
+    body: PublishKeyCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    publish = await _load_owned_publish(db, publish_id, current_user.user_id)
+    plaintext = generate_publish_key(publish_id)
+    key = PublishKey(
+        publish_id=publish.publish_id,
+        name=body.name,
+        key_hash=hash_publish_key(plaintext),
+        key_hint=publish_key_hint(plaintext),
+    )
+    db.add(key)
+    await db.commit()
+    # The ONLY time the plaintext is returned — shown once, then discarded.
+    # The rest mirrors the list shape so the UI can render the new row
+    # (active badge, date) without a reload.
+    return {
+        "key_id": str(key.key_id),
+        "name": key.name,
+        "key": plaintext,
+        "key_hint": key.key_hint,
+        "is_active": key.is_active,
+        "created_at": key.created_at.isoformat(),
+        "revoked_at": key.revoked_at.isoformat() if key.revoked_at else None,
+    }
+
+
+@router.get("/api/publishes/{publish_id}/keys")
+async def list_publish_keys(
+    publish_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    publish = await _load_owned_publish(db, publish_id, current_user.user_id)
+    result = await db.execute(
+        select(PublishKey)
+        .where(PublishKey.publish_id == publish.publish_id)
+        .order_by(PublishKey.created_at.desc())
+    )
+    keys = result.scalars().all()
+    return [
+        {
+            "key_id": str(k.key_id),
+            "name": k.name,
+            "key_hint": k.key_hint,
+            "is_active": k.is_active,
+            "created_at": k.created_at.isoformat(),
+            "revoked_at": k.revoked_at.isoformat() if k.revoked_at else None,
+        }
+        for k in keys
+    ]
+
+
+@router.delete("/api/publishes/{publish_id}/keys/{key_id}", status_code=204)
+async def revoke_publish_key(
+    publish_id: str,
+    key_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    publish = await _load_owned_publish(db, publish_id, current_user.user_id)
+    result = await db.execute(
+        select(PublishKey).where(
+            PublishKey.key_id == key_id,
+            PublishKey.publish_id == publish.publish_id,
+        )
+    )
+    key = result.scalar_one_or_none()
+    if not key:
+        raise api_error(404, "PUBLISH_KEY_NOT_FOUND", "Key not found")
+    key.is_active = False
+    key.revoked_at = _now_utc()
+    await db.commit()
+    return None
+
+
+# ── Public API (API Key) ───────────────────────────────────────────────────
+
+
+def _is_terminal_frame(evt: dict) -> bool:
+    """True only for the turn's final stream_end.
+
+    A turn can emit several stream_end frames: one per plan subtask (which
+    carries ``task_id`` and closes that task's panel stream), one at a
+    mid-turn injection boundary (``injection``), a synthetic one after an
+    abort, and the real terminal frame. Ending the SSE response on any of
+    the former truncated the answer while the run kept going.
+    """
+    return (
+        evt.get("type") == "stream_end"
+        and not evt.get("task_id")
+        and not evt.get("injection")
+    )
+
+
+async def _drain_publish_stream(stream: SSEStream, task: asyncio.Task, conversation: str):
+    """Yield SSE frames for one publish run until terminal, then end the stream.
+
+    Module-level (not a closure) so the disconnect cleanup is unit-testable.
+    """
+    from api.websocket.manager import manager
+
+    saw_terminal = False
+    try:
+        while True:
+            try:
+                evt = await asyncio.wait_for(stream.queue.get(), timeout=0.5)
+                yield sse_format(evt)
+                if _is_terminal_frame(evt):
+                    # Terminal frame; the task may still be unwinding.
+                    saw_terminal = True
+                    break
+            except asyncio.TimeoutError:
+                if task.done():
+                    break
+        # Flush anything left after the terminal event / task end.
+        while not stream.queue.empty():
+            try:
+                evt = stream.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if _is_terminal_frame(evt):
+                saw_terminal = True
+            yield sse_format(evt)
+        # A run that crashed before any terminal frame would otherwise
+        # end the stream in silence — tell the client. (task.exception()
+        # also marks it retrieved; the done callback logs it either way.)
+        if not saw_terminal and task.done() and not task.cancelled():
+            if task.exception() is not None:
+                yield sse_format({"type": "error", "code": "PUBLISH_RUN_FAILED", "message": "Agent execution failed. Check server logs for details."})
+    except BaseException:
+        # The client disconnect reaches the generator two ways: CancelledError
+        # at an await (the ASGI layer cancelling the response task while the
+        # generator runs), or — when the disconnect lands while a frame is
+        # being sent — GeneratorExit at the yield, because the framework
+        # closes the suspended generator instead of cancelling into it. A
+        # CancelledError-only handler misses that second path entirely and
+        # the run keeps going after the response is gone. Stop it either way.
+        manager.signal_abort(conversation, reason="publish_sse_client_disconnect")
+        task.cancel()
+        raise
+
+
+@router.post("/api/p/{publish_id}/stream")
+async def publish_stream(
+    publish_id: str,
+    body: RunRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """SSE stream for one published-agent turn.
+
+    The request carries the caller's message; the response streams the
+    standard agent turn events (``stream_delta``, ``tool_call_start``,
+    ``stream_end``, ...) as ``data:`` SSE frames. Runs execute under the
+    publisher's bound model config.
+    """
+    publish = await _authorize_publish_key(request, db, publish_id)
+    # Bounded concurrency: a burst of runs must not exhaust the publisher's
+    # model quota or the event loop. Fail fast with 429 instead of stacking
+    # unbounded tasks when saturated.
+    try:
+        await asyncio.wait_for(_publish_semaphore.acquire(), timeout=10.0)
+    except asyncio.TimeoutError:
+        raise api_error(429, "PUBLISH_TOO_MANY_RUNS", "Too many concurrent runs")
+
+    # Pin the caller's thread to a dedicated conversation so multi-turn
+    # agents keep their history across calls — one conversation per
+    # (publish, thread_id), never shared across threads or publishes.
+    #
+    # The slot acquired above is handed to the run task only once this block
+    # succeeds, so any failure or client disconnect in it must release the
+    # slot — otherwise a leaked permit permanently shrinks the global cap.
+    try:
+        thread_suffix = body.thread_id or "default"
+        conversation = await get_or_create_publish_conversation(
+            db, publish,
+            thread_id=thread_suffix,
+            title=f"发布会话: {publish.agent_slug}/{thread_suffix}",
+        )
+
+        # Claim the turn so a second concurrent stream on the same conversation
+        # fails fast instead of interleaving two runs.
+        from api.websocket.manager import manager
+        if not await manager.claim_turn(conversation):
+            raise api_error(409, "CONVERSATION_ALREADY_RUNNING", "This conversation already has a running turn")
+    except BaseException:
+        _publish_semaphore.release()
+        raise
+
+    # SSE paths never open a WS, so no abort event exists (WS turns get one
+    # from connect()). Without it, run_turn's abort watcher is never created
+    # and an abort request is a silent no-op. Create the event up front and
+    # clear any stale set state from a previous turn on this conversation.
+    manager.ensure_abort_event(conversation)
+    manager.reset_abort(conversation)
+
+    stream = SSEStream()
+    from types import SimpleNamespace
+    from api.services.agent_turn import run_turn
+
+    async def _run():
+        try:
+            await run_turn(
+                conversation,
+                ws=SimpleNamespace(app=request.app),
+                msg={"content": body.message, "fixed_config_id": publish.model_config_id, "agent_id": publish.agent_slug},
+                user_id=publish.owner_id,
+                transport=stream,
+                interactive=False,
+                actor_user_id=publish.owner_id,
+            )
+        finally:
+            # No release_turn: run_turn's own finally released the claim
+            # before its final await (agent.close), and a claim re-taken
+            # during that window belongs to its new owner — releasing again
+            # would drop it mid-turn. Only the slot goes back here.
+            _publish_semaphore.release()
+
+    task = asyncio.create_task(_run())
+
+    def _consume_run_exception(t: asyncio.Task) -> None:
+        # Retrieve the exception so asyncio never reports "Task exception
+        # was never retrieved" when the task is collected, and log it here
+        # — the SSE stream may already be closed by the time the unwinding
+        # task raises. Retrieval is idempotent, so the drain can also read
+        # t.exception() for its error frame.
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            _log.error("publish run task failed", exc_info=exc)
+
+    task.add_done_callback(_consume_run_exception)
+
+    return StreamingResponse(
+        _drain_publish_stream(stream, task, conversation),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/api/p/{publish_id}/abort")
+async def publish_abort(
+    publish_id: str,
+    request: Request,
+    body: AbortRequest | None = Body(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Abort the running turn of one thread of this publish.
+
+    The thread is identified by the body's thread_id (omitted → "default"),
+    so an abort never touches another thread's conversation. A missing
+    conversation — the thread never ran — is a no-op success, and no
+    conversation row is created by an abort.
+    """
+    publish = await _authorize_publish_key(request, db, publish_id)
+    thread_id = (body.thread_id if body else None) or "default"
+    conversation = await _find_publish_conversation_id(
+        db, publish, viewer_id=None, thread_id=thread_id
+    )
+    if conversation is None:
+        return {"aborted": True}
+    from api.websocket.manager import manager
+    manager.signal_abort(conversation, reason="publish_abort_api")
+    return {"aborted": True}
+
+
+# ── SSO embedded page (viewer-session) ────────────────────────────────────
+#
+# The embedded page is a link WITHIN the system: the viewer is an
+# authenticated user (their session cookie) who opens /p/<id>. Every viewer
+# of a publish gets their OWN conversation row — keyed by (publish_id,
+# viewer_id) — so no two viewers ever share history. The row still runs and
+# bills as the publisher (user_id = owner_id) and stays out of the
+# publisher's sidebar (source='publish'). Because the conversation belongs
+# to someone else, the viewer's cookie alone must not unlock it: the page
+# loads via a cookie-authenticated GET that issues a short HMAC viewer token
+# (publish, viewer) derived from the server secret; the /session paths
+# re-verify it server-side so each viewer stays gated to their own row.
+
+
+class SessionLookup(BaseModel):
+    token: str = Field(min_length=8, max_length=64)
+    message: str = Field(min_length=1, max_length=200_000)
+
+
+class SessionAbort(BaseModel):
+    token: str = Field(min_length=8, max_length=64)
+
+
+@router.get("/api/p/{publish_id}/page")
+async def get_publish_page(
+    publish_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    """First call of the embedded page: payload + a viewer token.
+
+    Cookie-authenticated (no token required yet) — the page issues its own
+    viewer-scoped HMAC token for the /session calls that follow. 404 when the
+    publish is disabled or missing, so a disabled page is indistinguishable
+    from a nonexistent one. When the publish's project has gone private, a
+    viewer without access gets 403 PROJECT_PRIVATE (the creator and whitelisted
+    members still load the page).
+    """
+    from api.services.publish import (
+        get_or_create_publish_conversation,
+        get_publish_viewer_payload,
+    )
+
+    # A fresh viewer token can never be pre-approved, so the token check would
+    # always fail on this first call. Instead gate purely on page_enabled and
+    # existence (the same predicate authorize_publish_viewer enforces).
+    from api.models.publish import AgentPublish
+
+    result = await db.execute(
+        select(AgentPublish).where(
+            AgentPublish.publish_id == publish_id,
+            AgentPublish.page_enabled == True,  # noqa: E712
+        )
+    )
+    publish = result.scalar_one_or_none()
+    if publish is None:
+        raise api_error(404, "PUBLISH_NOT_FOUND", "Publish not found")
+    await require_publish_project_open(db, publish, current_user.user_id)
+    conversation_id = await get_or_create_publish_conversation(
+        db, publish, viewer_id=current_user.user_id
+    )
+    payload = await get_publish_viewer_payload(
+        db, publish, current_user.user_id, conversation_id
+    )
+    return {"conversation_id": conversation_id, **payload}
+
+
+@router.get("/api/p/{publish_id}/session")
+async def get_publish_session(
+    publish_id: str,
+    token: str = Query(min_length=8, max_length=64),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    """Page payload + resolved conversation for an embedded publish.
+
+    The conversation is created on first page load (like the API path) so the
+    viewer's first message finds an active conversation. It is scoped to
+    (publish, viewer): each viewer gets their own row. The ``token`` from the
+    page payload is bound to (publish, viewer); only that combination may
+    open it.
+    """
+    from api.services.publish import (
+        authorize_publish_viewer,
+        get_or_create_publish_conversation,
+        get_publish_viewer_payload,
+    )
+
+    publish = await authorize_publish_viewer(db, publish_id, current_user.user_id, token)
+    if publish is None:
+        raise api_error(404, "PUBLISH_NOT_FOUND", "Publish not found")
+    conversation_id = await get_or_create_publish_conversation(
+        db, publish, viewer_id=current_user.user_id
+    )
+    payload = await get_publish_viewer_payload(
+        db, publish, current_user.user_id, conversation_id
+    )
+    return {"conversation_id": conversation_id, **payload}
+
+
+@router.get("/api/p/{publish_id}/session/messages")
+async def get_publish_session_messages(
+    publish_id: str,
+    token: str = Query(min_length=8, max_length=64),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    """Message history of the viewer's own publish conversation."""
+    from api.services.publish import (
+        _serialize_publish_messages,
+        authorize_publish_viewer,
+        get_or_create_publish_conversation,
+    )
+
+    publish = await authorize_publish_viewer(db, publish_id, current_user.user_id, token)
+    if publish is None:
+        raise api_error(404, "PUBLISH_NOT_FOUND", "Publish not found")
+    conversation_id = await get_or_create_publish_conversation(
+        db, publish, viewer_id=current_user.user_id
+    )
+    return await _serialize_publish_messages(db, publish, conversation_id)
+
+
+@router.get("/api/p/{publish_id}/session/runs/latest")
+async def get_publish_session_latest_run(
+    publish_id: str,
+    token: str = Query(min_length=8, max_length=64),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    """Latest run status of the viewer's own publish conversation."""
+    from api.services.publish import (
+        authorize_publish_viewer,
+        get_or_create_publish_conversation,
+    )
+
+    publish = await authorize_publish_viewer(db, publish_id, current_user.user_id, token)
+    if publish is None:
+        raise api_error(404, "PUBLISH_NOT_FOUND", "Publish not found")
+    conversation_id = await get_or_create_publish_conversation(
+        db, publish, viewer_id=current_user.user_id
+    )
+    from api.services.conversation_runs import latest_run
+
+    run = await latest_run(db, conversation_id)
+    if not run:
+        return None
+    return {
+        "run_id": str(run.run_id),
+        "status": run.status,
+        "user_message_id": run.user_message_id,
+        "started_at": run.started_at.isoformat(),
+        "ended_at": run.ended_at.isoformat() if run.ended_at else None,
+        "error_message": run.error_message,
+        "streaming_snapshot": run.streaming_snapshot,
+        "tokens_used": run.tokens_used,
+    }
+
+
+@router.post("/api/p/{publish_id}/session/abort")
+async def post_publish_session_abort(
+    publish_id: str,
+    body: SessionAbort,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    """Abort the running turn of the viewer's own publish conversation.
+
+    No conversation row is created by an abort — a viewer who never ran a
+    turn gets a no-op success.
+    """
+    from api.services.publish import (
+        _find_publish_conversation_id,
+        authorize_publish_viewer,
+    )
+
+    publish = await authorize_publish_viewer(db, publish_id, current_user.user_id, body.token)
+    if publish is None:
+        raise api_error(404, "PUBLISH_NOT_FOUND", "Publish not found")
+    conversation_id = await _find_publish_conversation_id(
+        db, publish, viewer_id=current_user.user_id, thread_id=None
+    )
+    if conversation_id is None:
+        return {"aborted": True}
+    from api.websocket.manager import manager
+
+    manager.signal_abort(conversation_id, reason="publish_viewer_abort")
+    return {"aborted": True}
+
+
+@router.post("/api/p/{publish_id}/session/run")
+async def post_publish_session_run(
+    publish_id: str,
+    body: SessionLookup,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    """Run a turn of an embedded publish as the publisher (viewer in the box).
+
+    The turn executes under the publisher's bound model config, non-interactive.
+    Reuses the same bounded semaphore as the API-key stream so the embedded
+    page cannot bypass rate limiting.
+    """
+    from api.services.publish import (
+        SSEStream,
+        authorize_publish_viewer,
+        get_or_create_publish_conversation,
+        sse_format,
+    )
+
+    publish = await authorize_publish_viewer(db, publish_id, current_user.user_id, body.token)
+    if publish is None:
+        raise api_error(404, "PUBLISH_NOT_FOUND", "Publish not found")
+
+    # A duplicate of the publish_stream semaphore guard: the embedded page is
+    # rate-limited like any other caller.
+    try:
+        await asyncio.wait_for(_publish_semaphore.acquire(), timeout=10.0)
+    except asyncio.TimeoutError:
+        raise api_error(429, "PUBLISH_TOO_MANY_RUNS", "Too many concurrent runs")
+
+    # Same slot-ownership rule as publish_stream: release on any failure or
+    # cancellation before the run task takes over the permit.
+    try:
+        conversation = await get_or_create_publish_conversation(
+            db, publish, viewer_id=current_user.user_id
+        )
+        from api.websocket.manager import manager
+
+        if not await manager.claim_turn(conversation):
+            raise api_error(409, "CONVERSATION_ALREADY_RUNNING", "This conversation already has a running turn")
+    except BaseException:
+        _publish_semaphore.release()
+        raise
+
+    # Same abort-event guarantee as the API-key stream: SSE never connects a
+    # WS, so the event (and with it run_turn's abort watcher) must exist
+    # before the turn starts, or "stop" is a silent no-op.
+    manager.ensure_abort_event(conversation)
+    manager.reset_abort(conversation)
+
+    stream = SSEStream()
+    from types import SimpleNamespace
+    from api.services.agent_turn import run_turn
+
+    async def _run():
+        try:
+            await run_turn(
+                conversation,
+                ws=SimpleNamespace(app=request.app),
+                msg={"content": body.message, "fixed_config_id": publish.model_config_id, "agent_id": publish.agent_slug},
+                user_id=publish.owner_id,
+                transport=stream,
+                interactive=False,
+                actor_user_id=publish.owner_id,
+            )
+        finally:
+            # No release_turn: run_turn's own finally released the claim
+            # before its final await (agent.close), and a claim re-taken
+            # during that window belongs to its new owner — releasing again
+            # would drop it mid-turn. Only the slot goes back here.
+            _publish_semaphore.release()
+
+    task = asyncio.create_task(_run())
+
+    def _consume_run_exception(t: asyncio.Task) -> None:
+        # Retrieve the exception so asyncio never reports "Task exception
+        # was never retrieved" when the task is collected, and log it here
+        # — the SSE stream may already be closed by the time the unwinding
+        # task raises. Retrieval is idempotent, so the drain can also read
+        # t.exception() for its error frame.
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            _log.error("publish run task failed", exc_info=exc)
+
+    task.add_done_callback(_consume_run_exception)
+
+    return StreamingResponse(
+        _drain_publish_stream(stream, task, conversation),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

@@ -1,0 +1,717 @@
+"""Tests for test_generator output_dir confinement."""
+from __future__ import annotations
+
+import base64
+import json
+
+import pytest
+
+from agent_core.tools.base import ToolContext
+from agent_core.tools.test_generator import TestGeneratorTool
+
+
+def _context(project_fs_path) -> ToolContext:
+    return ToolContext(
+        project_id="p1",
+        project_fs_path=str(project_fs_path),
+        conversation_id="c1",
+        user_id="u1",
+    )
+
+
+def _params(**overrides) -> dict:
+    base = {
+        "operation": "generate_spec",
+        "issue_key": "PROJ-1",
+        "test_cases": [{"title": "t", "steps": ["wait"]}],
+    }
+    base.update(overrides)
+    return base
+
+
+async def test_output_dir_escape_rejected(tmp_path):
+    proj_a = tmp_path / "proj-a"
+    proj_b = tmp_path / "proj-b"
+    proj_a.mkdir()
+    proj_b.mkdir()
+    tool = TestGeneratorTool()
+    result = await tool.execute(_params(output_dir="../proj-b/x"), _context(proj_a))
+    assert "error" in result
+    assert not (proj_b / "x").exists()
+
+
+async def test_default_output_dir_unaffected(tmp_path):
+    proj_a = tmp_path / "proj-a"
+    proj_a.mkdir()
+    tool = TestGeneratorTool()
+    result = await tool.execute(_params(), _context(proj_a))
+    assert result.get("success") is True
+    assert (proj_a / "tests" / "generated" / "proj-1.spec.ts").exists()
+
+
+async def test_output_dir_outside_tests_is_rejected(tmp_path):
+    """The generated Playwright config discovers specs under tests/; a spec
+    written elsewhere is reported as generated but can never run via
+    `npm test`."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    result = await TestGeneratorTool().execute(
+        _params(output_dir="e2e"), _context(proj)
+    )
+    assert "must stay under tests/" in result["error"], result
+    assert not (proj / "e2e" / "proj-1.spec.ts").exists()
+
+
+async def test_custom_output_dir_keeps_script_and_result_paths_in_sync(tmp_path):
+    """The npm script runs from tests/, so the spec path it passes must be
+    relative to tests/ — not to the project root."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    result = await TestGeneratorTool().execute(
+        _params(output_dir="tests/e2e/specs"), _context(proj)
+    )
+    assert result.get("success") is True, result
+    assert result["file_path"] == "tests/e2e/specs/proj-1.spec.ts"
+    assert (proj / "tests" / "e2e" / "specs" / "proj-1.spec.ts").is_file()
+    pkg = json.loads((proj / "tests" / "package.json").read_text(encoding="utf-8"))
+    assert pkg["scripts"]["test:proj-1"] == "playwright test e2e/specs/proj-1.spec.ts"
+
+
+async def test_stringified_test_cases_rejected(tmp_path):
+    """A string test_cases must be rejected instead of generating a garbage
+    spec or crashing on character iteration."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    tool = TestGeneratorTool()
+    result = await tool.execute(_params(test_cases="just one case"), _context(proj))
+    assert "error" in result
+    assert "array" in result["error"].lower()
+
+
+async def test_invalid_base_url_env_rejected(tmp_path):
+    """base_url_env is interpolated verbatim into the generated
+    `process.env.<name>` — a value that is not a plain identifier would
+    break (or inject into) the executable spec."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    result = await TestGeneratorTool().execute(
+        _params(base_url_env="FOO; require('child_process').execSync('x')//"),
+        _context(proj),
+    )
+    assert "error" in result
+    assert "base_url_env" in result["error"]
+    assert not (proj / "tests" / "generated" / "proj-1.spec.ts").exists()
+
+
+async def test_valid_custom_base_url_env_lands_in_spec(tmp_path):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    # A session-relevant case forces the generated `login()` helper, the only
+    # place base_url_env is interpolated — the default scaffold hands every
+    # other case a shared storageState instead.
+    result = await TestGeneratorTool().execute(
+        _params(
+            base_url_env="MY_APP_URL",
+            test_cases=[{"title": "user can login", "steps": ["wait"]}],
+        ),
+        _context(proj),
+    )
+    assert result.get("success") is True, result
+    spec = (proj / "tests" / "generated" / "proj-1.spec.ts").read_text(encoding="utf-8")
+    assert "process.env.MY_APP_URL" in spec
+
+
+# ---------------------------------------------------------------------------
+# Step/expected conversion (pure helpers)
+# ---------------------------------------------------------------------------
+
+
+def test_click_step_splits_case_insensitively():
+    """`step.split("click")` on the original text found nothing in a
+    capitalized step, so the whole sentence became the locator name."""
+    from agent_core.tools.test_generator import _step_to_action
+
+    action = _step_to_action("Click the login button")
+    assert "name: /the login button/i" in action, action
+
+
+def test_download_step_uses_wait_for_event():
+    """Playwright has no page.waitForDownload() — the generated spec threw
+    "page.waitForDownload is not a function"."""
+    from agent_core.tools.test_generator import _step_to_action
+
+    action = _step_to_action("Download the report")
+    assert "page.waitForEvent('download')" in action, action
+    assert "waitForDownload" not in action
+    assert "name: /the report/i" in action, action
+
+
+def test_navigate_step_pins_domcontentloaded():
+    """Playwright's default navigation wait is 'load', which blocks the case on
+    the slowest subresource — on a poor network that is the whole case timeout
+    while the page has been usable for ages."""
+    from agent_core.tools.test_generator import _step_to_action
+
+    action = _step_to_action("Navigate to https://example.com/login")
+    assert "waitUntil: 'domcontentloaded'" in action, action
+    assert "page.goto('https://example.com/login'" in action, action
+
+
+def test_expected_visible_splits_case_insensitively():
+    from agent_core.tools.test_generator import _expected_to_assertion
+
+    assertion = _expected_to_assertion("Visible: Welcome back")
+    assert "toContainText" not in assertion  # visible → toBeVisible
+    assert "Welcome back" in assertion, assertion
+
+
+def test_negated_expected_results_emit_negative_assertions():
+    """Phrasing like "not visible" must produce a negated matcher — a positive
+    one failed exactly when the product behaved correctly."""
+    from agent_core.tools.test_generator import _expected_to_assertion
+
+    for expected in (
+        "The error banner is not visible",
+        "The error banner should not be visible",
+    ):
+        assertion = _expected_to_assertion(expected)
+        assert ".not.toBeVisible()" in assertion, assertion
+
+    assert ".not.toContainText(" in _expected_to_assertion("The page does not contain 'secret'")
+    assert ".not.toContainText(" in _expected_to_assertion("错误提示不显示")
+
+    # Positive wording stays positive.
+    assert ".not." not in _expected_to_assertion("The error banner is visible")
+
+
+def test_text_list_coerces_malformed_fields():
+    from agent_core.tools.test_generator import _text_list
+
+    assert _text_list(None) == []
+    assert _text_list("one step") == ["one step"]
+    assert _text_list(["a", None, 2]) == ["a", "2"]
+    assert _text_list(5) == ["5"]
+
+
+async def test_stringified_steps_generate_one_action_not_per_character(tmp_path):
+    spec = await _generate(
+        tmp_path,
+        {
+            "title": "t",
+            "steps": "Click the Save button",
+            "expected_results": "Welcome banner is visible",
+        },
+    )
+
+    assert spec.count("// Step:") == 1
+    assert "name: /the Save button/i" in spec, spec
+    assert "Welcome banner is visible" in spec, spec
+
+
+# ---------------------------------------------------------------------------
+# Upload scenarios
+# ---------------------------------------------------------------------------
+
+
+def _upload_case(**overrides) -> dict:
+    case = {
+        "title": "upload a file",
+        "steps": ["Navigate to /upload", "Upload the orders file"],
+        "uploads": [
+            {"filename": "orders.csv", "mime_type": "text/csv", "content": "id,total\n1,42\n"}
+        ],
+    }
+    case.update(overrides)
+    return case
+
+
+async def _generate(tmp_path, case: dict) -> str:
+    result = await _generate_result(tmp_path, case)
+    assert result.get("success") is True, result
+    spec_file = tmp_path / "proj" / "tests" / "generated" / "proj-1.spec.ts"
+    return spec_file.read_text(encoding="utf-8")
+
+
+async def _generate_result(tmp_path, case: dict) -> dict:
+    (tmp_path / "proj").mkdir(exist_ok=True)
+    return await TestGeneratorTool().execute(
+        _params(test_cases=[case]), _context(tmp_path / "proj")
+    )
+
+
+async def test_upload_step_emits_set_input_files(tmp_path):
+    """The old behavior degraded upload steps to waitForTimeout(1000) — a
+    green test that never uploaded anything."""
+    spec = await _generate(tmp_path, _upload_case())
+
+    assert "setInputFiles('input[type=file]'" in spec, spec
+    assert "waitForTimeout" not in spec, spec
+    assert "buffer: Buffer.from('aWQsdG90YWwKMSw0Mgo=', 'base64')" in spec, spec
+    assert "name: 'orders.csv'" in spec and "mimeType: 'text/csv'" in spec
+    # Buffer is a Node global the scaffold's tsconfig has no types for.
+    assert "declare const Buffer: any;" in spec, spec
+
+
+async def test_upload_step_precedes_the_fill_branch(tmp_path):
+    """"Enter the file to upload" contains a fill keyword; without the upload
+    check running first it became a textbox fill."""
+    spec = await _generate(
+        tmp_path, _upload_case(steps=["Enter the report to upload"])
+    )
+    assert "setInputFiles" in spec, spec
+    assert "getByRole('textbox')" not in spec, spec
+
+
+async def test_cjk_upload_step_is_detected(tmp_path):
+    spec = await _generate(tmp_path, _upload_case(steps=["上传订单文件"]))
+    assert "setInputFiles" in spec, spec
+    assert "waitForTimeout" not in spec, spec
+
+
+async def test_binary_upload_uses_the_given_base64(tmp_path):
+    """A generated PNG byte-for-byte (newlines and all) without a decode/re-encode
+    round trip that could differ from the caller's intent."""
+    spec = await _generate(
+        tmp_path,
+        _upload_case(
+            uploads=[
+                {
+                    "filename": "logo.png",
+                    "content_base64": "iVBORw0KGgo=",
+                    "mime_type": "image/png",
+                }
+            ]
+        ),
+    )
+    assert "Buffer.from('iVBORw0KGgo=', 'base64')" in spec, spec
+    assert "mimeType: 'image/png'" in spec, spec
+
+
+async def test_wrapped_base64_upload_is_canonicalized(tmp_path):
+    """Line-wrapped base64 is accepted and re-encoded without the wrapping,
+    so it can be embedded in a single-quoted JS literal."""
+    raw = b"\x89PNG\r\n\x1a\n" + b"x" * 40
+    encoded = base64.b64encode(raw).decode()
+    wrapped = "\n".join(encoded[i:i + 20] for i in range(0, len(encoded), 20)) + "\n"
+    spec = await _generate(
+        tmp_path,
+        _upload_case(
+            uploads=[
+                {
+                    "filename": "logo.png",
+                    "content_base64": wrapped,
+                    "mime_type": "image/png",
+                }
+            ]
+        ),
+    )
+    assert f"Buffer.from('{encoded}', 'base64')" in spec, spec
+
+
+async def test_fixture_path_reference(tmp_path):
+    spec = await _generate(
+        tmp_path,
+        _upload_case(uploads=[{"filename": "big.zip", "fixture_path": "fixtures/big.zip"}]),
+    )
+    assert "setInputFiles('input[type=file]', 'fixtures/big.zip')" in spec, spec
+    assert "declare const Buffer" not in spec, spec
+
+
+async def test_via_chooser_arms_the_file_chooser(tmp_path):
+    spec = await _generate(
+        tmp_path,
+        _upload_case(
+            uploads=[{"filename": "a.txt", "content": "hi", "via_chooser": True}]
+        ),
+    )
+    assert "page.waitForEvent('filechooser')" in spec, spec
+    assert "fileChooser_1.setFiles(" in spec, spec
+    assert "page.locator(" in spec, spec
+    assert "Promise.all" in spec, spec
+
+
+async def test_needs_path_materializes_the_payload(tmp_path):
+    spec = await _generate(
+        tmp_path,
+        _upload_case(uploads=[{"filename": "a.txt", "content": "hi", "needs_path": True}]),
+    )
+    assert "test.info().outputPath('a.txt')" in spec, spec
+    assert "require('fs').writeFileSync" in spec, spec
+    assert "setInputFiles('input[type=file]', _uploadFile_1)" in spec, spec
+    assert "declare const require: any;" in spec, spec
+
+
+async def test_upload_step_without_a_payload_still_uploads(tmp_path):
+    """No declared payload → a real setInputFiles against a fixture path that
+    does not exist yet, so the test fails loudly instead of passing empty."""
+    spec = await _generate(
+        tmp_path, _upload_case(uploads=[], steps=["Upload the orders.csv file"])
+    )
+    assert "setInputFiles('input[type=file]', 'fixtures/orders.csv')" in spec, spec
+    assert "waitForTimeout" not in spec, spec
+    assert "TODO: create this fixture" in spec, spec
+
+
+async def test_unconsumed_payloads_are_still_emitted(tmp_path):
+    spec = await _generate(
+        tmp_path,
+        _upload_case(
+            steps=["Navigate to /upload"],
+            uploads=[
+                {"filename": "a.txt", "content": "one"},
+                {"filename": "b.txt", "content": "two"},
+            ],
+        ),
+    )
+    assert "Unmatched upload: a.txt" in spec, spec
+    assert "Unmatched upload: b.txt" in spec, spec
+    assert spec.count("setInputFiles") == 2, spec
+
+
+async def test_upload_filename_does_not_escape_its_literal(tmp_path):
+    """Filenames are caller-controlled text landing inside a TS string literal
+    in a generated, then executed, file."""
+    spec = await _generate(
+        tmp_path,
+        _upload_case(uploads=[{"filename": "it's.csv", "content": "x"}]),
+    )
+    assert "name: 'it\\'s.csv'" in spec, spec
+
+
+async def test_upload_filename_path_decoration_is_stripped(tmp_path):
+    """A filename carrying a path (or a predicate that looks like one) is
+    reduced to its last segment — that is what a browser would show."""
+    spec = await _generate(
+        tmp_path,
+        _upload_case(
+            uploads=[
+                {
+                    "filename": "'); await page.goto('http://evil.example.com'); //.txt",
+                    "content": "x",
+                }
+            ]
+        ),
+    )
+    body = spec.split("test.describe")[1]
+    assert "evil.example.com" not in body, spec
+    assert "name: '.txt'" in body, spec
+
+
+def test_upload_step_detection_keywords():
+    from agent_core.tools.test_generator import _is_upload_step
+
+    assert _is_upload_step("Upload the CSV")
+    assert _is_upload_step("attach the signed contract")
+    assert _is_upload_step("Select file from disk")
+    assert _is_upload_step("导入客户数据")
+    # "important" must not read as import; a click on an Upload button is a
+    # click step, not an upload.
+    assert not _is_upload_step("This is important")
+    assert not _is_upload_step("Verify the page title")
+
+
+async def test_oversized_inline_payload_is_refused(tmp_path):
+    result = await _generate_result(
+        tmp_path,
+        _upload_case(
+            uploads=[{"filename": "big.bin", "content": "x" * (512 * 1024 + 1)}]
+        ),
+    )
+    assert "inline limit" in result["error"], result
+    assert "fixture_path" in result["error"], result
+
+
+async def test_too_many_uploads_are_refused(tmp_path):
+    result = await _generate_result(
+        tmp_path,
+        _upload_case(
+            uploads=[{"filename": f"f{i}.txt", "content": "x"} for i in range(6)]
+        ),
+    )
+    assert "per-case limit" in result["error"], result
+
+
+async def test_invalid_base64_is_refused_without_echoing_it(tmp_path):
+    result = await _generate_result(
+        tmp_path,
+        _upload_case(
+            uploads=[{"filename": "a.bin", "content_base64": "sk-live-SUPERSECRET!"}]
+        ),
+    )
+    assert "not valid base64" in result["error"], result
+    assert "SUPERSECRET" not in result["error"], result
+
+
+async def test_conflicting_payload_sources_are_refused(tmp_path):
+    result = await _generate_result(
+        tmp_path,
+        _upload_case(
+            uploads=[{"filename": "a.txt", "content": "x", "fixture_path": "fixtures/a.txt"}]
+        ),
+    )
+    assert "exactly one of" in result["error"], result
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    ["../../etc/passwd", "C:/Windows/win.ini", "/etc/passwd", ""],
+)
+async def test_fixture_path_cannot_escape_tests(tmp_path, fixture):
+    result = await _generate_result(
+        tmp_path,
+        _upload_case(uploads=[{"filename": "a.txt", "fixture_path": fixture}]),
+    )
+    assert "must stay under tests/" in result["error"], result
+
+
+async def test_repeated_steps_get_case_unique_const_names(tmp_path):
+    """Two downloads (or two path-materialized uploads) in one callback used to
+    redeclare the same const, so the generated spec did not compile."""
+    spec = await _generate(
+        tmp_path,
+        {
+            "title": "two of each",
+            "steps": [
+                "Download the first report",
+                "Download the second report",
+            ],
+            "uploads": [
+                {"filename": "a.txt", "content": "a", "needs_path": True},
+                {"filename": "b.txt", "content": "b", "needs_path": True},
+            ],
+        },
+    )
+
+    assert "const [download_0]" in spec and "const [download_1]" in spec, spec
+    assert "download_0.saveAs" in spec and "download_1.saveAs" in spec, spec
+    # Payloads no step claimed are emitted after the step list, still unique.
+    assert "const _uploadFile_2" in spec and "const _uploadFile_3" in spec, spec
+
+
+async def test_scaffold_creates_fixtures_dir_and_readme(tmp_path):
+    await _generate(tmp_path, _upload_case())
+    fixtures = tmp_path / "proj" / "tests" / "fixtures"
+    assert fixtures.is_dir(), fixtures
+    assert "fixtures/<name>" in (fixtures / "README.md").read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Run shape: one sign-in per run, and which cases may not use it
+# ---------------------------------------------------------------------------
+
+
+def _plain_case(title: str, steps=None) -> dict:
+    return {"title": title, "steps": steps or ["Navigate to /orders", "Click Save"]}
+
+
+async def _generate_in(tmp_path, cases: list[dict], **params) -> tuple[dict, str]:
+    """Run the tool over ``tmp_path/proj`` and return (result, spec text)."""
+    (tmp_path / "proj").mkdir(exist_ok=True)
+    result = await TestGeneratorTool().execute(
+        _params(test_cases=cases, **params), _context(tmp_path / "proj")
+    )
+    spec_path = tmp_path / "proj" / "tests" / "generated" / "proj-1.spec.ts"
+    spec = spec_path.read_text(encoding="utf-8") if spec_path.exists() else ""
+    return result, spec
+
+
+def _tests_dir(tmp_path) -> object:
+    return tmp_path / "proj" / "tests"
+
+
+async def test_shared_session_spec_does_not_sign_in_per_case(tmp_path):
+    """The scaffold signs in once per run (setup project + storageState), so a
+    plain case must not carry its own login — that was one UI login per case."""
+    result, spec = await _generate_in(tmp_path, [_plain_case("One"), _plain_case("Two")])
+
+    assert result.get("success") is True, result
+    assert "async function login" not in spec, spec
+    assert "beforeEach" not in spec, spec
+    assert spec.count("test('") == 2, spec
+    # The blind 15s wait is what the setup project's real wait replaced.
+    assert ".catch(() => {})" not in spec, spec
+    assert "dashboard" not in spec, spec
+
+
+async def test_config_without_a_shared_session_keeps_the_per_case_login(tmp_path):
+    """A workspace whose config hands out no session still gets working specs —
+    just the slower shape."""
+    tests_dir = _tests_dir(tmp_path)
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "playwright.config.ts").write_text(
+        "import { defineConfig } from '@playwright/test';\n"
+        "export default defineConfig({ testDir: './generated' });\n",
+        encoding="utf-8",
+    )
+
+    result, spec = await _generate_in(tmp_path, [_plain_case("One")])
+
+    assert result.get("success") is True, result
+    assert "async function login" in spec, spec
+    assert "test.beforeEach" in spec, spec
+    assert "await login(page);" in spec, spec
+
+
+async def test_session_cases_start_signed_out(tmp_path):
+    """A case that switches user or checks permissions inherits nothing — the
+    session is the thing it exercises."""
+    result, spec = await _generate_in(
+        tmp_path,
+        [
+            _plain_case("Edit the order"),
+            _plain_case("Switch user to the auditor role", ["Click the account menu"]),
+        ],
+    )
+
+    assert result.get("success") is True, result
+    assert "- session cases" in spec, spec
+    assert "test.use({ storageState: { cookies: [], origins: [] } });" in spec, spec
+    # Signed out, so this describe is the one that needs the helper.
+    session_block = spec.split("- session cases")[1]
+    assert "await login(page);" in session_block, spec
+    assert "Switch user to the auditor role" in session_block, spec
+    assert "Edit the order" not in session_block, spec
+
+
+async def test_all_session_cases_skip_the_empty_describe(tmp_path):
+    """A card entirely about signing in must not emit an empty first describe."""
+    result, spec = await _generate_in(tmp_path, [_plain_case("Log in with a valid account")])
+
+    assert result.get("success") is True, result
+    assert spec.count("test.describe(") == 1, spec
+    assert "- session cases" in spec, spec
+
+
+async def test_include_login_false_opts_the_whole_file_out(tmp_path):
+    result, spec = await _generate_in(
+        tmp_path, [_plain_case("Read the public docs")], include_login=False
+    )
+
+    assert result.get("success") is True, result
+    assert "test.use({ storageState: { cookies: [], origins: [] } });" in spec, spec
+    assert "async function login" not in spec, spec
+
+
+async def test_no_credentials_skips_instead_of_running_unauthenticated(tmp_path):
+    """The old helper logged in only `if (username && password)` and swallowed
+    the failed wait, so a case ran on with no session and failed somewhere
+    unrelated. Saying so is cheaper to diagnose than that."""
+    result, spec = await _generate_in(
+        tmp_path,
+        [_plain_case("Check the audit trail", ["Switch user to the auditor role"])],
+    )
+
+    assert result.get("success") is True, result
+    assert "test.skip(true, 'APP_USERNAME/APP_PASSWORD not set" in spec, spec
+    assert "waitForURL((url: any) =>" in spec, spec
+
+
+def test_unclassified_step_waits_on_an_anchor_not_a_sleep():
+    from agent_core.tools.test_generator import _step_to_action
+
+    action = _step_to_action("Verify the totals reconcile")
+
+    assert "waitForTimeout" not in action, action
+    assert "waitForLoadState('domcontentloaded')" in action, action
+    # Still surfaced: the step itself is not exercised.
+    assert "TODO: unautomated step" in action, action
+
+
+# ---------------------------------------------------------------------------
+# Scaffold creation and upgrade
+# ---------------------------------------------------------------------------
+
+
+async def test_scaffold_writes_the_setup_project(tmp_path):
+    result, _ = await _generate_in(tmp_path, [_plain_case("One")])
+    assert result.get("success") is True, result
+    tests_dir = _tests_dir(tmp_path)
+
+    config = (tests_dir / "playwright.config.ts").read_text(encoding="utf-8")
+    assert "storageState: '.auth/state.json'" in config, config
+    assert "dependencies: ['setup']" in config, config
+    setup = (tests_dir / "auth.setup.ts").read_text(encoding="utf-8")
+    assert "storageState({ path: STATE_PATH })" in setup, setup
+
+
+async def test_a_pristine_v1_config_is_upgraded(tmp_path, monkeypatch):
+    """Scaffold files are create-only, so without this an existing project keeps
+    signing in per case forever."""
+    from agent_core.tools import test_generator
+    from agent_core.tools.test_generator import (
+        _SCAFFOLD_CONFIG_BASELINES,
+        _SCAFFOLD_PLAYWRIGHT_CONFIG,
+        _scaffold_digest,
+    )
+
+    tests_dir = _tests_dir(tmp_path)
+    tests_dir.mkdir(parents=True)
+    # Stands in for whatever an older generator shipped: the upgrade is driven
+    # by the digest, so enrolling it in the baseline set is the whole setup.
+    v1 = "import { defineConfig } from '@playwright/test';\n// v1\n"
+    config = tests_dir / "playwright.config.ts"
+    config.write_text(v1, encoding="utf-8")
+    monkeypatch.setattr(
+        test_generator, "_SCAFFOLD_CONFIG_BASELINES",
+        _SCAFFOLD_CONFIG_BASELINES | {_scaffold_digest(v1)},
+    )
+
+    result, _ = await _generate_in(tmp_path, [_plain_case("One")])
+
+    assert result.get("success") is True, result
+    assert config.read_text(encoding="utf-8") == _SCAFFOLD_PLAYWRIGHT_CONFIG
+    assert any("upgraded" in note for note in result["scaffold_updates"]), result
+
+
+async def test_an_edited_config_is_left_alone(tmp_path, monkeypatch):
+    """Only an untouched config is swapped: a workspace may have real edits in
+    there (an extra project, a different baseURL)."""
+    from agent_core.tools import test_generator
+
+    tests_dir = _tests_dir(tmp_path)
+    tests_dir.mkdir(parents=True)
+    mine = "// our own config\nexport default { testDir: './generated' };\n"
+    config = tests_dir / "playwright.config.ts"
+    config.write_text(mine, encoding="utf-8")
+    monkeypatch.setattr(test_generator, "_SCAFFOLD_CONFIG_BASELINES", frozenset())
+
+    result, spec = await _generate_in(tmp_path, [_plain_case("One")])
+
+    assert result.get("success") is True, result
+    assert config.read_text(encoding="utf-8") == mine
+    assert "scaffold_updates" not in result, result
+    # No session is handed out, so the spec keeps the slower per-case login
+    # rather than silently going unauthenticated.
+    assert "async function login" in spec, spec
+    assert not (tests_dir / "auth.setup.ts").exists()
+
+
+async def test_a_comment_mentioning_storage_state_is_not_a_session(tmp_path):
+    tests_dir = _tests_dir(tmp_path)
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "playwright.config.ts").write_text(
+        "// no storageState here: cases sign in themselves\n"
+        "export default { testDir: './generated' };\n",
+        encoding="utf-8",
+    )
+
+    result, spec = await _generate_in(tmp_path, [_plain_case("One")])
+
+    assert result.get("success") is True, result
+    assert "async function login" in spec, spec
+    assert not (tests_dir / "auth.setup.ts").exists()
+
+
+def test_strip_js_comments_keeps_urls_inside_strings():
+    from agent_core.tools.test_generator import _strip_js_comments
+
+    stripped = _strip_js_comments(
+        "// storageState: unused\n"
+        "const baseURL = 'https://example.com/path'; // storageState: x\n"
+        "/* storageState: nope */\n"
+        "export default { testDir: './generated' };\n"
+    )
+
+    assert "storageState" not in stripped
+    assert "https://example.com/path" in stripped
+    assert "export default" in stripped

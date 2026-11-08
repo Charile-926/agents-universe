@@ -1,0 +1,339 @@
+<template>
+  <div class="app-layout">
+    <!-- Mobile Top Bar (visible only on small screens) -->
+    <div class="mobile-topbar">
+      <button class="mobile-topbar-btn" @click="toggleLeft" :title="t('layout.menu')">
+        <Menu :size="20" />
+      </button>
+      <span class="mobile-topbar-title"><Bot :size="16" class="sidebar-title-icon" /> Agents Universe</span>
+      <button class="mobile-topbar-btn" @click="toggleRight" :title="t('layout.panel')">
+        <PanelRight :size="20" />
+      </button>
+    </div>
+
+    <!-- Mobile Backdrop — tap to close any open sidebar -->
+    <Transition name="fade">
+      <div
+        v-if="showBackdrop"
+        class="mobile-backdrop"
+        @click="closeMobilePanels"
+      />
+    </Transition>
+
+    <!-- Left Sidebar -->
+    <aside class="sidebar-left" :class="{ collapsed: leftCollapsed }">
+      <div class="sidebar-header">
+        <span v-if="!leftCollapsed" class="sidebar-title"><Bot :size="16" class="sidebar-title-icon" /> Agents Universe</span>
+        <button class="sidebar-toggle" @click="toggleLeft" :title="t('layout.toggleSidebar')">
+          <ChevronLeft v-if="!leftCollapsed" :size="16" />
+          <ChevronRight v-else :size="16" />
+        </button>
+      </div>
+      <template v-if="!leftCollapsed">
+        <ProjectTree />
+        <AgentSwitcher />
+        <SidebarFooter />
+      </template>
+    </aside>
+
+    <!-- Center panel -->
+    <main class="center-panel">
+      <!-- Page-level navigation. The only way between chat / workspace /
+           publishes - hidden on non-project routes (/app, /settings). -->
+      <nav v-if="pageSegment" class="center-topnav">
+        <button
+          v-for="nav in navTabs"
+          :key="nav.id"
+          class="center-tab"
+          :class="{ active: pageSegment === nav.id }"
+          :data-tour-target="`center-nav-${nav.id}`"
+          @click="goToPage(nav.id)"
+        ><component :is="nav.icon" :size="13" /> {{ nav.label }}</button>
+        <!-- 压缩当前对话 + 会话累计 token：与顶部页签同一行（右对齐组），
+             不单独占一行；分组持有右对齐，子项显隐不牵动页签位置。 -->
+        <div v-if="pageSegment === 'chat'" class="topnav-right">
+          <span
+            v-if="convStore.conversationId && convStore.tokensUsed > 0"
+            class="nav-tokens"
+          >{{ t('layout.sessionTokens', { count: convStore.tokensUsed.toLocaleString() }) }}</span>
+          <button
+            v-if="convStore.messages.length > 0"
+            class="compress-btn nav-compress"
+            :disabled="isCompressDisabled"
+            @click="handleCompress"
+          >
+            <Shrink :size="13" />
+            <span>{{ compressing ? t('chatPanel.compressing') : t('chatPanel.compressContext') }}</span>
+          </button>
+        </div>
+      </nav>
+      <div class="center-content">
+        <Transition name="route-fade" mode="out-in">
+          <RouterView />
+        </Transition>
+      </div>
+    </main>
+
+    <!-- Right Panel -->
+    <aside class="panel-right" :class="{ collapsed: rightCollapsed }">
+      <div class="panel-right-header">
+        <div class="panel-tabs" v-if="!rightCollapsed">
+          <button
+            v-for="tab in tabs"
+            :key="tab.id"
+            class="panel-tab"
+            :class="{ active: activeTab === tab.id }"
+            :data-tour-target="`panel-tab-${tab.id}`"
+            @click="activeTab = tab.id"
+          ><component :is="tab.icon" :size="13" /> {{ tab.label }}</button>
+        </div>
+        <button class="sidebar-toggle" @click="toggleRight" :title="t('layout.togglePanel')">
+          <ChevronRight v-if="!rightCollapsed" :size="16" />
+          <ChevronLeft v-else :size="16" />
+        </button>
+      </div>
+
+      <template v-if="!rightCollapsed">
+        <ContextMeter />
+        <Transition name="route-fade" mode="out-in">
+          <component
+            :is="panelComponent"
+            :key="activeTab"
+            v-bind="panelProps"
+            @new-conversation="handleNewConversation"
+          />
+        </Transition>
+      </template>
+    </aside>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { RouterView, useRouter, useRoute } from 'vue-router'
+import { ChevronLeft, ChevronRight, Bot, Menu, PanelRight, MessageSquare, BookOpen, Brain, FolderTree, Rocket, Shrink, CalendarClock } from 'lucide-vue-next'
+import { useProjectStore } from '@/stores/project'
+import { useAgentStore } from '@/stores/agent'
+import { useConversationStore } from '@/stores/conversation'
+import { conversationsApi } from '@/api/conversations'
+import { projectsApi } from '@/api/projects'
+import ProjectTree from '@/components/sidebar/ProjectTree.vue'
+import AgentSwitcher from '@/components/sidebar/AgentSwitcher.vue'
+import SidebarFooter from '@/components/sidebar/SidebarFooter.vue'
+import ContextMeter from '@/components/knowledge/ContextMeter.vue'
+import ConversationTreePanel from '@/components/conversations/ConversationTreePanel.vue'
+import KnowledgePanel from '@/components/knowledge/KnowledgePanel.vue'
+import MemoryPanel from '@/components/memory/MemoryPanel.vue'
+import { closeAllConnections } from '@/composables/useWebSocket'
+import { invalidateLatestConversation } from '@/pages/ChatPage.vue'
+import { useProjectData } from '@/composables/useProjectData'
+
+useProjectData()
+
+/* ── Sidebar state ────────────────────────────────────────────── */
+const MOBILE_BREAKPOINT = 1024
+const leftCollapsed = ref(false)
+const rightCollapsed = ref(false)
+const isMobile = ref(false)
+const activeTab = ref<'conversations' | 'knowledge' | 'memory'>('conversations')
+
+/** Sync isMobile flag and auto-collapse sidebars when entering mobile. */
+function checkMobile() {
+  const wasMobile = isMobile.value
+  isMobile.value = window.innerWidth <= MOBILE_BREAKPOINT
+  // When transitioning to mobile, collapse both sidebars so the center panel is visible.
+  if (!wasMobile && isMobile.value) {
+    leftCollapsed.value = true
+    rightCollapsed.value = true
+  }
+}
+
+/** Update --app-height CSS var from visualViewport for accurate mobile height (keyboard support). */
+function updateAppHeight() {
+  if (window.visualViewport) {
+    document.documentElement.style.setProperty(
+      '--app-height',
+      `${window.visualViewport.height}px`,
+    )
+  }
+}
+
+/** Backdrop is visible on mobile when at least one sidebar is open. */
+const showBackdrop = computed(() =>
+  isMobile.value && (!leftCollapsed.value || !rightCollapsed.value),
+)
+
+/** Toggle left sidebar — on mobile, ensure mutual exclusion with right. */
+function toggleLeft() {
+  if (isMobile.value) {
+    if (leftCollapsed.value) {
+      leftCollapsed.value = false
+      rightCollapsed.value = true
+    } else {
+      leftCollapsed.value = true
+    }
+  } else {
+    leftCollapsed.value = !leftCollapsed.value
+  }
+}
+
+/** Toggle right sidebar — on mobile, ensure mutual exclusion with left. */
+function toggleRight() {
+  if (isMobile.value) {
+    if (rightCollapsed.value) {
+      rightCollapsed.value = false
+      leftCollapsed.value = true
+    } else {
+      rightCollapsed.value = true
+    }
+  } else {
+    rightCollapsed.value = !rightCollapsed.value
+  }
+}
+
+/** Close both sidebars (used by backdrop tap and route change on mobile). */
+function closeMobilePanels() {
+  leftCollapsed.value = true
+  rightCollapsed.value = true
+}
+
+onMounted(() => {
+  checkMobile()
+  window.addEventListener('resize', checkMobile)
+  updateAppHeight()
+  window.visualViewport?.addEventListener('resize', updateAppHeight)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', checkMobile)
+  window.visualViewport?.removeEventListener('resize', updateAppHeight)
+})
+
+/* ── Auto-close sidebars on navigation (mobile) ───────────────── */
+const route = useRoute()
+watch(() => route.fullPath, () => {
+  if (isMobile.value) closeMobilePanels()
+})
+
+/* ── Panel tabs & content ─────────────────────────────────────── */
+const { t } = useI18n()
+const tabs = computed(() => [
+  { id: 'conversations' as const, label: t('layout.tabConversations'), icon: MessageSquare },
+  { id: 'knowledge' as const, label: t('layout.tabKnowledge'), icon: BookOpen },
+  { id: 'memory' as const, label: t('layout.tabMemory'), icon: Brain },
+])
+
+const projectStore = useProjectStore()
+const agentStore = useAgentStore()
+const convStore = useConversationStore()
+const router = useRouter()
+
+/* ── Center top navigation ─────────────────────────────────────── */
+// /projects/{pid}/(chat|workspace|publishes|schedules) page segment; non-project
+// routes (/app, /settings) have no page nav. Knowledge and scripts were merged
+// into the unified workspace tab, so their old segments also count as workspace
+// (they redirect to it).
+const pageSegment = computed(() => {
+  const m = route.path.match(/^\/projects\/[^/]+\/(chat|workspace|knowledge|scripts|publishes|schedules)(?:\/|$)/)
+  if (!m) return null
+  if (m[1] === 'chat' || m[1] === 'publishes' || m[1] === 'schedules') return m[1]
+  return 'workspace'
+})
+
+const navTabs = computed(() => [
+  { id: 'chat' as const, label: t('layout.tabConversations'), icon: MessageSquare },
+  { id: 'workspace' as const, label: t('layout.tabWorkspace'), icon: FolderTree },
+  { id: 'publishes' as const, label: t('layout.tabPublishes'), icon: Rocket },
+  { id: 'schedules' as const, label: t('layout.tabSchedules'), icon: CalendarClock },
+])
+
+// Compress lives on the top nav row (right-aligned) rather than on its own
+// line under the chat panel; it targets the active conversation.
+const compressing = ref(false)
+const isCompressDisabled = computed(
+  () => convStore.isStreaming || convStore.isThinking || compressing.value,
+)
+
+async function handleCompress() {
+  const id = convStore.conversationId
+  if (!id || compressing.value) return
+  if (!window.confirm(t('chatPanel.compressConfirm'))) return
+  compressing.value = true
+  try {
+    const res = await conversationsApi.compress(id)
+    convStore.loadHistory(res.messages, id)
+  } catch (e) {
+    window.alert(e instanceof Error ? e.message : t('chatPanel.compressFailed'))
+  } finally {
+    compressing.value = false
+  }
+}
+
+function goToPage(segment: 'chat' | 'workspace' | 'publishes' | 'schedules') {
+  const pid = route.params.projectId
+  if (!pid) return
+  // No query forwarding: ?new=1 belongs to a specific entry flow
+  // and must not leak into a tab switch (a stale ?new=1 would silently reset
+  // the conversation). The mobile sidebar auto-close is handled by the
+  // existing route.fullPath watcher below.
+  router.push(`/projects/${pid}/${segment}`)
+}
+
+/* ── Route param ↔ project store sync ─────────────────────────── */
+// ProjectTree pushes both together, but direct URL navigation / back-forward
+// (same route record, component reused) changes only route.params.projectId.
+// Without this, pages reading currentProject (ChatPage, WorkspacePage)
+// keep showing the OLD project while the URL says otherwise, and
+// WorkspacePage could even save edits into the wrong project.
+const routePid = computed(() => route.params.projectId as string | undefined)
+let pidSyncSeq = 0
+watch(routePid, async (pid) => {
+  if (!pid) return
+  if (projectStore.currentProject?.project_id === pid) return
+  const seq = ++pidSyncSeq
+  let list = projectStore.projects
+  if (list.length === 0) {
+    try {
+      list = await projectsApi.getProjects()
+      projectStore.setProjects(list)
+    } catch {
+      return // auth/network errors surface via the route guard; leave as-is
+    }
+  }
+  if (seq !== pidSyncSeq) return
+  const match = list.find((p) => p.project_id === pid)
+  if (match) projectStore.setCurrentProject(match)
+}, { immediate: true })
+
+const currentProjectId = computed(() => projectStore.currentProject?.project_id)
+const currentAgentSlug = computed(() => agentStore.currentAgent?.slug)
+
+const panelComponent = computed(() => {
+  switch (activeTab.value) {
+    case 'knowledge': return KnowledgePanel
+    case 'memory': return MemoryPanel
+    default: return ConversationTreePanel
+  }
+})
+
+const panelProps = computed(() => {
+  switch (activeTab.value) {
+    case 'knowledge': return { projectId: currentProjectId.value }
+    case 'memory': return {}
+    default: return { projectId: currentProjectId.value, agentSlug: currentAgentSlug.value }
+  }
+})
+
+function handleNewConversation() {
+  closeAllConnections()
+  convStore.reset()
+  // Invalidate any in-flight latest-conversation load: its response would
+  // otherwise resurrect the old conversation over the fresh empty state
+  // . The ?new=1 marker stops the (possibly re-mounted) ChatPage
+  // from auto-restoring the latest conversation after a non-chat-page click.
+  invalidateLatestConversation()
+  const id = projectStore.currentProject?.project_id
+  if (id) router.push(`/projects/${id}/chat?new=1`)
+}
+</script>

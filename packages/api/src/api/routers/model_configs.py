@@ -1,0 +1,535 @@
+"""User model configuration management — supports multiple entries per provider."""
+from __future__ import annotations
+
+import logging
+import re
+import traceback
+from datetime import datetime, timezone
+from urllib.parse import urlsplit
+
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
+
+_log = logging.getLogger("agents_universe.model_configs")
+
+from api.config import get_settings
+from api.database import get_db
+from api.dependencies.auth import UserInfo, get_current_user
+from api.errors import api_error
+from api.models.user import UserModelConfig
+from api.services.model_tier import infer_complexity_tier
+from api.services.token_vault import decrypt_or_none, encrypt, key_hint as make_hint
+from agent_core.providers.registry import default_context_window
+
+router = APIRouter()
+
+VALID_PROVIDERS = {"anthropic", "openai", "azure_openai", "google_gemini"}
+
+SYSTEM_DEFAULT_CONFIG_ID = "system-default"
+
+# Upper bound matches conversations.py token_budget validation; beyond this a
+# window is almost certainly a typo (or a provider limitation we don't know).
+MAX_CONTEXT_WINDOW = 2_000_000
+
+
+def _serialize_config(row: UserModelConfig) -> dict:
+    return {
+        "config_id": row.config_id,
+        "provider": row.provider,
+        "model_id": row.model_id,
+        "key_hint": row.key_hint,
+        "base_url": row.base_url,
+        "url_mode": row.url_mode,
+        "complexity_tier": row.complexity_tier,
+        # Stored override; None = runtime falls back to default_context_window.
+        "context_window": row.context_window,
+        # Name-matched window shown as the Settings prefill/default.
+        "default_context_window": default_context_window(row.provider, row.model_id),
+        # None = thinking follows the env default (AGENT_EXTENDED_THINKING).
+        "thinking_enabled": row.thinking_enabled,
+        # None = reasoning_effort not sent (OpenAI reasoning models only).
+        "reasoning_effort": row.reasoning_effort,
+        "is_system": False,
+    }
+
+
+def _normalize_base_url(value: str | None) -> str | None:
+    """Normalize and validate a user-provided provider endpoint."""
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    parsed = urlsplit(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("URL must be an HTTP or HTTPS URL with a hostname")
+    return normalized.rstrip("/")
+
+
+def _redact_key(text: str, key: str) -> str:
+    """Scrub the submitted key out of a provider error message.
+
+    Providers echo the credential back in 401 bodies ("Incorrect API key
+    provided: sk-...", "invalid x-api-key: <key>") — returning that verbatim
+    to the client prints the key it just submitted. Same rule as
+    api_keys.py / tokens.py / integrations.py; redact_secret also matches
+    the bytes-repr escaped form that h11 and tracebacks quote.
+    """
+    from agent_core.tools._http import redact_secret
+    return redact_secret(text, key)
+
+
+def _validate_url_mode(value: str | None) -> str | None:
+    if value is not None and value not in ("base_url", "full_url"):
+        raise ValueError("url_mode must be 'base_url' or 'full_url'")
+    return value
+
+
+def _validate_complexity_tier(value: str | None) -> str | None:
+    if value is not None and value not in ("low", "mid", "high"):
+        raise ValueError("complexity_tier must be 'low', 'mid', 'high' or null")
+    return value
+
+
+# OpenAI reasoning_effort members. No "max" in the OpenAI API; "minimal" is
+# gpt-5-family only (o-series 400s on it) — the UI gates it by model id, the
+# server only membership-validates.
+VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high")
+
+
+def _validate_reasoning_effort(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized not in VALID_REASONING_EFFORTS:
+        raise ValueError(
+            f"reasoning_effort must be one of {', '.join(VALID_REASONING_EFFORTS)} or null"
+        )
+    return normalized
+
+
+class ModelConfigCreate(BaseModel):
+    provider: str = Field(max_length=50)
+    model_id: str = Field(max_length=200)
+    # bounded to the encrypted_key column (String(4000)): AES-GCM ciphertext
+    # is plaintext+28 bytes and base64 expands it ~4/3, so 2800 chars store as
+    # ~3772 chars — longer values raise DataError on MSSQL (500).
+    api_key: str | None = Field(None, max_length=2800)
+    base_url: str | None = Field(None, max_length=500)
+    url_mode: str | None = Field(None, max_length=20)
+    # Auto-route tier; omitted/null → inferred from provider+model_id on create.
+    complexity_tier: str | None = Field(None, max_length=20)
+    # Context-window override in tokens; null → name-matched default at runtime.
+    context_window: int | None = Field(None, ge=1, le=MAX_CONTEXT_WINDOW)
+    # Extended-thinking override; null → env default (AGENT_EXTENDED_THINKING).
+    thinking_enabled: bool | None = None
+    # OpenAI reasoning_effort; null → not sent.
+    reasoning_effort: str | None = Field(None, max_length=20)
+
+    @field_validator("base_url")
+    @classmethod
+    def trim_base_url(cls, value: str | None) -> str | None:
+        return _normalize_base_url(value)
+
+    @field_validator("url_mode")
+    @classmethod
+    def validate_url_mode(cls, value: str | None) -> str | None:
+        return _validate_url_mode(value)
+
+    @field_validator("complexity_tier")
+    @classmethod
+    def validate_complexity_tier(cls, value: str | None) -> str | None:
+        return _validate_complexity_tier(value)
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def validate_reasoning_effort(cls, value: str | None) -> str | None:
+        return _validate_reasoning_effort(value)
+
+
+class ModelConfigUpdate(BaseModel):
+    model_id: str | None = Field(None, max_length=200)
+    # same column-bound math as ModelConfigCreate.api_key.
+    api_key: str | None = Field(None, max_length=2800)
+    base_url: str | None = Field(None, max_length=500)
+    url_mode: str | None = Field(None, max_length=20)
+    # Explicit null clears the tier (model no longer participates in auto).
+    complexity_tier: str | None = Field(None, max_length=20)
+    # Explicit null clears the override (back to name-matched default).
+    context_window: int | None = Field(None, ge=1, le=MAX_CONTEXT_WINDOW)
+    # Explicit null clears the override (back to env default).
+    thinking_enabled: bool | None = None
+    # Explicit null clears the override (effort no longer sent).
+    reasoning_effort: str | None = Field(None, max_length=20)
+
+    @field_validator("base_url")
+    @classmethod
+    def trim_base_url(cls, value: str | None) -> str | None:
+        return _normalize_base_url(value)
+
+    @field_validator("url_mode")
+    @classmethod
+    def validate_url_mode(cls, value: str | None) -> str | None:
+        return _validate_url_mode(value)
+
+    @field_validator("complexity_tier")
+    @classmethod
+    def validate_complexity_tier(cls, value: str | None) -> str | None:
+        return _validate_complexity_tier(value)
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def validate_reasoning_effort(cls, value: str | None) -> str | None:
+        return _validate_reasoning_effort(value)
+
+
+def _system_default_entry() -> dict | None:
+    settings = get_settings()
+    if not settings.system_default_model_id or not settings.system_default_api_key:
+        return None
+    return {
+        "config_id": SYSTEM_DEFAULT_CONFIG_ID,
+        "provider": "openai",
+        "model_id": settings.system_default_model_id,
+        "key_hint": None,
+        "base_url": settings.system_default_base_url or None,
+        "url_mode": "base_url",
+        "complexity_tier": None,
+        "context_window": None,
+        "default_context_window": default_context_window("openai", settings.system_default_model_id),
+        "thinking_enabled": None,
+        "reasoning_effort": None,
+        "is_system": True,
+    }
+
+
+@router.get("")
+async def list_model_configs(
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(UserModelConfig)
+        .where(UserModelConfig.user_id == current_user.user_id)
+        .order_by(UserModelConfig.sort_order)
+    )
+    rows = result.scalars().all()
+
+    configs = [_serialize_config(r) for r in rows]
+
+    sys_default = _system_default_entry()
+    if sys_default:
+        configs.append(sys_default)
+
+    return configs
+
+
+@router.post("")
+async def create_model_config(
+    body: ModelConfigCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    if body.provider not in VALID_PROVIDERS:
+        raise api_error(400, "MODEL_PROVIDER_UNKNOWN", f"Unknown provider: {body.provider!r}")
+    if not body.model_id.strip():
+        raise api_error(400, "MODEL_ID_EMPTY", "model_id cannot be empty")
+    if body.provider == "azure_openai" and not body.base_url:
+        raise api_error(400, "MODEL_AZURE_BASE_URL_REQUIRED", "Azure OpenAI requires a base URL")
+
+    user_id = current_user.user_id
+
+    # Determine sort_order (append at end)
+    max_order_result = await db.execute(
+        select(func.max(UserModelConfig.sort_order))
+        .where(UserModelConfig.user_id == user_id)
+    )
+    max_val = max_order_result.scalar()
+    next_order = 0 if max_val is None else max_val + 1
+
+    encrypted = None
+    hint = None
+    if body.api_key:
+        encrypted = encrypt(body.api_key, user_id)
+        hint = make_hint(body.api_key)
+
+    row = UserModelConfig(
+        user_id=user_id,
+        provider=body.provider,
+        model_id=body.model_id.strip(),
+        encrypted_key=encrypted,
+        key_hint=hint,
+        base_url=body.base_url or None,
+        url_mode=body.url_mode or "base_url",
+        # Explicit tier wins; otherwise a best-effort inference from the
+        # model name (user can adjust later in Settings).
+        complexity_tier=(
+            body.complexity_tier
+            if body.complexity_tier is not None
+            else infer_complexity_tier(body.provider, body.model_id.strip())
+        ),
+        context_window=body.context_window,
+        thinking_enabled=body.thinking_enabled,
+        reasoning_effort=body.reasoning_effort,
+        sort_order=next_order,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+
+    return _serialize_config(row)
+
+
+@router.put("/{config_id}")
+async def update_model_config(
+    config_id: str,
+    body: ModelConfigUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(UserModelConfig).where(
+            UserModelConfig.config_id == config_id,
+            UserModelConfig.user_id == current_user.user_id,
+        ).with_for_update()
+    )
+    row = result.scalar_one_or_none()
+    if not row:
+        raise api_error(404, "MODEL_CONFIG_NOT_FOUND", "Model config not found")
+
+    if body.model_id is not None:
+        if not body.model_id.strip():
+            raise api_error(400, "MODEL_ID_EMPTY", "model_id cannot be empty")
+        row.model_id = body.model_id.strip()
+
+    if body.api_key is not None:
+        row.encrypted_key = encrypt(body.api_key, row.user_id)
+        row.key_hint = make_hint(body.api_key)
+
+    if "base_url" in body.model_fields_set:
+        row.base_url = body.base_url
+    if "url_mode" in body.model_fields_set and body.url_mode:
+        row.url_mode = body.url_mode
+    if "complexity_tier" in body.model_fields_set:
+        row.complexity_tier = body.complexity_tier
+    if "context_window" in body.model_fields_set:
+        row.context_window = body.context_window
+    # Tri-state: explicit null in model_fields_set clears the override —
+    # an `is not None` guard would make clearing impossible.
+    if "thinking_enabled" in body.model_fields_set:
+        row.thinking_enabled = body.thinking_enabled
+    if "reasoning_effort" in body.model_fields_set:
+        row.reasoning_effort = body.reasoning_effort
+    if row.provider == "azure_openai" and not row.base_url:
+        raise api_error(400, "MODEL_AZURE_BASE_URL_REQUIRED", "Azure OpenAI requires a base URL")
+
+    row.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    return _serialize_config(row)
+
+
+@router.delete("/{config_id}")
+async def delete_model_config(
+    config_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(UserModelConfig).where(
+            UserModelConfig.config_id == config_id,
+            UserModelConfig.user_id == current_user.user_id,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if not row:
+        raise api_error(404, "MODEL_CONFIG_NOT_FOUND", "Model config not found")
+
+    await db.delete(row)
+    await db.commit()
+    return {"deleted": config_id}
+
+
+class TestConnectionBody(BaseModel):
+    provider: str = Field(max_length=50)
+    model_id: str = Field(max_length=200)
+    # test-only (not persisted), but kept consistent with the saved configs.
+    api_key: str = Field(max_length=2800)
+    base_url: str | None = Field(None, max_length=500)
+    url_mode: str | None = Field(None, max_length=20)
+
+    @field_validator("base_url")
+    @classmethod
+    def trim_base_url(cls, value: str | None) -> str | None:
+        return _normalize_base_url(value)
+
+    @field_validator("url_mode")
+    @classmethod
+    def validate_url_mode(cls, value: str | None) -> str | None:
+        return _validate_url_mode(value)
+
+
+@router.post("/test-connection")
+async def test_connection(
+    body: TestConnectionBody,
+    current_user: UserInfo = Depends(get_current_user),
+):
+    """Test model connectivity without saving — used by the 'Add' form."""
+    if body.provider not in VALID_PROVIDERS:
+        return {"ok": False, "error": f"Unknown provider: {body.provider!r}"}
+    if not body.api_key:
+        return {"ok": False, "error": "API key is required for testing"}
+    if body.provider == "azure_openai" and not body.base_url:
+        return {"ok": False, "error": "Azure OpenAI requires a base URL"}
+
+    return await _do_test(body.provider, body.model_id, body.api_key, body.base_url, body.url_mode or "base_url")
+
+
+@router.post("/{config_id}/test")
+async def test_model_config(
+    config_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    settings = get_settings()
+
+    if config_id == SYSTEM_DEFAULT_CONFIG_ID:
+        if not settings.system_default_model_id:
+            raise api_error(404, "MODEL_NO_SYSTEM_DEFAULT", "No system default configured")
+        api_key = settings.system_default_api_key
+        base_url = settings.system_default_base_url
+        model_id = settings.system_default_model_id
+        provider = "openai"
+        url_mode = "base_url"
+    else:
+        result = await db.execute(
+            select(UserModelConfig).where(
+                UserModelConfig.config_id == config_id,
+                UserModelConfig.user_id == current_user.user_id,
+            )
+        )
+        row = result.scalar_one_or_none()
+        if not row:
+            raise api_error(404, "MODEL_CONFIG_NOT_FOUND", "Model config not found")
+
+        if not row.encrypted_key:
+            return {"ok": False, "error": "No API key configured for this model"}
+        if row.provider == "azure_openai" and not row.base_url:
+            return {"ok": False, "error": "Azure OpenAI requires a base URL"}
+
+        api_key = decrypt_or_none(row.encrypted_key, row.user_id)
+        if api_key is None:
+            return {"ok": False, "error": "Stored API key is corrupted — delete and re-save the model config"}
+        base_url = row.base_url
+        model_id = row.model_id
+        provider = row.provider
+        url_mode = row.url_mode
+
+    return await _do_test(provider, model_id, api_key, base_url, url_mode)
+
+
+async def _do_test(provider: str, model_id: str, api_key: str, base_url: str | None, url_mode: str = "base_url") -> dict:
+    settings = get_settings()
+    # The key goes into an HTTP header verbatim (Bearer / x-api-key / api-key).
+    # h11 rejects an illegal value by echoing it back ("Illegal header value
+    # b'...'") — that echo IS the credential, and the except-branch below would
+    # log it via exc_info. Refuse before the request; the message names no secret.
+    from agent_core.tools._http import _header_value_problem
+    problem = _header_value_problem(api_key) if api_key else None
+    if problem:
+        return {
+            "ok": False,
+            "error": f"API key {problem} — re-save it in Settings → AI Models without it",
+        }
+    try:
+        import httpx
+        ssl_verify = settings.llm_ssl_verify
+        request_params: dict | None = None
+
+        if provider == "anthropic":
+            url_base = (base_url or "https://api.anthropic.com").rstrip("/")
+            # Exact hostname match — a substring match would send the plaintext
+            # key to a lookalike domain (api.anthropic.com.evil.example).
+            is_direct = urlsplit(url_base).hostname == "api.anthropic.com"
+            if url_mode == "full_url":
+                url = url_base
+                headers = {"Authorization": f"Bearer {api_key}", "content-type": "application/json"}
+                payload = {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
+            elif is_direct:
+                url = f"{url_base}/v1/messages"
+                headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+                payload = {"model": model_id, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
+            else:
+                url = f"{url_base}/model/{model_id}/invoke"
+                headers = {"Authorization": f"Bearer {api_key}", "content-type": "application/json"}
+                payload = {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
+        elif provider == "azure_openai":
+            url_base = (base_url or "").rstrip("/")
+            if not url_base:
+                return {"ok": False, "error": "Azure OpenAI requires a valid endpoint"}
+            api_version = "2024-08-01-preview"
+            url = f"{url_base}/openai/deployments/{model_id}/chat/completions?api-version={api_version}"
+            headers = {"api-key": api_key, "content-type": "application/json"}
+            payload = {"max_completion_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}
+        elif provider == "google_gemini":
+            url_base = (base_url or "https://generativelanguage.googleapis.com").rstrip("/")
+            url = f"{url_base}/v1beta/models/{model_id}:generateContent"
+            # Key in the header, never the URL: query params leak into logs.
+            headers = {"x-goog-api-key": api_key, "content-type": "application/json"}
+            payload = {"contents": [{"parts": [{"text": "hi"}]}], "generationConfig": {"maxOutputTokens": 5}}
+        else:
+            url_base = (base_url or "https://api.openai.com").rstrip("/")
+            if url_mode == "full_url":
+                if not url_base.endswith("/chat/completions"):
+                    url_base = f"{url_base}/chat/completions"
+                url = url_base
+            else:
+                if not re.search(r"/v\d+$", url_base):
+                    url_base = f"{url_base}/v1"
+                url = f"{url_base}/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key}", "content-type": "application/json"}
+            payload = {"model": model_id, "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}
+
+        # User-controlled base_url must pass the same SSRF gate as every
+        # other outbound URL: literal-IP/metadata checks always on, port
+        # allowlist NOT applied (self-hosted gateways on arbitrary ports are
+        # legitimate targets), DNS-resolved checks follow the SSRF_ENABLED
+        # opt-in convention. resolve_and_validate directly — validate_outbound_url
+        # would re-apply the port allowlist .
+        from agent_core.tools._ssrf import SSRFError, validate_url as _ssrf_validate_url
+        _ssrf_validate_url(url, allow_any_port=True)
+        from agent_core.tools._http import _is_ssrf_enabled
+        if _is_ssrf_enabled():
+            from agent_core.tools._ssrf import resolve_and_validate
+            from urllib.parse import urlparse
+            _p = urlparse(url)
+            resolve_and_validate(_p.hostname, _p.port or (443 if _p.scheme == "https" else 80))
+
+        async with httpx.AsyncClient(timeout=30.0, verify=ssl_verify) as http:
+            resp = await http.post(
+                url,
+                headers=headers,
+                json=payload,
+                params=request_params,
+            )
+
+        if resp.status_code == 200:
+            return {"ok": True}
+        try:
+            body = resp.json()
+        except Exception:
+            body = {}
+        error_msg = body.get("error", {}).get("message", "") or resp.text[:200]
+        return {"ok": False, "error": f"HTTP {resp.status_code}: {_redact_key(error_msg, api_key)}"}
+    except SSRFError as e:
+        return {"ok": False, "error": f"Blocked URL: {e}"}
+    except Exception:
+        # No exc_info: SDK/transport exceptions echo the key back, and this
+        # route takes it straight from the request body. Format + scrub instead.
+        _log.warning(
+            "Model config connection test failed: %s",
+            _redact_key(traceback.format_exc(), api_key),
+        )
+        return {"ok": False, "error": "Connection test failed"}

@@ -1,0 +1,625 @@
+"""Conversation management router."""
+from __future__ import annotations
+
+import asyncio
+import json
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import func, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from api.database import get_db
+from api.dependencies.auth import UserInfo, authorize_conversation, authorize_project, get_current_user
+from api.errors import api_error
+from api.models.agent import Agent
+from api.models.conversation import AgentTask, Conversation, Message as DbMessage
+from api.models.conversation_run import ConversationRun
+from api.models.task_event import TaskEvent
+from api.models.project import Project
+from api.services.compression import (
+    CompressionError,
+    compress_once,
+)
+from api.services.conversation_runs import latest_run
+from api.websocket.manager import manager as ws_manager
+
+router = APIRouter(prefix="/api")
+
+
+def _safe_payload(raw: str | None) -> dict:
+    """Parse a stored task-event payload defensively.
+
+    A corrupted/truncated row (e.g. written by an older buggy version) must
+    not 500 the whole timeline endpoint.
+    """
+    try:
+        data = json.loads(raw or "{}")
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _like_needle(term: str, dialect_name: str) -> str:
+    """Lowercased LIKE needle, with T-SQL's character-class bracket escaped.
+
+    SQLAlchemy's ``autoescape`` handles %, _ and the escape char, but T-SQL
+    additionally reads ``[abc]`` as a character class (no ESCAPE equivalent),
+    so a literal ``[`` must become ``[[]`` on MSSQL only. Other dialects treat
+    ``[`` literally.
+    """
+    needle = term.lower()
+    if dialect_name == "mssql":
+        needle = needle.replace("[", "[[]")
+    return needle
+
+
+def serialize_message(m: DbMessage) -> dict:
+    """Serialize a message row in the shape the frontend consumes."""
+    def _parse_refs(m):
+        if not m.knowledge_refs:
+            return None
+        try:
+            refs = json.loads(m.knowledge_refs)
+            return refs if isinstance(refs, dict) else None
+        except (ValueError, TypeError):
+            return None
+
+    refs = _parse_refs(m)
+    # tool_calls is a JSON column; a corrupted/legacy row must not 500 the
+    # whole /messages endpoint (same guard as _parse_refs above).
+    try:
+        tool_calls = json.loads(m.tool_calls) if m.tool_calls else []
+    except (ValueError, TypeError):
+        tool_calls = []
+    return {
+        "message_id": str(m.message_id),
+        "role": m.role,
+        "content": m.content or "",
+        "agent_slug": m.agent_slug,
+        "model_name": m.model_name,
+        "thinking": m.thinking or None,
+        "tool_calls": tool_calls,
+        "images": refs and refs.get("images") or None,
+        "attachments": refs and refs.get("attachments") or None,
+        "interrupted": bool(refs and refs.get("interrupted")),
+        "error": bool(refs and refs.get("error")),
+        "sequence_num": m.sequence_num,
+        # This turn's own token cost; NULL on legacy rows and on
+        # injection-frozen partials (the turn's final message carries it).
+        "token_count": m.token_count,
+        "created_at": m.created_at.isoformat(),
+    }
+
+
+class ConversationCreate(BaseModel):
+    agent_id: str | None = None
+    # title column is Unicode(255) — MSSQL DataError (500) on overflow,
+    # SQLite silently accepts .
+    title: str | None = Field(default=None, max_length=255)
+    token_budget: int = Field(default=128000, gt=0, le=2_000_000)
+
+
+class ConversationUpdate(BaseModel):
+    # Same Unicode(255) bound as ConversationCreate. Stripped before the
+    # length check (mode="before"): a title padded past 255 raw chars must
+    # trim to a valid one instead of 422-ing on the untrimmed length, and a
+    # whitespace-only title must fail min_length rather than blank the title.
+    title: str = Field(min_length=1, max_length=255)
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def _strip(cls, v):
+        return v.strip() if isinstance(v, str) else v
+
+
+@router.get("/projects/{project_id}/conversations/latest")
+async def get_latest_conversation(
+    project_id: str,
+    agent_slug: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+    project: Project = Depends(authorize_project),
+):
+    # Activity order, not creation order: updated_at bumps on every persisted
+    # message, so a conversation the user returns to sorts by its last
+    # message time. Legacy rows predate the bump (NULL) - COALESCE falls back
+    # to created_at for them.
+    query = (
+        select(Conversation)
+        .where(
+            Conversation.project_id == project_id,
+            Conversation.user_id == current_user.user_id,
+            Conversation.status == "active",
+            # Public-initiated (publish) conversations stay out of the
+            # sidebar — they are owned by the publisher but serve external
+            # callers, not the user's own chat.
+            (Conversation.source.is_(None) | (Conversation.source != "publish")),
+        )
+        .order_by(func.coalesce(Conversation.updated_at, Conversation.created_at).desc())
+        .limit(1)
+    )
+    if agent_slug:
+        query = query.outerjoin(Agent, Agent.agent_id == Conversation.agent_id).where(
+            Agent.slug == agent_slug
+        )
+    # the else branch filtered `agent_id != None`, hiding
+    # agent-less conversations (create_conversation allows agent_id=None)
+    # from the "latest" lookup forever — they existed in the DB but could
+    # never be resumed from the UI. Without a slug filter, list them all.
+    result = await db.execute(query)
+    conv = result.scalar_one_or_none()
+    if not conv:
+        return None
+    # Token figures ride along so a page reload restores the ContextMeter
+    # immediately — the client has no other cheap source (token_update
+    # events only fire while a run is active). context_* carry last turn's
+    # occupancy/window for the meter fraction; tokens_used/token_budget
+    # remain the billing mirror.
+    return {
+        "conversation_id": str(conv.conversation_id),
+        "tokens_used": conv.tokens_used,
+        "token_budget": conv.token_budget,
+        "context_tokens": conv.context_tokens,
+        "context_window": conv.context_window,
+    }
+
+
+@router.get("/projects/{project_id}/conversations")
+async def list_conversations(
+    project_id: str,
+    agent_slug: str | None = None,
+    q: str | None = Query(None, max_length=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+    project: Project = Depends(authorize_project),
+):
+    message_count_subq = (
+        select(func.count(DbMessage.message_id))
+        .where(DbMessage.conversation_id == Conversation.conversation_id)
+        .correlate(Conversation)
+        .scalar_subquery()
+    )
+    active_task_subq = (
+        select(func.count())
+        .where(
+            AgentTask.conversation_id == Conversation.conversation_id,
+            AgentTask.status.in_(["running", "pending"]),
+        )
+        .correlate(Conversation)
+        .scalar_subquery()
+    )
+    total_task_subq = (
+        select(func.count())
+        .where(AgentTask.conversation_id == Conversation.conversation_id)
+        .correlate(Conversation)
+        .scalar_subquery()
+    )
+    # Latest conversation_run per conversation — one correlated scalar
+    # subquery (no N+1). ORDER BY + LIMIT 1 compiles to TOP (1) on MSSQL.
+    latest_run_subq = (
+        select(ConversationRun.run_id)
+        .where(ConversationRun.conversation_id == Conversation.conversation_id)
+        .order_by(ConversationRun.started_at.desc(), ConversationRun.run_id.desc())
+        .limit(1)
+        .correlate(Conversation)
+        .scalar_subquery()
+    )
+    last_run_status_subq = (
+        select(ConversationRun.status)
+        .where(ConversationRun.run_id == latest_run_subq)
+        .correlate(Conversation)
+        .scalar_subquery()
+    )
+
+    # Activity order, not creation order: updated_at bumps on every persisted
+    # message, so resuming after a reload lands in the conversation that was
+    # actually used last. Legacy NULL rows fall back to created_at.
+    query = (
+        select(
+            Conversation,
+            Agent.slug.label("agent_slug"),
+            message_count_subq.label("message_count"),
+            active_task_subq.label("active_task_count"),
+            total_task_subq.label("total_task_count"),
+            last_run_status_subq.label("last_run_status"),
+        )
+        .outerjoin(Agent, Agent.agent_id == Conversation.agent_id)
+        .where(
+            Conversation.project_id == project_id,
+            Conversation.user_id == current_user.user_id,
+            Conversation.status == "active",
+            # Same sidebar exclusion as the /latest lookup above.
+            (Conversation.source.is_(None) | (Conversation.source != "publish")),
+        )
+        .order_by(func.coalesce(Conversation.updated_at, Conversation.created_at).desc())
+        .limit(50)
+    )
+    if agent_slug:
+        query = query.where(Agent.slug == agent_slug)
+    # the else branch filtered `agent_id != None`, hiding
+    # agent-less conversations (create_conversation allows agent_id=None)
+    # from listings. Show all active conversations without a slug filter.
+
+    # Keyword filter: title OR any message body. lower() on both sides keeps
+    # matching case-insensitive on PostgreSQL (whose LIKE is case-sensitive)
+    # and identical to the other three dialects; autoescape stops %/_ in the
+    # user's text from acting as wildcards. The body test is a correlated
+    # EXISTS so a conversation with many matching messages still appears once.
+    # No index can serve a leading-wildcard LIKE: this scans the project's
+    # messages. Fine at current scale — full-text search would need per-dialect
+    # support, and the .limit(50) below means "50 most recent matches".
+    term = (q or "").strip()
+    if term:
+        needle = _like_needle(term, db.get_bind().dialect.name)
+        body_match = (
+            select(DbMessage.message_id)
+            .where(
+                DbMessage.conversation_id == Conversation.conversation_id,
+                func.lower(DbMessage.content).contains(needle, autoescape=True),
+            )
+            .correlate(Conversation)
+            .exists()
+        )
+        query = query.where(
+            or_(
+                func.lower(Conversation.title).contains(needle, autoescape=True),
+                body_match,
+            )
+        )
+
+    result = await db.execute(query)
+    rows = result.all()
+    return [
+        {
+            "conversation_id": str(row.Conversation.conversation_id),
+            "title": row.Conversation.title,
+            "agent_id": str(row.Conversation.agent_id) if row.Conversation.agent_id else None,
+            "agent_slug": row.agent_slug,
+            "token_budget": row.Conversation.token_budget,
+            "tokens_used": row.Conversation.tokens_used,
+            "context_tokens": row.Conversation.context_tokens,
+            "context_window": row.Conversation.context_window,
+            "message_count": row.message_count,
+            "active_task_count": row.active_task_count,
+            "total_task_count": row.total_task_count,
+            "last_run_status": row.last_run_status,
+            "is_running": ws_manager.is_turn_active(str(row.Conversation.conversation_id)),
+            "created_at": row.Conversation.created_at.isoformat(),
+            # Last-activity time (NULL for legacy rows never bumped) - the
+            # sidebar shows this in preference to created_at.
+            "updated_at": row.Conversation.updated_at.isoformat() if row.Conversation.updated_at else None,
+        }
+        for row in rows
+    ]
+
+
+@router.post("/projects/{project_id}/conversations")
+async def create_conversation(
+    project_id: str,
+    body: ConversationCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+    project: Project = Depends(authorize_project),
+):
+    # body.agent_id is a slug — resolve to the DB primary key.
+    # Project-scoped agents are only valid within their own project.
+    resolved_agent_id: str | None = None
+    if body.agent_id:
+        result = await db.execute(select(Agent).where(Agent.slug == body.agent_id))
+        db_agent = result.scalar_one_or_none()
+        if db_agent is None or (db_agent.project_id is not None and db_agent.project_id != project_id):
+            raise api_error(404, "AGENT_NOT_FOUND", "Agent not found")
+        resolved_agent_id = db_agent.agent_id
+
+    conv = Conversation(
+        project_id=project_id,
+        user_id=current_user.user_id,
+        agent_id=resolved_agent_id,
+        title=body.title,
+        token_budget=body.token_budget,
+    )
+    db.add(conv)
+    await db.commit()
+    return {
+        "conversation_id": str(conv.conversation_id),
+        "project_id": str(conv.project_id),
+        "token_budget": conv.token_budget,
+    }
+
+
+@router.patch("/conversations/{conversation_id}")
+async def rename_conversation(
+    conversation_id: str,
+    body: ConversationUpdate,
+    db: AsyncSession = Depends(get_db),
+    conversation: Conversation = Depends(authorize_conversation),
+):
+    """Rename a conversation (manual title override).
+
+    Deliberately does not touch updated_at: the sidebar orders by
+    COALESCE(updated_at, created_at), so bumping it would yank a renamed
+    conversation to the top of the list even though nothing was said in it.
+    Allowed while a turn is running — the title is metadata, not history.
+    """
+    conversation.title = body.title
+    await db.commit()
+    return {"conversation_id": conversation_id, "title": conversation.title}
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str,
+    db: AsyncSession = Depends(get_db),
+    conversation: Conversation = Depends(authorize_conversation),
+):
+    # deleting a conversation with a live turn left the agent
+    # running into a soft-deleted (invisible, unrecoverable) conversation —
+    # user/assistant messages and episodes kept being written, then the
+    # conversation is gone and the deleted row lingers forever. Same 409
+    # policy as the compress endpoint.
+    if ws_manager.is_turn_active(conversation_id):
+        raise api_error(409, "CONVERSATION_AGENT_RUNNING", "Agent is running; wait for it to finish before deleting.")
+    # Guarded update — the is_turn_active check is advisory: a turn can claim
+    # the conversation between that check and this UPDATE. Only a
+    # status='active' row may be soft-deleted. The status predicate cannot
+    # see the turn's in-memory claim, though — the post-commit re-check below
+    # closes that half of the race.
+    result = await db.execute(
+        update(Conversation)
+        .where(
+            Conversation.conversation_id == conversation_id,
+            Conversation.status == "active",
+        )
+        .values(status="deleted")
+    )
+    if result.rowcount == 0:
+        await db.rollback()
+        # Not a running-agent 409: delete is the only writer of status, so
+        # rowcount=0 means a concurrent delete already won the race after
+        # authorize passed. Answer with the same 404 the second delete gets
+        # instead of blaming an agent that may not even be running.
+        raise api_error(404, "CONVERSATION_NOT_FOUND", "Conversation not found")
+    # Commit before the (slow) media rmtree: a turn claimed while the status
+    # change was still uncommitted would see status='active', run a full turn,
+    # and its reply would land in a conversation deleted moments later —
+    # visible to nobody but the tokens were spent.
+    await db.commit()
+    # The claim is in-memory, so neither the advisory check nor the UPDATE's
+    # status predicate could see a turn that claimed while this request was
+    # in flight — and run_turn reads status='active' in its own session
+    # BEFORE this commit lands, so such a turn would keep running against the
+    # soft-deleted row. Re-check now that the delete is committed: a claim
+    # held this close to the status flip is a turn that just started (it
+    # cannot have finished within one commit await), so put the row back and
+    # refuse. A claim landing AFTER this check happens after run_turn's own
+    # status read, and that read then sees 'deleted' — the turn aborts on its
+    # own. Either way a live turn and a soft-deleted row never coexist.
+    if ws_manager.is_turn_active(conversation_id):
+        await db.execute(
+            update(Conversation)
+            .where(
+                Conversation.conversation_id == conversation_id,
+                Conversation.status == "deleted",
+            )
+            .values(status="active"),
+        )
+        await db.commit()
+        raise api_error(409, "CONVERSATION_AGENT_RUNNING", "Agent is running; wait for it to finish before deleting.")
+    # Best-effort disk cleanup: uploads and generated images for this
+    # conversation live under {PROJECTS_ROOT}/{slug}/.tmp/media/{id}/ and were
+    # never reclaimed on delete — soft-deleted conversations' media (privacy
+    # and disk growth) lingered forever.
+    try:
+        from pathlib import Path
+        from shutil import rmtree
+
+        from api.paths import resolve_project_fs_path
+
+        project_fs = await resolve_project_fs_path(str(conversation.project_id), db)
+        media_dir = Path(project_fs) / ".tmp" / "media" / conversation_id
+        if media_dir.exists():
+            await asyncio.to_thread(rmtree, media_dir, ignore_errors=True)
+    except Exception:
+        # The conversation delete itself must never fail because disk
+        # cleanup failed — media is best-effort only.
+        pass
+    # In-memory upload store too: the is_turn_active guard above guarantees no
+    # turn is consuming these bytes, so they are dead weight on the global
+    # upload quota until the TTL sweep — and privacy data of a deleted
+    # conversation should not linger in memory at all.
+    try:
+        from api.routers.media import drop_uploads
+        drop_uploads(conversation_id)
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+@router.get("/conversations/{conversation_id}/messages")
+async def list_messages(
+    conversation_id: str,
+    db: AsyncSession = Depends(get_db),
+    conversation: Conversation = Depends(authorize_conversation),
+    limit: int = Query(500, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    # Unbounded full-table reads made a long conversation return multi-MB
+    # JSON on every history load. Cap the page at 500; the UI loads the most
+    # recent messages. The order was ascending, so with >500 messages the
+    # newest were never returned — fetch the newest window (desc) and reverse
+    # to chronological.
+    result = await db.execute(
+        select(DbMessage)
+        .where(DbMessage.conversation_id == conversation_id)
+        .order_by(DbMessage.sequence_num.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    messages = list(result.scalars().all())
+    messages.reverse()
+    return [serialize_message(m) for m in messages]
+
+
+@router.post("/conversations/{conversation_id}/compress")
+async def compress_conversation_messages(
+    conversation_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+    conversation: Conversation = Depends(authorize_conversation),
+):
+    """Summarize the early conversation history and replace it with the summary."""
+    if ws_manager.is_turn_active(conversation_id):
+        raise api_error(409, "CONVERSATION_AGENT_RUNNING", "Agent is running; wait for it to finish before compressing.")
+    try:
+        # Concurrent compressions of the same conversation share the in-flight
+        # call (singleflight) — no lock error, no duplicated summary pairs.
+        result = await compress_once(db, conversation_id, current_user.user_id)
+    except CompressionError as e:
+        raise api_error(e.status_code, e.code, e.message)
+
+    remaining = await db.execute(
+        select(DbMessage)
+        .where(DbMessage.conversation_id == conversation_id)
+        .order_by(DbMessage.sequence_num)
+    )
+    return {
+        **result,
+        "messages": [serialize_message(m) for m in remaining.scalars().all()],
+    }
+
+
+@router.get("/conversations/{conversation_id}/tasks")
+async def list_tasks(
+    conversation_id: str,
+    db: AsyncSession = Depends(get_db),
+    conversation: Conversation = Depends(authorize_conversation),
+):
+    # 只返回最新一次 plan 的任务。多次 plan_task 时旧 plan 的行会累积在
+    # agent_tasks 里（无 plan 版本列），task_plan_created 事件按 sequence
+    # 单调递增，取最后一条解析出任务 id 即可区分新旧 plan。无事件或载荷
+    # 损坏（如 _bounded_json 截断后的最小信封）时回退返回全部行。
+    latest = await db.execute(
+        select(TaskEvent)
+        .where(
+            TaskEvent.conversation_id == conversation_id,
+            TaskEvent.event_type == "task_plan_created",
+        )
+        .order_by(TaskEvent.sequence.desc())
+        .limit(1)
+    )
+    evt = latest.scalar_one_or_none()
+    task_ids: list[str] | None = None
+    if evt is not None:
+        plan_tasks = _safe_payload(evt.payload).get("tasks")
+        if isinstance(plan_tasks, list):
+            task_ids = [
+                str(t.get("id"))
+                for t in plan_tasks
+                if isinstance(t, dict) and t.get("id")
+            ]
+    query = select(AgentTask).where(AgentTask.conversation_id == conversation_id)
+    if task_ids:
+        query = query.where(AgentTask.task_id.in_(task_ids))
+    result = await db.execute(query.order_by(AgentTask.sequence_num))
+    tasks = result.scalars().all()
+    return [
+        {
+            "task_id": str(t.task_id),
+            "title": t.title,
+            "status": t.status,
+            "estimated_complexity": t.estimated_complexity,
+            "actual_model": t.actual_model,
+            "result_summary": t.result_summary,
+            "error_message": t.error_message,
+            "current_step": t.current_step,
+            "next_step": t.next_step,
+            "progress_completed": t.progress_completed,
+            "progress_total": t.progress_total,
+            "created_at": t.created_at.isoformat(),
+            "started_at": t.started_at.isoformat() if t.started_at else None,
+            "completed_at": t.completed_at.isoformat() if t.completed_at else None,
+        }
+        for t in tasks
+    ]
+
+
+@router.get("/conversations/{conversation_id}/task-events")
+async def list_task_events(
+    conversation_id: str,
+    cursor: int = 0,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+    conversation: Conversation = Depends(authorize_conversation),
+):
+    limit = max(1, min(limit, 200))
+    result = await db.execute(
+        select(TaskEvent)
+        .where(TaskEvent.conversation_id == conversation_id, TaskEvent.sequence > cursor)
+        .order_by(TaskEvent.sequence)
+        .limit(limit + 1)
+    )
+    rows = result.scalars().all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    return {
+        "items": [
+            {
+                "event_id": str(event.event_id),
+                "sequence": event.sequence,
+                "event_type": event.event_type,
+                "task_id": event.task_id,
+                "payload": _safe_payload(event.payload),
+                "created_at": event.created_at.isoformat(),
+            }
+            for event in rows
+        ],
+        "next_cursor": rows[-1].sequence if has_more and rows else None,
+        "has_more": has_more,
+    }
+
+
+@router.get("/conversations/{conversation_id}/token-usage")
+async def token_usage(
+    conversation_id: str,
+    conversation: Conversation = Depends(authorize_conversation),
+):
+    # Percent reflects context occupancy (meter semantics), not the lifetime
+    # billing ledger — tokens_used/token_budget stay in the payload for compat.
+    occupancy = conversation.context_tokens or 0
+    window = conversation.context_window or conversation.token_budget
+    return {
+        "tokens_used": conversation.tokens_used,
+        "token_budget": conversation.token_budget,
+        "context_tokens": conversation.context_tokens,
+        "context_window": conversation.context_window,
+        "percent": round(occupancy / window * 100, 1) if window else 0,
+    }
+
+
+@router.get("/conversations/{conversation_id}/runs/latest")
+async def get_latest_run(
+    conversation_id: str,
+    db: AsyncSession = Depends(get_db),
+    conversation: Conversation = Depends(authorize_conversation),
+):
+    """Most recent conversation run — reopen feedback (status, partial text).
+
+    Returns null when the conversation never ran an agent turn. The
+    streaming_snapshot is throttled partial output, not authoritative (the
+    Message row is); the frontend uses it to show what an interrupted run
+    produced before it died.
+    """
+    run = await latest_run(db, conversation_id)
+    if not run:
+        return None
+    return {
+        "run_id": str(run.run_id),
+        "status": run.status,
+        "user_message_id": run.user_message_id,
+        "started_at": run.started_at.isoformat(),
+        "ended_at": run.ended_at.isoformat() if run.ended_at else None,
+        "error_message": run.error_message,
+        "streaming_snapshot": run.streaming_snapshot,
+        "tokens_used": run.tokens_used,
+    }

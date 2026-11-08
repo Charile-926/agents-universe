@@ -1,0 +1,1410 @@
+"""Agent-as-a-Service publish tests.
+
+Covers the management CRUD + API-key lifecycle (SSO), the public SSE stream
+(API-key auth, bounded concurrency, abort) and the non-interactive turn path.
+The LLM is replaced with a spy Agent so no external provider is contacted.
+"""
+from __future__ import annotations
+
+import asyncio
+import uuid
+
+import pytest
+from sqlalchemy import select
+
+from api.models.conversation import Conversation
+from api.models.publish import AgentPublish, PublishKey
+from api.models.user import UserModelConfig
+from api.services.publish import (
+    authenticate_publish_key,
+    generate_publish_key,
+    hash_publish_key,
+)
+
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+
+async def _make_publish(db, make_project, *, user_id="test-user", agent_slug=None, model_id="p-model", with_agent=True):
+    agent_slug = agent_slug or f"t-agent-{uuid.uuid4().hex[:8]}"
+    project = await make_project(created_by=user_id)
+    if with_agent:
+        from api.models.agent import Agent
+        db.add(Agent(
+            slug=agent_slug,
+            display_name=agent_slug,
+            project_id=None,  # global agent
+        ))
+        await db.commit()
+    cfg = UserModelConfig(
+        user_id=user_id,
+        provider="openai",
+        model_id=model_id,
+        encrypted_key="not-a-real-key",
+    )
+    db.add(cfg)
+    await db.commit()
+    await db.refresh(cfg)
+    publish = AgentPublish(
+        owner_id=user_id,
+        agent_slug=agent_slug,
+        project_id=str(project.project_id),
+        model_config_id=cfg.config_id,
+        title="Test publish",
+    )
+    db.add(publish)
+    await db.commit()
+    await db.refresh(publish)
+    return publish, cfg
+
+
+def _mk_key(publish_id: str):
+    plain = generate_publish_key(publish_id)
+    return plain, hash_publish_key(plain)
+
+
+def _record_turn_ownership(monkeypatch):
+    """Record every release_turn and mark when the run task unwinds.
+
+    The SSE drain returns as soon as stream_end is yielded — the run
+    task's finally may not have run yet — so the run semaphore (released
+    last in that finally) is swapped for a marker the test can await
+    before counting releases.
+    """
+    import api.routers.publish as publish_router
+    from api.websocket.manager import manager
+
+    releases: list[str] = []
+    unwound: list[str] = []
+    real_release = manager.release_turn
+
+    def _release(conversation_id: str) -> None:
+        releases.append(conversation_id)
+        real_release(conversation_id)
+
+    monkeypatch.setattr(manager, "release_turn", _release)
+
+    class _MarkerSemaphore:
+        async def acquire(self) -> bool:
+            return True
+
+        def release(self) -> None:
+            unwound.append("yes")
+
+    monkeypatch.setattr(publish_router, "_publish_semaphore", _MarkerSemaphore())
+    return releases, unwound
+
+
+# ── key hashing / auth helpers ─────────────────────────────────────────────
+
+
+async def test_generate_hash_roundtrip(db, make_project):
+    """The stored hash authenticates the plaintext, and never the other way."""
+    # publish_keys.publish_id is an FK to agent_publishes — create the parent
+    # row or PostgreSQL rejects the insert (SQLite, with FK enforcement off by
+    # default, would not). The key embeds the real publish id as its prefix.
+    publish, _ = await _make_publish(db, make_project)
+    plain, digest = _mk_key(publish.publish_id)
+    assert plain.startswith(f"pua_{publish.publish_id}_")
+    assert hash_publish_key(plain) == digest
+    # Store a row so authenticate resolves it.
+    key = PublishKey(publish_id=publish.publish_id, name="k", key_hash=digest, key_hint="..." + plain[-4:])
+    db.add(key)
+    await db.commit()
+
+    found = await authenticate_publish_key(db, plain)
+    assert found is not None and found[0] == publish.publish_id
+    # A wrong key must not authenticate (compare_digest, constant time).
+    assert await authenticate_publish_key(db, "pua_p1_" + "x" * 43) is None
+    # Non-prefixed / malformed keys never reach the DB scan.
+    assert await authenticate_publish_key(db, "pua_p1_short") is None
+    assert await authenticate_publish_key(db, "not-a-key") is None
+
+
+async def test_key_hash_not_plaintext_in_db(db, make_project):
+    """The DB row stores only the SHA-256, never the raw key."""
+    publish, _ = await _make_publish(db, make_project)
+    plain = generate_publish_key(publish.publish_id)
+    digest = hash_publish_key(plain)
+    row = PublishKey(publish_id=publish.publish_id, key_hash=digest, key_hint="..." + plain[-4:])
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    assert row.key_hash == digest
+    assert plain not in (row.key_hash, row.key_hint or "")
+    assert row.key_hint == "..." + plain[-4:]
+
+
+# ── management CRUD (SSO) ──────────────────────────────────────────────────
+
+
+async def test_create_publish_requires_owned_model_config(client, db, make_project, as_user):
+    project = await make_project(created_by="test-user")
+    from api.models.agent import Agent
+    slug = f"t-agent-{uuid.uuid4().hex[:8]}"
+    db.add(Agent(slug=slug, display_name=slug, project_id=None))
+    # Another user's model config must be rejected.
+    other_cfg = UserModelConfig(user_id="someone-else", provider="openai", model_id="x", encrypted_key="k")
+    db.add(other_cfg)
+    await db.commit()
+
+    async with as_user("test-user"):
+        r = await client.post("/api/publishes", json={
+            "agent_slug": slug,
+            "project_id": str(project.project_id),
+            "model_config_id": other_cfg.config_id,
+        })
+    assert r.status_code == 400  # model config not owned by publisher
+
+    async with as_user("other-user"):
+        r = await client.post("/api/publishes", json={
+            "agent_slug": slug,
+            "project_id": str(project.project_id),
+            "model_config_id": other_cfg.config_id,
+        })
+    # other-user is not a member of the project -> forbidden
+    assert r.status_code == 403
+
+
+async def test_create_and_list_publish(client, db, make_project, as_user):
+    from api.models.agent import Agent
+    project = await make_project(created_by="test-user")
+    cfg = UserModelConfig(user_id="test-user", provider="openai", model_id="gpt-x", encrypted_key="k")
+    db.add(cfg)
+    await db.commit()
+
+    slug = f"t-agent-{uuid.uuid4().hex[:8]}"
+    db.add(Agent(slug=slug, display_name=slug, project_id=None))
+    await db.commit()
+    async with as_user("test-user"):
+        r = await client.post("/api/publishes", json={
+            "agent_slug": slug,
+            "project_id": str(project.project_id),
+            "model_config_id": cfg.config_id,
+            "title": "My publish",
+        })
+    assert r.status_code == 201, r.text
+    body = r.json()
+    pubid = body["publish_id"]
+    assert body["agent_slug"] == slug
+    assert body["model_config_id"] == cfg.config_id
+    # Same shape as GET/list — the UI prepends this row and renders its date.
+    assert body["created_at"]
+    assert body["updated_at"] is None
+
+    async with as_user("test-user"):
+        r = await client.get("/api/publishes")
+    assert r.status_code == 200
+    assert any(p["publish_id"] == pubid for p in r.json())
+
+
+async def test_create_duplicate_publish_conflicts(client, db, make_project, as_user):
+    """One publish per (publisher, agent): the second POST is a clear 409, not
+    a 500 from the unique constraint."""
+    publish, cfg = await _make_publish(db, make_project)
+
+    async with as_user("test-user"):
+        r = await client.post("/api/publishes", json={
+            "agent_slug": publish.agent_slug,
+            "project_id": publish.project_id,
+            "model_config_id": cfg.config_id,
+        })
+    assert r.status_code == 409, r.text
+
+
+async def test_publish_key_plaintext_shown_once(client, db, make_project, as_user):
+    publish, _ = await _make_publish(db, make_project)
+    async with as_user("test-user"):
+        r = await client.post(f"/api/publishes/{publish.publish_id}/keys", json={"name": "prod"})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    plain = body["key"]
+    assert plain.startswith("pua_")
+    # The list shape (active badge + date) must be usable without a reload.
+    assert body["is_active"] is True
+    assert body["created_at"]
+    assert body["revoked_at"] is None
+
+    # Listing keys must never include the plaintext.
+    async with as_user("test-user"):
+        r = await client.get(f"/api/publishes/{publish.publish_id}/keys")
+    assert r.status_code == 200
+    listed = r.json()
+    assert len(listed) == 1
+    assert "key" not in listed[0]
+    assert listed[0]["key_hint"] == "..." + plain[-4:]
+
+    # Revoke: subsequent API calls with the key fail.
+    async with as_user("test-user"):
+        r = await client.delete(f"/api/publishes/{publish.publish_id}/keys/{listed[0]['key_id']}")
+    assert r.status_code == 204
+    from api.services.publish import authenticate_publish_key
+    assert await authenticate_publish_key(db, plain) is None
+
+
+async def test_publish_update_toggle(client, db, make_project, as_user):
+    publish, _ = await _make_publish(db, make_project)
+    async with as_user("test-user"):
+        r = await client.patch(f"/api/publishes/{publish.publish_id}", json={"api_enabled": False})
+    assert r.status_code == 200
+    await db.refresh(publish)
+    assert publish.api_enabled is False
+
+
+# ── public stream (API key) ────────────────────────────────────────────────
+
+
+async def test_stream_requires_valid_key(client, db, make_project):
+    publish, _ = await _make_publish(db, make_project)
+    # No key -> 401
+    r = await client.post(f"/api/p/{publish.publish_id}/stream", json={"message": "hi"})
+    assert r.status_code == 401
+    # Wrong key -> 401
+    r = await client.post(
+        f"/api/p/{publish.publish_id}/stream",
+        headers={"Authorization": "Bearer pua_wrong_xyz"},
+        json={"message": "hi"},
+    )
+    assert r.status_code == 401
+
+
+async def test_stream_disabled_publish(client, db, make_project, as_user):
+    publish, _ = await _make_publish(db, make_project)
+    publish.api_enabled = False
+    await db.commit()
+    plain, _ = _mk_key(publish.publish_id)
+    row = PublishKey(publish_id=publish.publish_id, key_hash=hash_publish_key(plain), key_hint="...abc")
+    db.add(row)
+    await db.commit()
+    r = await client.post(
+        f"/api/p/{publish.publish_id}/stream",
+        headers={"Authorization": f"Bearer {plain}"},
+        json={"message": "hi"},
+    )
+    assert r.status_code == 403
+
+
+async def test_stream_creates_publish_conversation_and_runs(
+    client, db, make_project, monkeypatch
+):
+    """A turn runs against a source='publish' conversation owned by the publisher.
+
+    The API stream's conversation is scoped to (publish, "default" thread) —
+    no viewer, since an API caller has no identity.
+    """
+    publish, _ = await _make_publish(db, make_project)
+    plain, _ = _mk_key(publish.publish_id)
+    db.add(PublishKey(publish_id=publish.publish_id, key_hash=hash_publish_key(plain), key_hint="...z"))
+    await db.commit()
+
+    # Spy the turn kernel so no LLM is contacted.
+    captured = {}
+
+    async def _fake_run_turn(conversation_id, ws, msg, user_id, *, transport=None, interactive=True, actor_user_id=None):
+        captured["conversation_id"] = conversation_id
+        captured["user_id"] = user_id
+        captured["actor_user_id"] = actor_user_id
+        captured["interactive"] = interactive
+        captured["fixed_config_id"] = msg.get("fixed_config_id")
+        captured["agent_id"] = msg.get("agent_id")
+        # Emit a terminal event so the SSE stream closes.
+        await transport.send(conversation_id, {"type": "stream_delta", "delta": "hi"})
+        await transport.send(conversation_id, {"type": "stream_end", "message_id": "m1", "total_tokens": 0})
+
+    # The router imports run_turn from the agent_turn module — patch there so
+    # the router's lookup resolves the spy.
+    monkeypatch.setattr("api.services.agent_turn.run_turn", _fake_run_turn)
+
+    async with client.stream(
+        "POST", f"/api/p/{publish.publish_id}/stream",
+        headers={"Authorization": f"Bearer {plain}"},
+        json={"message": "hello world"},
+    ) as resp:
+        assert resp.status_code == 200
+        body = ""
+        async for line in resp.aiter_lines():
+            body += line
+        # One data frame: stream_delta + stream_end should both appear.
+        assert "stream_delta" in body
+        assert "stream_end" in body
+
+    # The kernel ran as the publisher with their bound model and interactive off.
+    assert captured["user_id"] == publish.owner_id
+    assert captured["actor_user_id"] == publish.owner_id
+    assert captured["interactive"] is False
+    assert captured["fixed_config_id"] == publish.model_config_id
+    # The run must resolve the agent the publisher selected, not a default.
+    assert captured["agent_id"] == publish.agent_slug
+
+    # The conversation is marked publish-owned and scoped to (publish, default).
+    result = await db.execute(
+        select(Conversation).where(Conversation.conversation_id == captured["conversation_id"])
+    )
+    conv = result.scalar_one()
+    assert conv.source == "publish"
+    assert conv.user_id == publish.owner_id
+    assert conv.publish_id == str(publish.publish_id)
+    assert conv.thread_id == "default"
+    assert conv.viewer_id is None
+
+
+async def test_stream_keeps_a_claim_retook_during_turn_cleanup(
+    client, db, make_project, monkeypatch
+):
+    """_run's finally must not release a claim re-taken after run_turn's
+    own release — that claim belongs to the new owner (a user message
+    arriving while the agent closes), and dropping it opens the
+    conversation to a second concurrent turn."""
+    import asyncio
+
+    publish, _ = await _make_publish(db, make_project)
+    plain, _ = _mk_key(publish.publish_id)
+    db.add(PublishKey(publish_id=publish.publish_id, key_hash=hash_publish_key(plain), key_hint="...z"))
+    await db.commit()
+    releases, unwound = _record_turn_ownership(monkeypatch)
+
+    async def _fake_run_turn(conversation_id, ws, msg, user_id, *, transport=None, interactive=True, actor_user_id=None):
+        # The kernel's finally: release, then await agent.close() — during
+        # that window a new message claims the turn.
+        from api.websocket.manager import manager
+        manager.release_turn(conversation_id)
+        assert await manager.claim_turn(conversation_id)
+        await transport.send(conversation_id, {"type": "stream_end", "message_id": "m1", "total_tokens": 0})
+
+    monkeypatch.setattr("api.services.agent_turn.run_turn", _fake_run_turn)
+
+    async with client.stream(
+        "POST", f"/api/p/{publish.publish_id}/stream",
+        headers={"Authorization": f"Bearer {plain}"},
+        json={"message": "hello world"},
+    ) as resp:
+        assert resp.status_code == 200
+        async for _line in resp.aiter_lines():
+            pass
+
+    for _ in range(200):
+        if unwound:
+            break
+        await asyncio.sleep(0.005)
+    assert unwound, "run task never unwound"
+    # Exactly one release: the kernel's own. A second would be the caller
+    # discarding the re-taken claim.
+    assert len(releases) == 1
+
+
+async def test_stream_surfaces_a_run_that_crashes_before_any_frame(
+    client, db, make_project, monkeypatch, caplog
+):
+    """A run task that raises before sending stream_end must not end the
+    SSE stream in silence, and its exception must be retrieved — otherwise
+    asyncio logs it as an unhandled task error when the task is collected."""
+    import logging
+
+    publish, _ = await _make_publish(db, make_project)
+    plain, _ = _mk_key(publish.publish_id)
+    db.add(PublishKey(publish_id=publish.publish_id, key_hash=hash_publish_key(plain), key_hint="...e"))
+    await db.commit()
+
+    async def _boom(conversation_id, ws, msg, user_id, *, transport=None, interactive=True, actor_user_id=None):
+        raise RuntimeError("kernel exploded")
+
+    monkeypatch.setattr("api.services.agent_turn.run_turn", _boom)
+
+    with caplog.at_level(logging.ERROR, logger="agents_universe.publish"):
+        async with client.stream(
+            "POST", f"/api/p/{publish.publish_id}/stream",
+            headers={"Authorization": f"Bearer {plain}"},
+            json={"message": "hi"},
+        ) as resp:
+            assert resp.status_code == 200
+            body = ""
+            async for line in resp.aiter_lines():
+                body += line
+
+    assert '"type": "error"' in body
+    assert "publish run task failed" in caplog.text
+
+
+async def test_abort_endpoint(client, db, make_project):
+    """A body-less abort stays compatible and never creates a conversation row."""
+    publish, _ = await _make_publish(db, make_project)
+    plain, _ = _mk_key(publish.publish_id)
+    db.add(PublishKey(publish_id=publish.publish_id, key_hash=hash_publish_key(plain), key_hint="...q"))
+    await db.commit()
+    r = await client.post(
+        f"/api/p/{publish.publish_id}/abort",
+        headers={"X-API-Key": plain},
+    )
+    assert r.status_code == 200
+
+    # Aborting a thread that never ran must not fabricate a conversation row.
+    result = await db.execute(
+        select(Conversation).where(
+            Conversation.source == "publish",
+            Conversation.publish_id == str(publish.publish_id),
+        )
+    )
+    assert result.scalars().all() == []
+
+
+async def test_publish_conversations_hidden_from_sidebar(client, db, make_project, as_user):
+    """source='publish' conversations never appear in the ordinary lists."""
+    publish, _ = await _make_publish(db, make_project)
+    from api.services.publish import get_or_create_publish_conversation
+    conv_id = await get_or_create_publish_conversation(
+        db, publish, viewer_id="test-user"
+    )
+
+    async with as_user("test-user"):
+        r = await client.get(f"/api/projects/{publish.project_id}/conversations")
+        r2 = await client.get(f"/api/projects/{publish.project_id}/conversations/latest")
+    assert r.status_code == 200
+    ids = [c["conversation_id"] for c in r.json()]
+    assert conv_id not in ids
+    assert (r2.json() or {}).get("conversation_id") != conv_id
+
+
+# ── SSO embedded page (viewer session) ─────────────────────────────────────
+
+
+def _make_viewer_token(publish_id: str, viewer_id: str) -> str:
+    from api.services.publish import publish_viewer_token
+    return publish_viewer_token(publish_id, viewer_id)
+
+
+async def test_page_tokenless_first_call(client, db, make_project, as_user):
+    """A logged-in viewer opens /p/<id> without any token: the page endpoint
+    issues a viewer-bound token and the payload in one cookie-authenticated
+    call (this is the page's very first request)."""
+    publish, _ = await _make_publish(db, make_project)
+
+    async with as_user("test-user"):
+        r = await client.get(f"/api/p/{publish.publish_id}/page")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["publish_id"] == str(publish.publish_id)
+    assert data["conversation_id"]
+    assert data["token"]
+    # The issued token opens the /session paths for the same viewer.
+    async with as_user("test-user"):
+        r2 = await client.get(
+            f"/api/p/{publish.publish_id}/session",
+            params={"token": data["token"]},
+        )
+    assert r2.status_code == 200
+
+    # A different viewer cannot reuse the issued token.
+    async with as_user("other-user"):
+        r3 = await client.get(
+            f"/api/p/{publish.publish_id}/session",
+            params={"token": data["token"]},
+        )
+    assert r3.status_code == 404
+
+
+async def test_page_tokenless_disabled_hidden(client, db, make_project, as_user):
+    """page_enabled=False makes the page endpoint 404 (indistinguishable from
+    a nonexistent publish — no existence oracle for disabled pages)."""
+    publish, _ = await _make_publish(db, make_project)
+    publish.page_enabled = False
+    await db.commit()
+
+    async with as_user("test-user"):
+        r = await client.get(f"/api/p/{publish.publish_id}/page")
+    assert r.status_code == 404
+
+
+async def test_session_requires_valid_token(client, db, make_project, as_user):
+    """The page payload's token is bound to (publish, viewer); a wrong token
+    or a different user cannot open the conversation."""
+    publish, _ = await _make_publish(db, make_project)
+
+    async with as_user("test-user"):
+        # Missing token -> 404 (fail closed)
+        r = await client.get(f"/api/p/{publish.publish_id}/session")
+        assert r.status_code == 422  # query param required by schema
+
+        r = await client.get(
+            f"/api/p/{publish.publish_id}/session",
+            params={"token": "wrong-token"},
+        )
+        assert r.status_code == 404
+        r2 = await client.get(
+            f"/api/p/{publish.publish_id}/session",
+            params={"token": _make_viewer_token(str(publish.publish_id), "other-user")},
+        )
+        assert r2.status_code == 404
+
+
+async def test_session_gets_or_creates_conversation(client, db, make_project, as_user):
+    """A page load creates the viewer's own publish conversation (owner-owned)."""
+    publish, _ = await _make_publish(db, make_project)
+
+    async with as_user("test-user"):
+        r = await client.get(
+            f"/api/p/{publish.publish_id}/session",
+            params={"token": _make_viewer_token(str(publish.publish_id), "test-user")},
+        )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["conversation_id"]
+    assert data["publish_id"] == str(publish.publish_id)
+    assert data["token"]  # a fresh viewer token for the socket path
+
+    result = await db.execute(
+        select(Conversation).where(Conversation.conversation_id == data["conversation_id"])
+    )
+    conv = result.scalar_one()
+    assert conv.source == "publish"
+    assert conv.user_id == publish.owner_id
+    assert conv.publish_id == str(publish.publish_id)
+    assert conv.viewer_id == "test-user"
+    assert conv.thread_id is None
+
+    # Idempotent: a second load reuses the same conversation.
+    async with as_user("test-user"):
+        r2 = await client.get(
+            f"/api/p/{publish.publish_id}/session",
+            params={"token": _make_viewer_token(str(publish.publish_id), "test-user")},
+        )
+    assert r2.json()["conversation_id"] == data["conversation_id"]
+
+
+async def test_session_page_disabled_publish(client, db, make_project, as_user):
+    """page_enabled=False hides the page from every viewer."""
+    publish, _ = await _make_publish(db, make_project)
+    publish.page_enabled = False
+    await db.commit()
+
+    async with as_user("test-user"):
+        r = await client.get(
+            f"/api/p/{publish.publish_id}/session",
+            params={"token": _make_viewer_token(str(publish.publish_id), "test-user")},
+        )
+    assert r.status_code == 404
+
+
+async def test_session_messages_and_latest_run(client, db, make_project, as_user):
+    """History + run status read back for a viewer of their own conversation."""
+    publish, _ = await _make_publish(db, make_project)
+    from api.services.publish import get_or_create_publish_conversation
+    conv_id = await get_or_create_publish_conversation(
+        db, publish, viewer_id="test-user"
+    )
+
+    # Seed one message + run row directly (the turn kernel persists these).
+    from api.models.conversation import Message as DbMessage
+    from api.models.conversation_run import ConversationRun
+    from api.models._compat import new_uuid
+    db.add(DbMessage(
+        message_id=new_uuid(),
+        conversation_id=conv_id,
+        role="user",
+        content="hello",
+        sequence_num=0,
+    ))
+    run = ConversationRun(
+        conversation_id=conv_id,
+        status="completed",
+        tokens_used=0,
+    )
+    db.add(run)
+    await db.commit()
+
+    async with as_user("test-user"):
+        r = await client.get(
+            f"/api/p/{publish.publish_id}/session/messages",
+            params={"token": _make_viewer_token(str(publish.publish_id), "test-user")},
+        )
+        r2 = await client.get(
+            f"/api/p/{publish.publish_id}/session/runs/latest",
+            params={"token": _make_viewer_token(str(publish.publish_id), "test-user")},
+        )
+    assert r.status_code == 200
+    msgs = r.json()
+    assert any(m["content"] == "hello" for m in msgs)
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "completed"
+
+
+async def test_session_run_streams_under_publisher(
+    client, db, make_project, as_user, monkeypatch
+):
+    """A viewer's message runs non-interactively as the publisher, pinned to
+    the publisher's bound model config."""
+    publish, _ = await _make_publish(db, make_project)
+    token = _make_viewer_token(str(publish.publish_id), "test-user")
+    captured = {}
+
+    async def _fake_run_turn(conversation_id, ws, msg, user_id, *, transport=None, interactive=True, actor_user_id=None):
+        captured["user_id"] = user_id
+        captured["actor_user_id"] = actor_user_id
+        captured["interactive"] = interactive
+        captured["fixed_config_id"] = msg.get("fixed_config_id")
+        captured["agent_id"] = msg.get("agent_id")
+        await transport.send(conversation_id, {"type": "stream_delta", "delta": "pong"})
+        await transport.send(conversation_id, {"type": "stream_end", "message_id": "m1", "total_tokens": 0})
+
+    monkeypatch.setattr("api.services.agent_turn.run_turn", _fake_run_turn)
+
+    async with as_user("test-user"):
+        async with client.stream(
+            "POST", f"/api/p/{publish.publish_id}/session/run",
+            json={"token": token, "message": "ping"},
+        ) as resp:
+            assert resp.status_code == 200
+            body = ""
+            async for line in resp.aiter_lines():
+                body += line
+            assert "stream_delta" in body
+            assert "stream_end" in body
+
+    assert captured["user_id"] == publish.owner_id
+    assert captured["actor_user_id"] == publish.owner_id
+    assert captured["interactive"] is False
+    assert captured["fixed_config_id"] == publish.model_config_id
+    # The run must resolve the agent the publisher selected, not a default.
+    assert captured["agent_id"] == publish.agent_slug
+
+
+async def test_session_run_keeps_a_claim_retook_during_turn_cleanup(
+    client, db, make_project, as_user, monkeypatch
+):
+    """The viewer run task has the same no-double-release rule as the
+    API-key stream: a claim re-taken while the kernel closes must survive
+    the caller's finally."""
+    import asyncio
+
+    publish, _ = await _make_publish(db, make_project)
+    token = _make_viewer_token(str(publish.publish_id), "test-user")
+    releases, unwound = _record_turn_ownership(monkeypatch)
+
+    async def _fake_run_turn(conversation_id, ws, msg, user_id, *, transport=None, interactive=True, actor_user_id=None):
+        from api.websocket.manager import manager
+        manager.release_turn(conversation_id)
+        assert await manager.claim_turn(conversation_id)
+        await transport.send(conversation_id, {"type": "stream_end", "message_id": "m1", "total_tokens": 0})
+
+    monkeypatch.setattr("api.services.agent_turn.run_turn", _fake_run_turn)
+
+    async with as_user("test-user"):
+        async with client.stream(
+            "POST", f"/api/p/{publish.publish_id}/session/run",
+            json={"token": token, "message": "ping"},
+        ) as resp:
+            assert resp.status_code == 200
+            async for _line in resp.aiter_lines():
+                pass
+
+    for _ in range(200):
+        if unwound:
+            break
+        await asyncio.sleep(0.005)
+    assert unwound, "run task never unwound"
+    assert len(releases) == 1
+
+
+async def test_session_run_bad_token(client, db, make_project, as_user):
+    publish, _ = await _make_publish(db, make_project)
+    async with as_user("test-user"):
+        r = await client.post(
+            f"/api/p/{publish.publish_id}/session/run",
+            json={"token": "nope", "message": "hi"},
+        )
+    # Schema rejects a short token before auth runs; use a full-length wrong
+    # token to exercise the auth gate itself.
+    assert r.status_code == 422
+    async with as_user("test-user"):
+        r2 = await client.post(
+            f"/api/p/{publish.publish_id}/session/run",
+            json={"token": "x" * 40, "message": "hi"},
+        )
+    assert r2.status_code == 404
+
+
+async def test_session_run_creates_abort_event(
+    client, db, make_project, as_user, monkeypatch
+):
+    """The SSE stream path must register an abort event for the conversation.
+
+    Abort events are normally created on WS ``connect()``; publish streams
+    never open a socket, so without ensure_abort_event run_turn's abort
+    watcher is never created and "stop" is a silent no-op. Hitting the stream
+    endpoint must leave a settable event behind.
+    """
+    publish, _ = await _make_publish(db, make_project)
+    token = _make_viewer_token(str(publish.publish_id), "test-user")
+
+    async def _fake_run_turn(conversation_id, ws, msg, user_id, *, transport=None, interactive=True, actor_user_id=None):
+        await transport.send(conversation_id, {"type": "stream_delta", "delta": "hi"})
+        await transport.send(conversation_id, {"type": "stream_end", "message_id": "m1", "total_tokens": 0})
+
+    monkeypatch.setattr("api.services.agent_turn.run_turn", _fake_run_turn)
+
+    from api.services.publish import get_or_create_publish_conversation
+    from api.websocket.manager import manager
+
+    # Seed the viewer's own conversation; the /session/run below must resolve
+    # to this exact row (same publish + viewer), not a fresh one.
+    conv_id = await get_or_create_publish_conversation(
+        db, publish, viewer_id="test-user"
+    )
+    # No WS was ever connected, so no event exists yet.
+    assert manager.get_abort_event(conv_id) is None
+
+    async with as_user("test-user"):
+        async with client.stream(
+            "POST", f"/api/p/{publish.publish_id}/session/run",
+            json={"token": token, "message": "ping"},
+        ) as resp:
+            assert resp.status_code == 200
+            async for _ in resp.aiter_lines():
+                pass
+
+    # The stream registered the event; abort now actually fires.
+    event = manager.get_abort_event(conv_id)
+    assert event is not None
+    assert not event.is_set()
+    manager.signal_abort(conv_id)
+    assert event.is_set()
+
+
+async def test_session_abort(client, db, make_project, as_user, monkeypatch):
+    """A viewer can abort the running turn of their own publish conversation."""
+    publish, _ = await _make_publish(db, make_project)
+    from api.services.publish import get_or_create_publish_conversation
+    conv_id = await get_or_create_publish_conversation(
+        db, publish, viewer_id="test-user"
+    )
+
+    signalled = []
+    import api.websocket.manager as wm
+    monkeypatch.setattr(
+        wm.manager, "signal_abort",
+        lambda conversation_id, **kw: signalled.append(
+            (conversation_id, kw.get("reason"))
+        ),
+    )
+
+    async with as_user("test-user"):
+        r = await client.post(
+            f"/api/p/{publish.publish_id}/session/abort",
+            json={"token": _make_viewer_token(str(publish.publish_id), "test-user")},
+        )
+    assert r.status_code == 200
+    assert r.json()["aborted"] is True
+    assert signalled == [(conv_id, "publish_viewer_abort")]
+
+    # A wrong token cannot abort.
+    async with as_user("test-user"):
+        r2 = await client.post(
+            f"/api/p/{publish.publish_id}/session/abort",
+            json={"token": "x" * 40},
+        )
+    assert r2.status_code == 404
+    assert signalled == [(conv_id, "publish_viewer_abort")]
+
+
+# ── per-publish / per-viewer / per-thread isolation ──────────────────────────
+
+
+async def test_two_publishes_same_project_get_distinct_conversations(
+    db, make_project
+):
+    """Two publishes of one owner in one project never share a conversation.
+
+    Regression for the bug where every publish of an owner+project resolved
+    to the same conversation row (mixed history, cross-publish turn claims
+    and aborts).
+    """
+    from api.models.publish import AgentPublish as PublishModel
+    from api.services.publish import get_or_create_publish_conversation
+
+    p1, cfg = await _make_publish(db, make_project, agent_slug="iso-a")
+    p2 = PublishModel(
+        owner_id=p1.owner_id,
+        agent_slug="iso-b",
+        project_id=p1.project_id,  # same project as p1
+        model_config_id=cfg.config_id,
+        title="Test publish 2",
+    )
+    db.add(p2)
+    await db.commit()
+    await db.refresh(p2)
+
+    c1 = await get_or_create_publish_conversation(db, p1, viewer_id="v1")
+    c2 = await get_or_create_publish_conversation(db, p2, viewer_id="v1")
+    assert c1 != c2
+
+    # Each publish is idempotent for the same viewer.
+    assert await get_or_create_publish_conversation(db, p1, viewer_id="v1") == c1
+    assert await get_or_create_publish_conversation(db, p2, viewer_id="v1") == c2
+
+    # viewer and thread are disjoint namespaces: a thread named like a viewer
+    # never collides with the viewer's row.
+    assert await get_or_create_publish_conversation(db, p1, thread_id="v1") != c1
+
+
+async def test_two_viewers_get_distinct_conversations_and_histories(
+    client, db, make_project, as_user
+):
+    """A second viewer of a publish never sees the first viewer's history."""
+    publish, _ = await _make_publish(db, make_project)
+
+    async with as_user("test-user"):
+        ra = await client.get(f"/api/p/{publish.publish_id}/page")
+    assert ra.status_code == 200
+    conv_a = ra.json()["conversation_id"]
+
+    # Viewer A leaves a message in their own conversation.
+    from api.models.conversation import Message as DbMessage
+    from api.models._compat import new_uuid
+    db.add(DbMessage(
+        message_id=new_uuid(),
+        conversation_id=conv_a,
+        role="user",
+        content="secret-of-a",
+        sequence_num=0,
+    ))
+    await db.commit()
+
+    async with as_user("other-user"):
+        rb = await client.get(f"/api/p/{publish.publish_id}/page")
+    assert rb.status_code == 200
+    conv_b = rb.json()["conversation_id"]
+    assert conv_a != conv_b
+
+    # Viewer B's history endpoint returns none of A's messages.
+    async with as_user("other-user"):
+        rm = await client.get(
+            f"/api/p/{publish.publish_id}/session/messages",
+            params={"token": _make_viewer_token(str(publish.publish_id), "other-user")},
+        )
+    assert rm.status_code == 200
+    assert all(m["content"] != "secret-of-a" for m in rm.json())
+
+
+async def test_viewer_conversation_idempotent_across_session_endpoints(
+    client, db, make_project, as_user
+):
+    """/page and every /session endpoint resolve to one conversation per viewer."""
+    publish, _ = await _make_publish(db, make_project)
+
+    async with as_user("test-user"):
+        page = await client.get(f"/api/p/{publish.publish_id}/page")
+        assert page.status_code == 200
+        data = page.json()
+        token = data["token"]
+        conv = data["conversation_id"]
+
+        s = await client.get(
+            f"/api/p/{publish.publish_id}/session", params={"token": token}
+        )
+        m = await client.get(
+            f"/api/p/{publish.publish_id}/session/messages", params={"token": token}
+        )
+        r = await client.get(
+            f"/api/p/{publish.publish_id}/session/runs/latest", params={"token": token}
+        )
+    assert s.status_code == 200
+    assert s.json()["conversation_id"] == conv
+    assert m.status_code == 200
+    assert r.status_code == 200  # no run yet -> null body, still 200
+
+
+async def test_stream_thread_partitions(client, db, make_project, monkeypatch):
+    """Each (publish, thread_id) pair gets its own conversation; omitted → default."""
+    publish, _ = await _make_publish(db, make_project)
+    plain, _ = _mk_key(publish.publish_id)
+    db.add(PublishKey(publish_id=publish.publish_id, key_hash=hash_publish_key(plain), key_hint="...t"))
+    await db.commit()
+
+    seen = []
+
+    async def _fake_run_turn(conversation_id, ws, msg, user_id, *, transport=None, interactive=True, actor_user_id=None):
+        seen.append(conversation_id)
+        await transport.send(conversation_id, {"type": "stream_delta", "delta": "hi"})
+        await transport.send(conversation_id, {"type": "stream_end", "message_id": "m1", "total_tokens": 0})
+        # Mirror the kernel's finally: run_turn owns the claim release —
+        # the caller's _run no longer does it for us.
+        from api.websocket.manager import manager
+        manager.release_turn(conversation_id)
+
+    monkeypatch.setattr("api.services.agent_turn.run_turn", _fake_run_turn)
+
+    async def _stream(thread_id=None):
+        body = {"message": "hi"}
+        if thread_id is not None:
+            body["thread_id"] = thread_id
+        async with client.stream(
+            "POST", f"/api/p/{publish.publish_id}/stream",
+            headers={"Authorization": f"Bearer {plain}"},
+            json=body,
+        ) as resp:
+            assert resp.status_code == 200
+            async for _ in resp.aiter_lines():
+                pass
+
+    await _stream("t1")
+    await _stream("t2")
+    await _stream("t1")
+    await _stream()
+    assert seen[0] != seen[1]           # t1 and t2 are isolated
+    assert seen[2] == seen[0]           # repeat t1 reuses the same conversation
+    assert seen[3] not in (seen[0], seen[1])  # omitted thread is its own scope
+
+    result = await db.execute(
+        select(Conversation).where(Conversation.conversation_id == seen[3])
+    )
+    conv = result.scalar_one()
+    assert conv.thread_id == "default"
+    assert conv.viewer_id is None
+
+
+async def test_abort_targets_correct_thread(client, db, make_project, monkeypatch):
+    """Abort with a thread_id stops only that thread; a body-less abort stops default."""
+    publish, _ = await _make_publish(db, make_project)
+    plain, _ = _mk_key(publish.publish_id)
+    db.add(PublishKey(publish_id=publish.publish_id, key_hash=hash_publish_key(plain), key_hint="...u"))
+    await db.commit()
+    from api.services.publish import get_or_create_publish_conversation
+    default_conv = await get_or_create_publish_conversation(db, publish, thread_id="default")
+    alpha_conv = await get_or_create_publish_conversation(db, publish, thread_id="alpha")
+
+    signalled = []
+    import api.websocket.manager as wm
+    monkeypatch.setattr(
+        wm.manager, "signal_abort",
+        lambda conversation_id, **kw: signalled.append(
+            (conversation_id, kw.get("reason"))
+        ),
+    )
+
+    r = await client.post(
+        f"/api/p/{publish.publish_id}/abort",
+        headers={"X-API-Key": plain},
+        json={"thread_id": "alpha"},
+    )
+    assert r.status_code == 200
+    assert signalled == [(alpha_conv, "publish_abort_api")]
+
+    r2 = await client.post(
+        f"/api/p/{publish.publish_id}/abort",
+        headers={"X-API-Key": plain},
+    )
+    assert r2.status_code == 200
+    assert signalled == [
+        (alpha_conv, "publish_abort_api"),
+        (default_conv, "publish_abort_api"),
+    ]
+
+    # An unknown thread is a no-op success — and creates no row.
+    r3 = await client.post(
+        f"/api/p/{publish.publish_id}/abort",
+        headers={"X-API-Key": plain},
+        json={"thread_id": "nope"},
+    )
+    assert r3.status_code == 200
+    assert signalled == [
+        (alpha_conv, "publish_abort_api"),
+        (default_conv, "publish_abort_api"),
+    ]
+
+
+async def test_legacy_shared_publish_rows_unreachable(db, make_project):
+    """Pre-isolation rows (NULL scope columns) never match the new lookup."""
+    from api.models._compat import new_uuid
+    from api.services.publish import get_or_create_publish_conversation
+
+    publish, _ = await _make_publish(db, make_project)
+    legacy = Conversation(
+        conversation_id=new_uuid(),
+        project_id=publish.project_id,
+        user_id=publish.owner_id,
+        source="publish",
+        status="active",
+        title="legacy shared row",
+    )
+    db.add(legacy)
+    await db.commit()
+
+    fresh = await get_or_create_publish_conversation(
+        db, publish, viewer_id="test-user"
+    )
+    assert fresh != str(legacy.conversation_id)
+    # The legacy row stays untouched in the DB.
+    result = await db.execute(
+        select(Conversation).where(Conversation.conversation_id == legacy.conversation_id)
+    )
+    assert result.scalar_one().publish_id is None
+
+
+async def test_page_payload_with_multiple_publishes_no_500(
+    client, db, make_project, as_user
+):
+    """Two publishes of one owner+project each load their own page — regression
+    for the unscoped viewer-payload lookup that 500'd on multiple rows."""
+    publish, cfg = await _make_publish(db, make_project, agent_slug="mp-a")
+    publish2 = AgentPublish(
+        owner_id=publish.owner_id,
+        agent_slug="mp-b",
+        project_id=publish.project_id,
+        model_config_id=cfg.config_id,
+    )
+    db.add(publish2)
+    await db.commit()
+
+    async with as_user("test-user"):
+        r1 = await client.get(f"/api/p/{publish.publish_id}/page")
+        r2 = await client.get(f"/api/p/{publish2.publish_id}/page")
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert r1.json()["conversation_id"] != r2.json()["conversation_id"]
+
+
+# ── private-project gate ────────────────────────────────────────────────────
+#
+# A project flipping private cuts off every publish surface for outsiders:
+# the API-key stream (no identity to check), the embed page (creator and
+# whitelisted members still load it), and /session calls carrying a viewer
+# token minted before the flip.
+
+
+async def _set_project_visibility(db, publish, visibility: str):
+    from api.models.project import Project
+    project = (await db.execute(
+        select(Project).where(Project.project_id == publish.project_id)
+    )).scalar_one()
+    project.visibility = visibility
+    await db.commit()
+
+
+async def test_stream_cut_off_when_project_private(client, db, make_project):
+    """A valid API key loses access the moment the project goes private."""
+    publish, _ = await _make_publish(db, make_project)
+    plain, _ = _mk_key(publish.publish_id)
+    db.add(PublishKey(publish_id=publish.publish_id, key_hash=hash_publish_key(plain), key_hint="...z"))
+    await db.commit()
+    await _set_project_visibility(db, publish, "private")
+
+    r = await client.post(
+        f"/api/p/{publish.publish_id}/stream",
+        headers={"Authorization": f"Bearer {plain}"},
+        json={"message": "hi"},
+    )
+    assert r.status_code == 403
+    detail = r.json()["detail"]
+    assert detail["code"] == "PROJECT_PRIVATE"
+    assert "private" in detail["message"]
+
+
+async def test_page_private_project_blocks_outsiders_not_members(
+    client, db, make_project, as_user
+):
+    """The embed page loads for creator/member, 403 PROJECT_PRIVATE for others."""
+    publish, _ = await _make_publish(db, make_project)
+    await _set_project_visibility(db, publish, "private")
+
+    # The creator keeps access.
+    async with as_user("test-user"):
+        r = await client.get(f"/api/p/{publish.publish_id}/page")
+    assert r.status_code == 200
+
+    # A logged-in outsider gets the private-project hint.
+    async with as_user("other-user"):
+        r2 = await client.get(f"/api/p/{publish.publish_id}/page")
+    assert r2.status_code == 403
+    detail = r2.json()["detail"]
+    assert detail["code"] == "PROJECT_PRIVATE"
+
+    # A whitelisted member loads the page like the creator.
+    from api.models.project_member import ProjectMember
+    db.add(ProjectMember(
+        project_id=publish.project_id, user_id="other-user", added_by="test-user",
+    ))
+    await db.commit()
+    async with as_user("other-user"):
+        r3 = await client.get(f"/api/p/{publish.publish_id}/page")
+    assert r3.status_code == 200
+
+
+async def test_session_viewer_token_rejected_when_project_private(
+    client, db, make_project, as_user
+):
+    """A viewer token minted before the flip stops working after it."""
+    publish, _ = await _make_publish(db, make_project)
+    await _set_project_visibility(db, publish, "private")
+
+    async with as_user("other-user"):
+        r = await client.get(
+            f"/api/p/{publish.publish_id}/session",
+            params={"token": _make_viewer_token(str(publish.publish_id), "other-user")},
+        )
+    assert r.status_code == 403
+    assert r.json()["detail"]["code"] == "PROJECT_PRIVATE"
+
+
+# ── agent scope ordering (T-SQL compile guard) ──────────────────────────────
+#
+# _get_publish_agent orders by scope so a project-scoped row wins over a
+# global row of the same slug if the schema ever allows duplicates. agents.slug
+# is globally unique today, so the predicate is defensive — but a bare
+# ``ORDER BY project_id IS NULL`` is a boolean predicate that SQL Server
+# rejects at parse time (error 156, "Incorrect syntax near the keyword 'IS'")
+# while SQLite/PG/MySQL accept it — which is why the regression only shows up
+# on the MSSQL deployment. These tests pin the compiled SQL instead.
+
+
+def test_publish_agent_scope_order_compiles_on_mssql():
+    """The scope order must compile to CASE WHEN — never a bare IS NULL."""
+    from sqlalchemy.dialects import mssql
+
+    from api.models.agent import Agent
+    from api.services.publish import _publish_agent_scope_order
+
+    stmt = (
+        select(Agent)
+        .where(Agent.slug == "some-agent")
+        .order_by(_publish_agent_scope_order())
+    )
+    sql = str(stmt.compile(dialect=mssql.dialect()))
+    order_clause = sql.split("ORDER BY", 1)[1]
+    assert order_clause.lstrip().startswith("CASE WHEN"), sql
+    assert "IS NULL" in order_clause  # NULL (global) rows sort last
+
+
+def test_publish_agent_scope_order_compiles_everywhere_else():
+    """No dialect-locked syntax leaks into the other three drivers."""
+    from sqlalchemy.dialects import mysql, postgresql, sqlite
+
+    from api.models.agent import Agent
+    from api.services.publish import _publish_agent_scope_order
+
+    stmt = (
+        select(Agent)
+        .where(Agent.slug == "some-agent")
+        .order_by(_publish_agent_scope_order())
+    )
+    for dialect in (postgresql.dialect(), mysql.dialect(), sqlite.dialect()):
+        str(stmt.compile(dialect=dialect))  # must not raise
+
+
+async def test_page_payload_resolves_agent(client, db, make_project, as_user):
+    """The page payload carries the publish agent's display row.
+
+    Runs the same lookup the broken query fed (WHERE slug + scope order),
+    so the endpoint keeps resolving the agent after the CASE rewrite.
+    """
+    publish, _ = await _make_publish(db, make_project)
+
+    async with as_user("test-user"):
+        r = await client.get(f"/api/p/{publish.publish_id}/page")
+    assert r.status_code == 200
+    agent = r.json()["agent"]
+    assert agent["slug"] == publish.agent_slug
+    assert agent["display_name"] == publish.agent_slug
+    assert agent["project_id"] is None  # the _make_publish global row
+
+
+async def test_session_messages_map_refs_like_the_chat_api(client, db, make_project, as_user):
+    """knowledge_refs must be split into images/attachments/interrupted/error
+    exactly like the chat serializer (routers/conversations) — pre-fix the
+    publish serializer returned the whole refs object as `images` and
+    hardcoded attachments/interrupted/error, so publish history lost every
+    flag the backend persists (error bubbles died on reload)."""
+    publish, _ = await _make_publish(db, make_project)
+    from api.services.publish import get_or_create_publish_conversation
+    conv_id = await get_or_create_publish_conversation(
+        db, publish, viewer_id="test-user"
+    )
+
+    from api.models._compat import new_uuid
+    from api.models.conversation import Message as DbMessage
+
+    db.add(DbMessage(
+        message_id=new_uuid(),
+        conversation_id=conv_id,
+        role="assistant",
+        content="with attachments",
+        sequence_num=1,
+        knowledge_refs='{"images": [{"url": "/x.png"}], "attachments": [{"name": "a.png"}]}',
+    ))
+    db.add(DbMessage(
+        message_id=new_uuid(),
+        conversation_id=conv_id,
+        role="assistant",
+        content="failed turn",
+        sequence_num=2,
+        knowledge_refs='{"error": true}',
+    ))
+    db.add(DbMessage(
+        message_id=new_uuid(),
+        conversation_id=conv_id,
+        role="assistant",
+        content="cut short",
+        sequence_num=3,
+        knowledge_refs='{"interrupted": true}',
+    ))
+    await db.commit()
+
+    async with as_user("test-user"):
+        r = await client.get(
+            f"/api/p/{publish.publish_id}/session/messages",
+            params={"token": _make_viewer_token(str(publish.publish_id), "test-user")},
+        )
+
+    assert r.status_code == 200
+    by_content = {m["content"]: m for m in r.json()}
+    with_refs = by_content["with attachments"]
+    assert with_refs["images"] == [{"url": "/x.png"}]
+    assert with_refs["attachments"] == [{"name": "a.png"}]
+    assert by_content["failed turn"]["error"] is True
+    assert by_content["failed turn"]["images"] is None
+    assert by_content["cut short"]["interrupted"] is True
+
+
+# ── SSE drain disconnect cleanup ────────────────────────────────────────────
+
+
+def _spy_abort(monkeypatch) -> list[tuple[str, str]]:
+    from api.websocket.manager import manager
+
+    aborted: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        manager,
+        "signal_abort",
+        lambda cid, *, reason="abort_signal": aborted.append((cid, reason)),
+    )
+    return aborted
+
+
+async def test_drain_generator_close_stops_the_run(monkeypatch):
+    """A client disconnect that lands while a frame is being sent closes the
+    suspended generator with GeneratorExit at the yield — a CancelledError-only
+    handler never sees it and the run would keep going with no client left."""
+    from api.routers.publish import _drain_publish_stream
+    from api.services.publish import SSEStream
+
+    aborted = _spy_abort(monkeypatch)
+    stream = SSEStream()
+    stream.queue.put_nowait({"type": "stream_delta", "delta": "x"})
+    task = asyncio.create_task(asyncio.sleep(3600))
+
+    gen = _drain_publish_stream(stream, task, "conv-close")
+    frame = await gen.__anext__()
+    assert "stream_delta" in frame
+    await gen.aclose()  # GeneratorExit raised at the yield
+
+    assert aborted == [("conv-close", "publish_sse_client_disconnect")]
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+
+
+async def test_drain_cancelled_at_await_stops_the_run(monkeypatch):
+    """Disconnect while the drain awaits the queue: CancelledError path, same
+    cleanup (and the re-raise must keep propagating)."""
+    from api.routers.publish import _drain_publish_stream
+    from api.services.publish import SSEStream
+
+    aborted = _spy_abort(monkeypatch)
+    stream = SSEStream()  # empty — the drain blocks in wait_for(queue.get())
+    task = asyncio.create_task(asyncio.sleep(3600))
+
+    gen = _drain_publish_stream(stream, task, "conv-cancel")
+    first = asyncio.ensure_future(gen.__anext__())
+    await asyncio.sleep(0.01)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    assert aborted == [("conv-cancel", "publish_sse_client_disconnect")]
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+
+
+async def test_drain_ignores_subtask_and_injection_stream_end(monkeypatch):
+    """Only the turn's final stream_end closes the SSE response.
+
+    Plan subtasks emit stream_end per task (task_id) and a mid-turn injection
+    emits one at its step boundary (injection=True); breaking on either cut
+    the HTTP stream while the agent kept working.
+    """
+    from api.routers.publish import _drain_publish_stream
+    from api.services.publish import SSEStream
+
+    aborted = _spy_abort(monkeypatch)
+    stream = SSEStream()
+    stream.queue.put_nowait(
+        {"type": "stream_end", "message_id": "m-task", "task_id": "t1"}
+    )
+    stream.queue.put_nowait({"type": "stream_delta", "delta": "after subtask"})
+    stream.queue.put_nowait(
+        {"type": "stream_end", "message_id": "m-frozen", "injection": True}
+    )
+    stream.queue.put_nowait({"type": "stream_delta", "delta": "after injection"})
+    stream.queue.put_nowait({"type": "stream_end", "message_id": "m-final"})
+    task = asyncio.create_task(asyncio.sleep(3600))
+
+    gen = _drain_publish_stream(stream, task, "conv-task")
+    frames = [f async for f in gen]
+
+    assert len(frames) == 5
+    assert "m-final" in frames[-1]
+    assert aborted == []
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+def test_sse_format_encodes_datetimes():
+    """Turn events can carry datetimes from tool results; a plain json.dumps
+    raised TypeError mid-stream and killed the whole SSE response."""
+    import json
+    from datetime import datetime, timezone
+
+    from api.services.publish import sse_format
+
+    frame = sse_format(
+        {"type": "tool_call_end", "output": {"at": datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)}}
+    )
+    payload = json.loads(frame.strip().removeprefix("data: "))
+    assert payload["output"]["at"] == "2026-01-02T03:04:05+00:00"
+
+
+async def test_drain_normal_completion_does_not_abort(monkeypatch):
+    """Exhausting the stream after stream_end must not signal abort — the run
+    is meant to finish (or be unwinding) on its own."""
+    from api.routers.publish import _drain_publish_stream
+    from api.services.publish import SSEStream
+
+    aborted = _spy_abort(monkeypatch)
+    stream = SSEStream()
+    stream.queue.put_nowait(
+        {"type": "stream_end", "message_id": "m1", "stop_reason": "stop"}
+    )
+    task = asyncio.create_task(asyncio.sleep(0))
+    await task  # run finished before the drain even starts
+
+    gen = _drain_publish_stream(stream, task, "conv-ok")
+    frames = [f async for f in gen]
+
+    assert len(frames) == 1
+    assert "stream_end" in frames[0]
+    assert aborted == []
+    assert not task.cancelled()
+
+
+async def test_session_non_ascii_token_is_rejected_not_500(
+    client, db, make_project, as_user
+):
+    """compare_digest raises TypeError on non-ASCII str; the viewer token is
+    an unauthenticated query parameter, so it must 404 like any bad token."""
+    publish, _ = await _make_publish(db, make_project)
+    async with as_user("other-user"):
+        r = await client.get(
+            f"/api/p/{publish.publish_id}/session",
+            params={"token": "签名签名签名签名"},
+        )
+    assert r.status_code == 404

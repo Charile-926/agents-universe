@@ -1,0 +1,513 @@
+"""Scheduled task management router (the 定时任务 tab)."""
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime
+from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from fastapi import APIRouter, Depends, Request
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from agent_core.scheduling.cron import CronError, describe_cron, next_run_at, validate_cron
+from api.database import get_db
+from api.dependencies.auth import UserInfo, authorize_project, get_current_user
+from api.errors import api_error
+from api.models._compat import now_utc
+from api.models.conversation import Conversation
+from api.models.project import Project
+from api.models.schedule import ScheduledTask, ScheduledTaskRun
+from api.models.script import AutomationScript
+
+router = APIRouter(prefix="/api")
+
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_MAX_RUNS = 100
+
+TargetType = Literal["script", "playwright", "agent"]
+
+
+class ScheduleCreate(BaseModel):
+    # Caps mirror the Unicode column widths (MSSQL DataError on overflow).
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=2000)
+    target_type: TargetType
+    script_id: str | None = Field(default=None, max_length=36)
+    spec_slug: str | None = Field(default=None, max_length=100)
+    agent_slug: str | None = Field(default=None, max_length=100)
+    prompt: str | None = None
+    env: dict[str, str] = Field(default_factory=dict, max_length=16)
+    conversation_id: str | None = Field(default=None, max_length=36)
+    cron_expr: str = Field(min_length=1, max_length=100)
+    timezone: str = Field(default="Asia/Shanghai", max_length=64)
+    enabled: bool = True
+
+
+class ScheduleUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=2000)
+    target_type: TargetType | None = None
+    script_id: str | None = Field(default=None, max_length=36)
+    spec_slug: str | None = Field(default=None, max_length=100)
+    agent_slug: str | None = Field(default=None, max_length=100)
+    prompt: str | None = None
+    env: dict[str, str] | None = Field(default=None, max_length=16)
+    conversation_id: str | None = Field(default=None, max_length=36)
+    cron_expr: str | None = Field(default=None, min_length=1, max_length=100)
+    timezone: str | None = Field(default=None, max_length=64)
+    enabled: bool | None = None
+
+
+class CronPreview(BaseModel):
+    cron_expr: str = Field(min_length=1, max_length=100)
+    timezone: str = Field(default="Asia/Shanghai", max_length=64)
+
+
+def _task_dict(task: ScheduledTask) -> dict:
+    return {
+        "schedule_id": str(task.schedule_id),
+        "project_id": str(task.project_id),
+        "name": task.name,
+        "description": task.description,
+        "target_type": task.target_type,
+        "script_id": str(task.script_id) if task.script_id else None,
+        "spec_slug": task.spec_slug,
+        "agent_slug": task.agent_slug,
+        "prompt": task.prompt,
+        "env": json.loads(task.env_json) if task.env_json else {},
+        "conversation_id": task.conversation_id,
+        "cron_expr": task.cron_expr,
+        "schedule": describe_cron(task.cron_expr),
+        "timezone": task.timezone,
+        "enabled": bool(task.enabled),
+        "notify": bool(task.notify),
+        "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
+        "last_run_at": task.last_run_at.isoformat() if task.last_run_at else None,
+        "last_status": task.last_status,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+    }
+
+
+def _run_dict(run: ScheduledTaskRun) -> dict:
+    return {
+        "run_id": str(run.run_id),
+        "schedule_id": str(run.schedule_id),
+        "trigger": run.trigger,
+        "status": run.status,
+        "script_run_id": run.script_run_id,
+        "conversation_id": run.conversation_id,
+        "summary": run.summary,
+        "error": run.error,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+    }
+
+
+def _validated_timezone(tz: str) -> str:
+    try:
+        ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise api_error(422, "SCHEDULE_TIMEZONE_INVALID", f"Unknown timezone: {tz}")
+    return tz
+
+
+def _upcoming(cron_expr: str, tz: str, *, enabled: bool) -> datetime | None:
+    if not enabled:
+        return None
+    try:
+        return next_run_at(cron_expr, tz, now_utc())
+    except CronError as exc:
+        raise api_error(422, "SCHEDULE_CRON_INVALID", str(exc))
+
+
+async def _load_task(db: AsyncSession, schedule_id: str) -> ScheduledTask:
+    task = (
+        await db.execute(
+            select(ScheduledTask).where(ScheduledTask.schedule_id == schedule_id)
+        )
+    ).scalar_one_or_none()
+    if task is None:
+        raise api_error(404, "SCHEDULE_NOT_FOUND", "Scheduled task not found")
+    return task
+
+
+async def _validate_target(
+    db: AsyncSession,
+    project: Project,
+    current_user: UserInfo,
+    *,
+    target_type: str,
+    script_id: str | None,
+    spec_slug: str | None,
+    agent_slug: str | None,
+    prompt: str | None,
+    conversation_id: str | None,
+    require_conversation: bool,
+    validate_conversation: bool = True,
+    conversation_owner_id: str | None = None,
+) -> None:
+    """Reject a task whose target could never run (fail at author time).
+
+    ``validate_conversation`` is turned off for values the client did not just
+    change: a stored conversation was validated when it was bound, the runtime
+    re-checks it against ``created_by`` at fire time (scheduled fires never
+    reach this function), and the model requires the task to outlive a deleted
+    conversation — re-validating it here only made PATCH/run-now fail for the
+    owner after a soft-delete and for any teammate at all. When validating an
+    explicit rebind, the owner is ``conversation_owner_id`` (the task creator,
+    who the runtime will check), defaulting to the requester at create time.
+    """
+    from api.paths import resolve_project_fs_path
+    from api.services.agent_sync import resolve_agent_definition_path
+
+    project_fs = await resolve_project_fs_path(str(project.project_id), db)
+
+    if target_type == "script":
+        if not script_id:
+            raise api_error(422, "SCHEDULE_SCRIPT_ID_REQUIRED", "script_id is required for a script task")
+        script = (
+            await db.execute(
+                select(AutomationScript).where(
+                    AutomationScript.script_id == script_id,
+                    AutomationScript.project_id == project.project_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if script is None:
+            raise api_error(422, "SCHEDULE_SCRIPT_NOT_FOUND", "Script not found in this project")
+        if script.script_type == "playwright":
+            raise api_error(
+                422,
+                "SCHEDULE_TARGET_TYPE_MISMATCH",
+                "Playwright specs are scheduled with target_type=playwright",
+            )
+    elif target_type == "playwright":
+        if not spec_slug or not _SLUG_RE.match(spec_slug):
+            raise api_error(422, "SCHEDULE_SPEC_SLUG_INVALID", "Invalid spec slug")
+        from pathlib import Path
+        spec = Path(project_fs) / "tests" / "generated" / f"{spec_slug}.spec.ts"
+        try:
+            ok = spec.is_file() and spec.resolve().is_relative_to(Path(project_fs).resolve())
+        except OSError:
+            ok = False
+        if not ok:
+            raise api_error(
+                422, "SCHEDULE_SPEC_NOT_FOUND", f"Spec not found: tests/generated/{spec_slug}.spec.ts"
+            )
+    elif target_type == "agent":
+        if not agent_slug or not _SLUG_RE.match(agent_slug):
+            raise api_error(422, "SCHEDULE_AGENT_SLUG_INVALID", "Invalid agent slug")
+        if not (prompt or "").strip():
+            raise api_error(422, "SCHEDULE_PROMPT_REQUIRED", "prompt is required for an agent task")
+        try:
+            resolved = resolve_agent_definition_path(agent_slug, project_fs)
+        except ValueError:
+            raise api_error(422, "SCHEDULE_AGENT_SLUG_INVALID", "Invalid agent slug")
+        if resolved is None:
+            raise api_error(
+                422, "SCHEDULE_AGENT_NOT_FOUND", f"No agent definition found for {agent_slug!r}"
+            )
+    else:
+        raise api_error(422, "SCHEDULE_TARGET_TYPE_INVALID", f"Unknown target type: {target_type}")
+
+    if conversation_id:
+        if validate_conversation:
+            conv = (
+                await db.execute(
+                    select(Conversation).where(
+                        Conversation.conversation_id == conversation_id,
+                        Conversation.project_id == project.project_id,
+                        Conversation.user_id
+                        == (conversation_owner_id or current_user.user_id),
+                        Conversation.status == "active",
+                    )
+                )
+            ).scalar_one_or_none()
+            if conv is None:
+                raise api_error(422, "SCHEDULE_CONVERSATION_NOT_FOUND", "Target conversation not found")
+    elif require_conversation:
+        raise api_error(422, "SCHEDULE_CONVERSATION_REQUIRED", "conversation_id is required")
+
+
+def _env_json(env: dict[str, str] | None) -> str | None:
+    """Serialize env for the Unicode(2000) column, refusing overflow.
+
+    Caps mirror the column widths (MSSQL DataError on overflow → 500); the
+    entry count cap on the request model does not bound key/value sizes, and
+    the fire-time value cap never runs at author time. Measure the exact
+    bytes that will be stored (json.dumps with the same default serialization
+    as the write sites).
+    """
+    if not env:
+        return None
+    raw = json.dumps(env)
+    if len(raw) > 2000:
+        raise api_error(
+            422,
+            "SCHEDULE_ENV_TOO_LARGE",
+            f"env serializes to {len(raw)} chars (max 2000); shrink the keys/values",
+        )
+    return raw
+
+
+@router.get("/projects/{project_id}/schedules")
+async def list_schedules(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+    project: Project = Depends(authorize_project),
+):
+    rows = (
+        await db.execute(
+            select(ScheduledTask)
+            .where(ScheduledTask.project_id == project_id)
+            .order_by(ScheduledTask.created_at.desc())
+        )
+    ).scalars().all()
+    return [_task_dict(t) for t in rows]
+
+
+@router.post("/projects/{project_id}/schedules/preview")
+async def preview_cron(
+    project_id: str,
+    body: CronPreview,
+    current_user: UserInfo = Depends(get_current_user),
+    project: Project = Depends(authorize_project),
+):
+    """Next three fire times for an expression — used by the create dialog."""
+    _validated_timezone(body.timezone)
+    if validate_cron(body.cron_expr) is not None:
+        raise api_error(422, "SCHEDULE_CRON_INVALID", validate_cron(body.cron_expr))
+    cursor = now_utc()
+    upcoming: list[str] = []
+    for _ in range(3):
+        try:
+            cursor = next_run_at(body.cron_expr, body.timezone, cursor)
+        except CronError as exc:
+            raise api_error(422, "SCHEDULE_CRON_INVALID", str(exc))
+        upcoming.append(cursor.isoformat())
+    return {"next_runs": upcoming, "description": describe_cron(body.cron_expr)}
+
+
+@router.post("/projects/{project_id}/schedules")
+async def create_schedule(
+    project_id: str,
+    body: ScheduleCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+    project: Project = Depends(authorize_project),
+):
+    _validated_timezone(body.timezone)
+    if validate_cron(body.cron_expr) is not None:
+        raise api_error(422, "SCHEDULE_CRON_INVALID", validate_cron(body.cron_expr))
+    await _validate_target(
+        db, project, current_user,
+        target_type=body.target_type,
+        script_id=body.script_id,
+        spec_slug=body.spec_slug,
+        agent_slug=body.agent_slug,
+        prompt=body.prompt,
+        conversation_id=body.conversation_id,
+        require_conversation=body.target_type == "agent",
+    )
+
+    task = ScheduledTask(
+        project_id=project_id,
+        name=body.name,
+        description=body.description,
+        target_type=body.target_type,
+        # Keep only the active target's fields: a create form that posts every
+        # field would otherwise leave stale values behind, and a later PATCH
+        # that switches target_type would resurrect them.
+        script_id=body.script_id if body.target_type == "script" else None,
+        spec_slug=body.spec_slug if body.target_type == "playwright" else None,
+        agent_slug=body.agent_slug if body.target_type == "agent" else None,
+        prompt=body.prompt if body.target_type == "agent" else None,
+        env_json=_env_json(body.env),
+        conversation_id=body.conversation_id,
+        cron_expr=body.cron_expr,
+        timezone=body.timezone,
+        enabled=body.enabled,
+        next_run_at=_upcoming(body.cron_expr, body.timezone, enabled=body.enabled),
+        created_by=current_user.user_id,
+    )
+    db.add(task)
+    await db.commit()
+    return _task_dict(task)
+
+
+@router.get("/schedules/{schedule_id}")
+async def get_schedule(
+    schedule_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    task = await _load_task(db, schedule_id)
+    await authorize_project(str(task.project_id), db, current_user)
+    return _task_dict(task)
+
+
+@router.patch("/schedules/{schedule_id}")
+async def update_schedule(
+    schedule_id: str,
+    body: ScheduleUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    task = await _load_task(db, schedule_id)
+    project = await authorize_project(str(task.project_id), db, current_user)
+
+    target_type = body.target_type or task.target_type
+    # Target fields fall back to the stored row so a cron-only PATCH does not
+    # need to resend the whole target.
+    script_id = body.script_id if body.script_id is not None else task.script_id
+    spec_slug = body.spec_slug if body.spec_slug is not None else task.spec_slug
+    agent_slug = body.agent_slug if body.agent_slug is not None else task.agent_slug
+    prompt = body.prompt if body.prompt is not None else task.prompt
+    conversation_id = (
+        body.conversation_id if body.conversation_id is not None else task.conversation_id
+    )
+    cron_expr = body.cron_expr or task.cron_expr
+    timezone = body.timezone or task.timezone
+    enabled = task.enabled if body.enabled is None else body.enabled
+
+    _validated_timezone(timezone)
+    if validate_cron(cron_expr) is not None:
+        raise api_error(422, "SCHEDULE_CRON_INVALID", validate_cron(cron_expr))
+    # Validate env before touching the row so an overflow 422s cleanly.
+    new_env_json = _env_json(body.env) if body.env is not None else None
+    # Only an explicitly-changed conversation is re-validated — and against
+    # the task creator, whose user_id the fire-time check uses (a requester
+    # rebinding to their own conversation would 422 at every fire).
+    rebind = (
+        body.conversation_id is not None
+        and body.conversation_id != task.conversation_id
+    )
+    await _validate_target(
+        db, project, current_user,
+        target_type=target_type,
+        script_id=script_id,
+        spec_slug=spec_slug,
+        agent_slug=agent_slug,
+        prompt=prompt,
+        conversation_id=conversation_id,
+        require_conversation=target_type == "agent",
+        validate_conversation=rebind,
+        conversation_owner_id=str(task.created_by) if rebind else None,
+    )
+
+    if body.name is not None:
+        task.name = body.name
+    if body.description is not None:
+        task.description = body.description
+    task.target_type = target_type
+    task.script_id = script_id if target_type == "script" else None
+    task.spec_slug = spec_slug if target_type == "playwright" else None
+    task.agent_slug = agent_slug if target_type == "agent" else None
+    task.prompt = prompt if target_type == "agent" else None
+    if body.env is not None:
+        task.env_json = new_env_json
+    # Capture BEFORE the assignments below overwrite the stored values — the
+    # cadence comparison must see the row's previous state.
+    cadence_changed = (
+        (body.cron_expr is not None and body.cron_expr != task.cron_expr)
+        or (body.timezone is not None and body.timezone != task.timezone)
+        or (body.enabled is not None and body.enabled != task.enabled)
+    ) or (enabled and task.next_run_at is None)
+    task.conversation_id = conversation_id
+    task.cron_expr = cron_expr
+    task.timezone = timezone
+    task.enabled = enabled
+    # Recompute only when the cadence or the on/off state actually changed —
+    # an unconditional recompute would push a due occurrence (next_run_at <=
+    # now, scheduler tick not yet fired) a full period into the future, so a
+    # name-only PATCH could silently eat an imminent fire. The value-compare
+    # (not presence-compare) keeps an explicitly-sent unchanged field from
+    # resetting the anchor; the next_run_at is None clause heals a legacy row
+    # that is enabled but was never anchored.
+    if cadence_changed:
+        task.next_run_at = _upcoming(cron_expr, timezone, enabled=enabled)
+    task.updated_at = now_utc()
+    await db.commit()
+    return _task_dict(task)
+
+
+@router.delete("/schedules/{schedule_id}")
+async def delete_schedule(
+    schedule_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    task = await _load_task(db, schedule_id)
+    await authorize_project(str(task.project_id), db, current_user)
+    # Cascades to the run history (ScheduledTask.runs).
+    await db.delete(task)
+    await db.commit()
+    return {"deleted": True}
+
+
+@router.post("/schedules/{schedule_id}/run")
+async def run_schedule_now(
+    schedule_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    from api.services.scheduled_runs import ScheduleBusy, ScheduleNotFound, spawn_run
+
+    task = await _load_task(db, schedule_id)
+    project = await authorize_project(str(task.project_id), db, current_user)
+    await _validate_target(
+        db, project, current_user,
+        target_type=task.target_type,
+        script_id=str(task.script_id) if task.script_id else None,
+        spec_slug=task.spec_slug,
+        agent_slug=task.agent_slug,
+        prompt=task.prompt,
+        conversation_id=task.conversation_id,
+        require_conversation=False,
+        # The runtime validates against target.created_by and fails the run
+        # cleanly; scheduled fires never revalidate either — author-time
+        # rechecking here only 422'd a manual run after a soft-delete.
+        validate_conversation=False,
+    )
+    try:
+        run_id = await spawn_run(request.app, schedule_id, trigger="manual")
+    except ScheduleNotFound:
+        # The row was deleted between _load_task and the spawner's re-select.
+        # The resource is gone, not the server failing.
+        raise api_error(404, "SCHEDULE_NOT_FOUND", "Scheduled task not found")
+    except ScheduleBusy as exc:
+        # The exception distinguishes "previous run still active" from
+        # "process-wide queue full" — a fixed code would mislabel the
+        # latter on an idle task.
+        raise api_error(
+            409,
+            "SCHEDULE_BUSY",
+            str(exc) or "This task already has a run in progress",
+        )
+    return {"run_id": run_id, "status": "pending"}
+
+
+@router.get("/schedules/{schedule_id}/runs")
+async def list_schedule_runs(
+    schedule_id: str,
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserInfo = Depends(get_current_user),
+):
+    task = await _load_task(db, schedule_id)
+    await authorize_project(str(task.project_id), db, current_user)
+    rows = (
+        await db.execute(
+            select(ScheduledTaskRun)
+            .where(ScheduledTaskRun.schedule_id == schedule_id)
+            .order_by(ScheduledTaskRun.created_at.desc())
+            .limit(max(1, min(limit, _MAX_RUNS)))
+        )
+    ).scalars().all()
+    return [_run_dict(r) for r in rows]

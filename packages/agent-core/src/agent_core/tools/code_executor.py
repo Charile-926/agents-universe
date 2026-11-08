@@ -1,0 +1,755 @@
+"""Code executor tool - sandboxed Python/Bash subprocess with 30s timeout.
+
+Python code runs under a file-access audit-hook guard (agent_core.sandbox_guard)
+that restricts reads/writes to the project directory.  Bash code is validated
+line-by-line against the same path rules as the shell tool.  The working
+directory and scratch files live inside the project (.tmp/work/) so the guard
+covers them; no TEMP/TMP/TMPDIR injection.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import shlex
+import shutil
+import sys
+import uuid
+from pathlib import Path
+from typing import Any
+from urllib.parse import unquote
+
+from ..sandbox import (
+    _SAFE_ENV_PATH_VARS,
+    _check_all_substitutions,
+    _check_assignment,
+    _dollar_vars,
+    _find_heredoc_start,
+    _skip_subst_parens,
+    ends_with_continuation,
+    has_unclosed_quote,
+    python_guard_env,
+    spawn_in_new_session,
+    split_logical_lines,
+    terminate_process_tree,
+    validate_command,
+)
+from ._media import _IMAGE_SUFFIXES, media_type_for, media_url, sanitize_suffix
+from .base import Tool, ToolContext
+from .shell import redact_secrets
+
+_log = logging.getLogger(__name__)
+_TIMEOUT = 30
+_PW_TIMEOUT = 120
+_MAX_OUTPUT = 20_000
+
+# Bash control-structure keywords whose lines are skipped during validation.
+_BASH_CONTROL = frozenset({
+    "if", "then", "else", "elif", "fi", "for", "do", "done",
+    "while", "until", "case", "esac", "function", "select", "in",
+    "{", "}", "!",
+})
+_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Bash assignment-prefix keywords: `export C=$(...)`, `local x=...`, etc.
+# perform the same assignment with command substitution as a bare `C=$(...)`,
+# so the validator must strip the prefix before the _ASSIGN_RE match below or
+# `export C=$(echo /etc/passwd)` skips the taint branch and `cat $C` expands
+# to an unvalidated absolute path. Optional single-letter flags are consumed
+# (`declare -p`, `readonly -a`).
+_ASSIGN_PREFIX_RE = re.compile(r"^(?:export|local|declare|typeset|readonly)(?:\s+-[A-Za-z]+)*\s+")
+# Scheme prefix of a proxy URL. The userinfo is peeled off with this instead of
+# urlparse because a scheme-less "user:pass@host:port" parses as scheme="user"
+# and the credential would be missed entirely.
+_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+
+
+def _proxy_credential_variants(proxy_url: str) -> dict[str, str]:
+    """Substrings of a credentialed proxy URL that must never reach output.
+
+    Ordered widest-first so the whole URL is replaced before its parts. A
+    username without a password is not treated as a secret: masking every
+    occurrence of a short name would garble unrelated output.
+    """
+    if not proxy_url or "@" not in proxy_url:
+        return {}
+    userinfo = _SCHEME_RE.sub("", proxy_url.rpartition("@")[0], count=1)
+    _, sep, password = userinfo.partition(":")
+    if not sep or not password:
+        return {}
+    variants = {
+        "PROXY_URL": proxy_url,
+        "PROXY_CREDENTIALS": userinfo,
+        "PROXY_PASSWORD": password,
+    }
+    # Percent-encoded spellings reach error messages verbatim, and their
+    # decoded form leaks the credential the encoding was hiding.
+    decoded_userinfo = unquote(userinfo)
+    if decoded_userinfo != userinfo:
+        variants["PROXY_CREDENTIALS_DECODED"] = decoded_userinfo
+    decoded_password = unquote(password)
+    if decoded_password != password:
+        variants["PROXY_PASSWORD_DECODED"] = decoded_password
+    return variants
+
+
+def redact_proxy_credentials(text: str, proxy_url: str) -> str:
+    """Scrub a credentialed proxy URL out of tool-visible text.
+
+    Sandboxed code that prints its own environment — or a requests/httpx error
+    echoing the proxy it could not reach — would otherwise hand the credential
+    to the model and to the server log. Applied after decode and before
+    truncation; exact substring replacement, like shell.redact_secrets.
+    """
+    return redact_secrets(text, _proxy_credential_variants(proxy_url))
+
+
+def _live_payloads(text: str, *, quotes_literal: bool) -> list[str]:
+    r"""Substitution payloads bash will execute inside *text*.
+
+    ``quotes_literal=False`` is heredoc-body context: quotes are plain
+    characters there, so `$(...)` inside them still executes.``quotes_literal=True`` is shell-parsed context (a payload's own
+    content): single-quoted regions never execute and are skipped, while
+    double quotes do execute. Recursion into each payload matters because
+    an outer shlex pass keeps backslash escapes inside quotes —
+    `"$(c\url x)"` would otherwise hide `curl` from a single-level scan.
+    """
+    payloads: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if quotes_literal and c == "'":
+            end = text.find("'", i + 1)
+            if end == -1:
+                break  # unterminated — bash syntax error, nothing executes
+            i = end + 1
+            continue
+        if c == "`":
+            end = text.find("`", i + 1)
+            if end == -1:
+                break  # unterminated — _validate_substitutions fails closed first
+            payload = text[i + 1 : end]
+            payloads.append(payload)
+            payloads.extend(_live_payloads(payload, quotes_literal=True))
+            i = end + 1
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "(":
+            close = _skip_subst_parens(text, i + 2)
+            if close is None:
+                break  # unclosed — refused by _validate_substitutions
+            payload = text[i + 2 : close]
+            payloads.append(payload)
+            payloads.extend(_live_payloads(payload, quotes_literal=True))
+            i = close + 1
+            continue
+        i += 1
+    return payloads
+
+
+class CodeExecutorTool(Tool):
+    name = "code_executor"
+    prompt_hint = (
+        "For computation or data processing that needs real code. File access confined "
+        "to the project workspace; network follows the SANDBOX_NETWORK policy "
+        "(default: allowed), 30s timeout. Use language=python-playwright for browser "
+        "automation (Playwright Python): subprocess + network allowed so the agent can "
+        "drive a real browser - downloads, screen recording, screenshots, etc."
+    )
+    description = (
+        "Execute Python, Python-Playwright, or Bash code in a sandboxed subprocess. "
+        "Python/Bash: 30s timeout. Network follows the SANDBOX_NETWORK policy "
+        "(default: allowed; 'localhost' or 'none' restrict it). "
+        "python-playwright: 120s timeout, subprocess + network allowed for browser "
+        "automation via the Playwright Python library. "
+        "Python code runs under a file-access guard that restricts reads/writes to "
+        "the project directory; cross-project access via ../ or absolute paths is blocked. "
+        "The working directory is the project root, available as the PROJECT_DIR env var. "
+        "Files written to the OUTPUT_DIR env var are delivered to the user "
+        "(images appear in chat, other files as downloadable attachments) — "
+        "write anything the user should receive there "
+        "(e.g., $OUTPUT_DIR/output_0.png, $OUTPUT_DIR/report.csv). "
+        "Outbound HTTP(S) follows the platform proxy — the sandbox environment "
+        "carries the resolved URL as HTTPS_PROXY; a browser launched with Playwright "
+        "must be given it explicitly as proxy=os.environ['HTTPS_PROXY'] because "
+        "Playwright ignores proxy env vars. "
+        "Bash mode is for in-project data processing; use the shell tool for external commands."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string", "description": "Code to execute"},
+            "language": {
+                "type": "string",
+                "enum": ["python", "bash", "python-playwright"],
+                "default": "python",
+            },
+        },
+        "required": ["code"],
+    }
+
+    # ctypes is on the text blocklist (not the runtime import blocklist —
+    # pandas imports it internally); user code naming it explicitly is
+    # rejected, while library imports keep working.
+    _BLOCKED_IMPORTS = re.compile(
+        r"\b(subprocess|os\.system|os\.popen|os\.execv|os\.execl|os\.fork|pty|ctypes|_ctypes|pexpect|fabric|invoke)\b"
+    )
+    # Playwright mode allows subprocess (browser launch) but still blocks
+    # direct os.system/fork/pty/ctypes etc. The audit hook blocks the
+    # runtime calls regardless; this regex is the text-level first gate.
+    _BLOCKED_IMPORTS_PW = re.compile(
+        r"\b(os\.system|os\.popen|os\.execv|os\.execl|os\.fork|pty|ctypes|_ctypes|pexpect|fabric|invoke)\b"
+    )
+    _BLOCKED_BASH = re.compile(
+        # interpreters bypass the python-only audit hook (perl -e runs
+        # arbitrary code) and git reaches the network via GIT_SSH_COMMAND /
+        # credential helpers / proxies — this regex also gates scripts.py.
+        # Database clients (mysql/psql/redis-cli/mongosh/...) reach the
+        # compose-internal databases that hold session/secret data; bash mode
+        # has no socket audit hook, so they are blocked here like curl/wget.
+        r"\b(curl|wget|npx|npm|node|tsx|python3?|ssh|scp|rsync|nc|ncat|telnet|ftp|"
+        r"mysql|mariadb|psql|redis-cli|redis-server|mongosh|mongo|"
+        r"clickhouse-client|tsql|"
+        # shell/meta-programming words run arbitrary code as a prelude to
+        # reading host files — `eval "$(echo cat /etc/hostname)"`,
+        # `echo 'cat /etc/passwd' > x.sh; . x.sh`, `bash x.sh` all bypass the
+        # token checks while executing the payload for real. trap/alias/shopt
+        # are shell BUILTINS with the same power (trap 'cat /etc/passwd'
+        # EXIT runs at script end; alias + shopt -s expand_aliases runs
+        # aliased commands in non-interactive bash); xargs/dd smuggle the
+        # command/path construction into data tokens (`echo /etc/passwd |
+        # xargs cat`, `dd if=/etc/passwd`) the token checks never see.
+        r"bash|sh|zsh|dash|ksh|fish|ash|eval|source|exec|command|builtin|env|"
+        r"perl|ruby|php|git|socat|openssl|unset|trap|alias|shopt|xargs|dd)\b|"
+        # ANSI-C quoting ($'\x2fetc\x2fpasswd') hides '/' and '..' inside a
+        # token shlex never unescapes — bash decodes it into an absolute
+        # path at runtime, past every check.
+        r"\$\'|"
+        # dot command (`. script.sh`) is not a \b word — match it at start /
+        # after a separator only, so `./tool.sh` keeps working.
+        r"(?:^|[\s;|&])\.(?=\s|$)"
+    )
+
+    @classmethod
+    def _payload_blocked_word(cls, text: str, *, quotes_literal: bool) -> str | None:
+        r"""Blocked word inside a live substitution payload of *text*, else None.
+
+        The line-level shlex keeps backslash escapes inside quotes, so
+        `"$(c\url x)"` hides `curl` from a whole-line search even though the
+        substitution executes it — walking the payloads separately sees the
+        unquoted inner text. Raises ValueError when a payload cannot be
+        tokenized (fail closed).
+        """
+        for payload in _live_payloads(text, quotes_literal=quotes_literal):
+            lexer = shlex.shlex(payload, posix=True)
+            lexer.whitespace_split = True
+            unescaped = " ".join(list(lexer))
+            match = cls._BLOCKED_BASH.search(unescaped)
+            if match:
+                return match.group(0)
+        return None
+
+    @classmethod
+    def _find_blocked_bash(cls, code: str) -> str | None:
+        r"""The blocked word a bash script contains, else None.
+
+        Scan PER LOGICAL LINE and skip heredoc bodies: whole-code shlex
+        raised on an apostrophe in a heredoc body and the raw-text
+        fallback then missed a backslash-obfuscated command on a later
+        line (`c\url http://...`), which bash unescapes back to `curl`
+        and executes for real. Body lines are stdin data — their live
+        substitution payloads are checked by _validate_bash instead,
+        which knows whether the delimiter was quoted. Raises ValueError
+        when a line cannot be tokenized (fail closed). Shared with the
+        script runner.
+        """
+        for logical, is_heredoc_body in split_logical_lines(code):
+            if is_heredoc_body:
+                continue
+            lexer = shlex.shlex(logical, posix=True)
+            lexer.whitespace_split = True
+            unescaped = " ".join(list(lexer))
+            match = cls._BLOCKED_BASH.search(unescaped)
+            if match:
+                return match.group(0)
+            match = cls._payload_blocked_word(logical, quotes_literal=True)
+            if match:
+                return match
+        return None
+
+    async def execute(self, params: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+        code = params["code"]
+        language = params.get("language", "python")
+
+        # The JSON-schema enum is advisory — a hand-built tool call can pass
+        # anything. Every guard below is keyed on the exact string, so an
+        # unknown value ("sh", "shell", "Bash") skipped them all and fell
+        # through to the bash branch: arbitrary shell with no blocklist, no
+        # path validation. Reject unknown values instead.
+        if language not in ("python", "python-playwright", "bash"):
+            return {"error": f"Unsupported language {language!r}. Use python, python-playwright or bash."}
+
+        if language == "python" and self._BLOCKED_IMPORTS.search(code):
+            return {"error": "Code uses a blocked module (subprocess, os.system, etc.). Use the shell tool for commands."}
+        if language == "python-playwright" and self._BLOCKED_IMPORTS_PW.search(code):
+            return {"error": "Code uses a blocked module (os.system, pty, ctypes, etc.). Use the shell tool for commands."}
+        if language == "bash":
+            # ANSI-C quoting ($'\x2fetc\x2fpasswd') hides '/' and '..'
+            # inside a token that bash decodes at runtime — the shlex
+            # unescape below strips the quotes so the $'-pattern never
+            # matches, and the token checks see only decoded content. Check
+            # the RAW code; a literal `$'` text in a data echo is a rare
+            # false positive, fail-closed.
+            if "$'" in code:
+                return {"error": "Bash code_executor is for data processing only. ANSI-C quoting ($'...') is not allowed."}
+            # \b-word 正则跑在原始代码上可被反斜杠混淆绕过（`c\url ...` 中
+            # "curl" 不是连续子串，但 bash 执行时反斜杠转义还原出真正的
+            # `curl`）。先按 shlex 还原转义再匹配，堵住该旁路。
+            # A line that cannot be tokenized is refused (see
+            # _find_blocked_bash for the per-line / heredoc-body rationale).
+            try:
+                blocked = self._find_blocked_bash(code)
+            except ValueError:
+                return {"error": "Bash code could not be parsed safely; refusing to run."}
+            if blocked:
+                return {"error": "Bash code_executor is for data processing only. Use the shell tool for external commands."}
+
+        project_cwd = Path(context.project_fs_path)
+
+        # Validate bash code for path escapes before spawning.  Command
+        # substitution is allowed here (unlike the shell tool) because it is
+        # common in data-processing snippets and _BLOCKED_BASH already strips
+        # the external commands that could abuse it.
+        if language == "bash":
+            reason = self._validate_bash(code, project_cwd)
+            if reason:
+                return {"error": reason}
+
+        # Scratch directory inside the project (.tmp/work/) so the Python
+        # file-access guard covers script files and image outputs.  Cleaned up
+        # in finally.  No TEMP/TMP/TMPDIR injection - the user explicitly
+        # requested the temp dir stay inside the project.
+        work_dir = project_cwd / ".tmp" / "work" / f"code-{uuid.uuid4().hex[:8]}"
+        try:
+            work_dir.mkdir(parents=True, exist_ok=True)
+            output_dir = work_dir / "output"
+            output_dir.mkdir(exist_ok=True)
+
+            if language in ("python", "python-playwright"):
+                code_file = work_dir / "script.py"
+                # newline="" out on Windows: text-mode write_text would
+                # translate \n to \r\n, and a bash script read back on Linux
+                # (or in Git Bash/WSL) chokes on the trailing \r in command
+                # names and file paths.
+                code_file.write_text(code, encoding="utf-8", newline="\n")
+                cmd = [sys.executable, str(code_file)]
+            else:  # bash — the only remaining value after the guard above
+                # Bash runs from a script FILE (not `bash -s` via stdin) so the
+                # script's own stdin stays free: a bare `cat`/`read` gets EOF
+                # instead of swallowing the remaining script lines.  The path
+                # is relative to the cwd (project root) so it works identically
+                # in Linux bash, Git Bash, and WSL — no drive-letter mapping.
+                code_file = work_dir / "script.sh"
+                code_file.write_text(code, encoding="utf-8", newline="\n")
+                cmd = ["bash", code_file.relative_to(project_cwd).as_posix()]
+
+            # safe_env() strips SECRET_KEY, DB connection strings, etc.
+            # python_guard_env arms the sitecustomize audit hook in the child
+            # (strict=True denies subprocess.Popen calls, matching the
+            # _BLOCKED_PYTHON regex above as a second layer; subprocess import
+            # stays allowed so matplotlib/pandas keep working).
+            extra: dict[str, str] = {
+                "OUTPUT_DIR": str(output_dir),
+                "PROJECT_DIR": str(project_cwd),
+            }
+            # Network policy follows the SANDBOX_NETWORK config (see
+            # .env.example): unset/empty -> allow all network (Playwright
+            # downloads, screen recording, ...); localhost -> loopback only;
+            # none -> all sockets blocked. Only a restricting mode needs to
+            # be passed down; "all" is the sitecustomize default.
+            network_mode = (context.cfg("SANDBOX_NETWORK") or "").strip().lower()
+            if language == "python":
+                extra["HOME"] = str(work_dir)
+                extra.update(python_guard_env(project_cwd, strict=True))
+                if network_mode in ("localhost", "none"):
+                    extra["_AGENT_NETWORK_MODE"] = network_mode
+            elif language == "python-playwright":
+                # Keep the real HOME so Playwright finds browser binaries
+                # (PLAYWRIGHT_BROWSERS_PATH is inherited from the Docker ENV).
+                # Non-strict: allow subprocess.Popen for browser launching.
+                # Network follows SANDBOX_NETWORK (default: allow all).
+                extra.update(python_guard_env(project_cwd, strict=False))
+                if network_mode in ("localhost", "none"):
+                    extra["_AGENT_NETWORK_MODE"] = network_mode
+            else:  # bash
+                # Inheriting the real HOME hands the sandbox the host's dotfiles
+                # (.aws/.azure/.ssh), and bash's $HOME is on the
+                # project-internal path whitelist (_SAFE_ENV_PATH_VARS) — that
+                # whitelist is only sound when HOME actually points inside the
+                # project. Point it at the scratch dir, like python does.
+                extra["HOME"] = str(work_dir)
+
+            # Proxy env comes after safe_env() because a merge can only set
+            # values, never delete the empty HTTPS_PROXY placeholder or evict a
+            # conflicting inherited spelling. Every network mode gets the same
+            # proxy as the browser tool — SANDBOX_NETWORK decides which sockets
+            # the guard allows, not which proxy the process is configured with.
+            # A Chromium the code launches itself does NOT read these vars
+            # (Playwright only honors an explicit launch(proxy=...) kwarg), but
+            # requests/httpx/urllib and child processes do.
+            proxy_url = context.proxy_url()
+            env = context.proxy_env(context.safe_env(extra=extra))
+
+            # Bound before the await: a cancellation delivered while
+            # create_subprocess_exec is still awaiting would otherwise hit the
+            # except handlers with `proc` unbound, replacing the
+            # CancelledError with an UnboundLocalError (the run then could not
+            # be cancelled cleanly).
+            proc: asyncio.subprocess.Process | None = None
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    # DEVNULL stdin: scripts reading stdin get a clean EOF,
+                    # matching "run a script file" semantics.
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(project_cwd),
+                    env=env,
+                    # Own session on POSIX so a forked/backgrounded
+                    # grandchild dies with the tree on timeout/abort.
+                    **spawn_in_new_session(),
+                )
+                timeout = _PW_TIMEOUT if language == "python-playwright" else _TIMEOUT
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                if proc is not None:
+                    terminate_process_tree(proc)
+                    await proc.wait()
+                _log.warning("code_executor timed out after %ds (language=%s)", timeout, language)
+                return {"error": f"Execution timed out after {timeout}s", "exit_code": -1}
+            except asyncio.CancelledError:
+                # Task cancelled: kill the child before its finally-rmtree of
+                # work_dir (a live child would hold the script file open).
+                if proc is not None:
+                    terminate_process_tree(proc)
+                    await proc.wait()
+                raise
+            except OSError as exc:
+                _log.warning("code_executor failed to start subprocess: %s", exc)
+                return {"error": f"Failed to start code execution: {exc}"}
+
+            # Redact before truncation so a proxy credential straddling the
+            # _MAX_OUTPUT boundary is fully masked; the log line below reads
+            # the same scrubbed text.
+            stdout_text = redact_proxy_credentials(
+                stdout.decode(errors="replace"), proxy_url)[:_MAX_OUTPUT]
+            stderr_text = redact_proxy_credentials(
+                stderr.decode(errors="replace"), proxy_url)[:_MAX_OUTPUT]
+            if proc.returncode != 0:
+                _log.warning("code_executor failed (exit=%d, language=%s)\nstderr: %s",
+                             proc.returncode, language, stderr_text[:500])
+
+            # Collect outputs from the isolated output directory: PNGs surface
+            # as images, everything else as downloadable attachments. Names
+            # are server-generated (the media whitelist rejects spaces and
+            # unicode — the sandboxed code can write any filename), the
+            # original name rides in the record's `name` field.
+            images: list[dict[str, str]] = []
+            files: list[dict[str, Any]] = []
+            media_path = Path(context.conversation_media_dir)
+            media_path.mkdir(parents=True, exist_ok=True)
+            for out_file in sorted(output_dir.iterdir()):
+                if not out_file.is_file():
+                    continue
+                suffix = sanitize_suffix(out_file.name)
+                dest = media_path / f"code_{uuid.uuid4().hex[:8]}{suffix}"
+                try:
+                    shutil.move(str(out_file), str(dest))
+                except OSError:
+                    continue
+                rel = media_url(context, dest.name)
+                if suffix in _IMAGE_SUFFIXES:
+                    images.append({"id": dest.stem, "url": rel, "alt": f"Code output: {out_file.name}", "path": str(dest)})
+                else:
+                    files.append({
+                        "id": dest.stem,
+                        "url": rel,
+                        "name": out_file.name[:255],
+                        "media_type": media_type_for(out_file.name),
+                        "size": dest.stat().st_size,
+                    })
+
+            result: dict[str, Any] = {
+                "stdout": stdout_text,
+                "stderr": stderr_text,
+                "exit_code": proc.returncode,
+            }
+            if images:
+                result["images"] = images
+            if files:
+                result["files"] = files
+            return result
+        except OSError as exc:
+            return {"error": f"Failed to create scratch directory inside the project: {exc}"}
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # Bash validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_bash(code: str, project_root: Path) -> str | None:
+        """Best-effort line-by-line path-escape check for bash scripts.
+
+        Skips comments, control-structure keywords, variable assignments, and
+        heredoc bodies.  Physical lines whose quotes don't close are joined
+        with the following lines first — a quoted string may legitimately
+        span multiple lines.  Command substitution is allowed (the
+        _BLOCKED_BASH regex already strips external commands that could abuse
+        it); the remaining path tokens are checked by validate_command.
+        """
+        in_heredoc = False
+        heredoc_delim: str | None = None
+        heredoc_quoted = False
+        buffer = ""
+        buffer_start = 0
+        # Variable names whose values were captured from command substitution
+        # (`x=$(echo /etc/passwd)`). Later path positions using them expand to
+        # anything at runtime — validate_command rejects those references.
+        tainted: set[str] = set()
+        # Variable names assigned on earlier lines of this script. Seeded into
+        # each per-line validate_command so `d=data` on line 1 still satisfies
+        # the assigned-path-prefix rule on line 3 (`cat $d/x`); every value was
+        # validated when its assignment line passed (_check_simple rejects
+        # `..` and absolute paths), so carrying the name forward is safe.
+        assigned: set[str] = set()
+        lines = code.splitlines()
+        idx = 0
+        while idx < len(lines):
+            line = lines[idx]
+            line_num = idx + 1
+            idx += 1
+            if in_heredoc:
+                if line.strip() == heredoc_delim:
+                    in_heredoc = False
+                    heredoc_delim = None
+                    heredoc_quoted = False
+                    continue
+                # an UNQUOTED heredoc body runs command substitution
+                # when bash executes it — `cat <<EOF` + `$(cat /app/.env)` in
+                # the body previously sailed through because body lines were
+                # skipped wholesale. Quoted delimiters (<<'EOF') are literal
+                # and safe to skip.
+                if not heredoc_quoted:
+                    # Single quotes are plain characters in a heredoc body —
+                    # $(...) inside them still executes, so scan them. bash
+                    # joins backslash-newline in an unquoted body too (and a
+                    # continuation target is not delimiter-checked), so merge
+                    # continuation lines before the scan: `$(cat \` + the
+                    # `/etc/passwd)` line must be checked as one substitution.
+                    body = line
+                    while ends_with_continuation(body) and idx < len(lines):
+                        body = body[:-1] + lines[idx]
+                        idx += 1
+                    reason = CodeExecutorTool._validate_substitutions(
+                        body, buffer_start, project_root, single_quotes_literal=False
+                    )
+                    if reason:
+                        return reason
+                    # Body lines are skipped by _find_blocked_bash (they are
+                    # stdin data), but an unquoted body's $(...) / backticks
+                    # execute for real — and bash mode has no socket audit
+                    # hook, so `$(curl ...)` or `$(python ...)` planted here
+                    # would reach the network / an unguarded interpreter past
+                    # the blocklist. Scan the payloads only: the surrounding
+                    # data words are still not commands.
+                    reason = CodeExecutorTool._blocked_substitutions(body)
+                    if reason:
+                        return reason
+                continue
+            candidate = f"{buffer}\n{line}" if buffer else line
+            if not buffer:
+                buffer_start = line_num
+            stripped = candidate.strip()
+            if not stripped or stripped.startswith("#"):
+                buffer = ""
+                continue
+            if has_unclosed_quote(candidate):
+                # Multi-line quoted string — accumulate and retry with the
+                # next physical line before validating.
+                buffer = candidate
+                continue
+            buffer = ""
+            # Detect heredoc start to skip body lines on subsequent iterations.
+            # A line-wide regex search matched "<<EOF" INSIDE quotes
+            # (`echo "x <<EOF"`) and put the following lines in heredoc-skip
+            # mode while bash ran them for real — arbitrary commands escaped
+            # validation. _find_heredoc_start scans the raw line with quote
+            # tracking, and also captures the delimiter's quoted flag: a
+            # quoted delimiter (<<'EOF') makes the body literal, so its
+            # $(...) must not be treated as executable.
+            heredoc = _find_heredoc_start(stripped)
+            if heredoc is not None:
+                heredoc_delim, heredoc_quoted = heredoc
+                in_heredoc = True
+            first_word = stripped.split()[0].rstrip(";")
+            if first_word in _BASH_CONTROL:
+                # Control-structure lines used to skip validation wholesale —
+                # but their bodies execute for real: `for i in $(cat
+                # ../sibling/.env)` and `do cat ../x; done` both bypassed the
+                # path checks (the control keywords themselves validate as
+                # plain in-project tokens, so the full-line check is safe).
+                reason = validate_command(
+                    stripped,
+                    cwd=project_root,
+                    project_root=project_root,
+                    allow_substitution=True,
+                    tainted_vars=frozenset(tainted),
+                    pre_assigned_vars=assigned,
+                )
+                if reason:
+                    return f"Line {buffer_start}: {reason}\n  -> {stripped}"
+                continue
+            # `export C=$(...)` / `local x=...` are assignments too — strip the
+            # prefix so `export C=$(echo /etc/passwd)` cannot skip the taint
+            # branch (its `$C` would then expand past validation).
+            assign_body = _ASSIGN_PREFIX_RE.sub("", stripped) if _ASSIGN_PREFIX_RE.match(stripped) else stripped
+            if _ASSIGN_RE.match(assign_body):
+                # assignment lines are skipped wholesale, but
+                # `X=$(cat /app/.env)` performs command substitution — the
+                # payload must be validated like any other command. The rest
+                # of the line still runs (`x=$(echo /etc/passwd); cat $x`
+                # puts the captured value into a path argument), so the whole
+                # line goes through validate_command with substitution-captured
+                # names tracked as tainted.
+                reason = CodeExecutorTool._validate_substitutions(stripped, buffer_start, project_root)
+                if reason:
+                    return reason
+                try:
+                    # Quote-aware tokens: `a="x y" b=$t` must yield two
+                    # assignments — plain whitespace split would cut at the
+                    # space inside the quotes, drop out of the loop at `y"`,
+                    # and leave `b` untracked for `cat $b` to slip through.
+                    assign_tokens = shlex.split(stripped)
+                except ValueError:
+                    # Unclosed quote — the line is a bash syntax error and
+                    # validate_command rejects it below; nothing to taint.
+                    assign_tokens = []
+                for tok in assign_tokens:
+                    if not _ASSIGN_RE.match(tok):
+                        # Not an assignment — a payload word (`hi)` glued by
+                        # shlex to `x=$(echo hi)`) or a command token; keep
+                        # scanning so a later assignment on the same line is
+                        # still tracked (`x=$(echo hi) C=$(echo /etc/passwd)`
+                        # must taint C).
+                        continue
+                    # `export x=/etc/passwd` — the NAME= prefix dissolves the
+                    # absolute-path scan when the token validates as a plain
+                    # positional (the prefix is the whole token's leading
+                    # segment). The VALUE must pass assignment validation:
+                    # absolute/tilde/`..` paths and untracked variable
+                    # references are rejected, and the name only gets
+                    # "assigned" status on a clean value.
+                    reason = _check_assignment(tok, allow_dollar=True,
+                                               assigned_vars=assigned)
+                    if reason:
+                        return f"Line {buffer_start}: {reason}\n  -> {stripped}"
+                    name, _, value = tok.partition("=")
+                    # shlex (no punctuation_chars) glues a command separator
+                    # onto the token (`x=;`, `x=a&&b`) — bash parses it as a
+                    # boundary, so `x=;` IS an empty assignment and must not
+                    # grant "assigned" status.
+                    value = value.rstrip(";&|()")
+                    refs = set(_dollar_vars(value))
+                    # A variable that expands a tainted variable (`y=$x`) is
+                    # tainted itself — `y=$x; cat $y` smuggles the captured
+                    # path through a relay the same way `x=$(echo /etc/passwd);
+                    # cat $x` does. A reference to an UNTRACKED name is
+                    # tainted too: host env vars ($SHELL) expand to host
+                    # paths, and an unset var expands to EMPTY, collapsing
+                    # `$x/etc/hostname` into an absolute path. Only names
+                    # assigned earlier on this line/screen and the
+                    # server-injected project-internal vars are predictable.
+                    untracked = refs - assigned - _SAFE_ENV_PATH_VARS
+                    if "$(" in value or "`" in value or (refs & tainted) or untracked:
+                        tainted.add(name)
+                    # Only non-empty values qualify as "assigned" — `x=`
+                    # expands to nothing, so `cat $x/etc/hostname` collapses
+                    # to an absolute path past the checks. (validate_command
+                    # independently rejects ${x:-...} expansions in values.)
+                    if value:
+                        assigned.add(name)
+                reason = validate_command(
+                    stripped,
+                    cwd=project_root,
+                    project_root=project_root,
+                    allow_substitution=True,
+                    tainted_vars=frozenset(tainted),
+                    pre_assigned_vars=assigned,
+                )
+                if reason:
+                    return f"Line {buffer_start}: {reason}\n  -> {stripped}"
+                continue
+            reason = validate_command(
+                stripped,
+                cwd=project_root,
+                project_root=project_root,
+                allow_substitution=True,
+                tainted_vars=frozenset(tainted),
+                pre_assigned_vars=assigned,
+            )
+            if reason:
+                return f"Line {buffer_start}: {reason}\n  -> {stripped}"
+        if buffer:
+            return f"Line {buffer_start}: command could not be parsed safely (unclosed quotation)\n  -> {buffer.strip()}"
+        return None
+
+    @staticmethod
+    def _validate_substitutions(
+        line: str, line_num: int, project_root: Path, *, single_quotes_literal: bool = True
+    ) -> str | None:
+        """Validate command-substitution payloads in lines that are otherwise
+        skipped by _validate_bash (unquoted heredoc bodies, assignment values).
+
+        `X=$(cat /app/.env)` and heredoc bodies with `$(...)` execute payloads
+        when bash runs the line; the payload must pass the same path-scoped
+        validation as any other command. `$(< file)` (pure file read) is
+        rejected outright. _check_all_substitutions walks every nesting level —
+        `$(cat $(echo /etc/passwd))` only gets caught when the OUTER layer is
+        validated (the inner one is a harmless data command). In an unquoted
+        heredoc body quotes are plain characters to bash (substitution still
+        runs), so single_quotes_literal=False.
+        """
+        reason = _check_all_substitutions(
+            line,
+            cwd=project_root,
+            root=project_root,
+            single_quotes_literal=single_quotes_literal,
+        )
+        if reason:
+            return f"Line {line_num}: command substitution blocked: {reason}"
+        return None
+
+    @staticmethod
+    def _blocked_substitutions(text: str) -> str | None:
+        """Refuse blocked commands inside live substitution payloads.
+
+        Complements _find_blocked_bash, which skips heredoc bodies: only an
+        unquoted body's payloads execute (quoted bodies are literal and
+        never reach here), so only they need the command-word check. Body
+        context keeps quotes literal — `$(...)` inside a plain `'` in an
+        unquoted body still runs.
+        """
+        try:
+            match = CodeExecutorTool._payload_blocked_word(text, quotes_literal=False)
+        except ValueError:
+            return "Bash code could not be parsed safely; refusing to run."
+        if match:
+            return (
+                "Bash code_executor is for data processing only. "
+                "Use the shell tool for external commands."
+            )
+        return None

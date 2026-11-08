@@ -1,0 +1,447 @@
+"""Abstract Tool interface."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import shutil
+from abc import ABC, abstractmethod
+from typing import Any, Callable
+
+_log = logging.getLogger("agent_core.tools")
+
+# Every spelling that can route HTTP(S) traffic through a proxy. The four
+# HTTP(S) ones always carry the resolved URL; the ALL_PROXY spellings are
+# dropped because nothing in this codebase resolves them — a value that
+# only the host environment knows would route code_executor somewhere the
+# browser tool never goes.
+_PROXY_ENV_KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy")
+_PROXY_ENV_STALE_KEYS = ("ALL_PROXY", "all_proxy")
+
+
+def resolve_proxy_url(injected: dict[str, str] | None = None) -> str:
+    """Resolved outbound proxy — one precedence for every networked channel.
+
+    The injected per-turn settings win over the process environment, HTTPS
+    before HTTP (uppercase env rides the same rungs, lowercase is the last
+    resort). NO_PROXY is deliberately not resolved here — subprocesses
+    inherit it untouched so main.py's bypass list (localhost + the LLM
+    hosts) keeps working. Empty means "no proxy".
+    """
+    import os
+    injected = injected or {}
+    return (
+        (injected.get("HTTPS_PROXY") or os.environ.get("HTTPS_PROXY"))
+        or (injected.get("HTTP_PROXY") or os.environ.get("HTTP_PROXY"))
+        or os.environ.get("https_proxy")
+        or os.environ.get("http_proxy")
+        or ""
+    )
+
+
+def apply_proxy_env(env: dict[str, str], url: str | None = None) -> dict[str, str]:
+    """Normalize proxy variables in a subprocess environment, in place.
+
+    With ``url`` omitted the proxy is resolved from the process environment
+    alone (for context-less callers such as script runs). Replaces whatever
+    the child would have inherited with the resolved proxy so sandboxed code
+    (and any Playwright it launches by env-reading libraries) reaches the
+    network exactly like the browser tool does. With no resolved proxy every
+    spelling is removed — that doubles as the empty-.env-placeholder scrub
+    (an empty proxy value breaks URI parsers in native tooling). NO_PROXY
+    survives untouched.
+    """
+    if url is None:
+        url = resolve_proxy_url()
+    for key in _PROXY_ENV_KEYS:
+        if url:
+            env[key] = url
+        else:
+            env.pop(key, None)
+    for key in _PROXY_ENV_STALE_KEYS:
+        env.pop(key, None)
+    return env
+
+
+class Tool(ABC):
+    """Abstract base for all agent tools."""
+
+    # Behavior-oriented usage hint injected into the system prompt (1-2 lines).
+    # Focuses on when to prefer/avoid the tool, not on its parameter schema.
+    prompt_hint: str = ""
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Tool name as used in LLM tool calls."""
+        ...
+
+    @property
+    @abstractmethod
+    def description(self) -> str:
+        """Human-readable description for the LLM."""
+        ...
+
+    @property
+    @abstractmethod
+    def parameters(self) -> dict:
+        """JSON Schema for the tool's input parameters."""
+        ...
+
+    @abstractmethod
+    async def execute(self, params: dict[str, Any], context: "ToolContext") -> dict[str, Any]:
+        """Execute the tool and return a result dict."""
+        ...
+
+    def to_definition(self):
+        """Convert to ToolDefinition for LLM providers."""
+        from agent_core.providers.base import ToolDefinition
+        return ToolDefinition(
+            name=self.name,
+            description=self.description,
+            parameters=self.parameters,
+        )
+
+
+class ToolContext:
+    """Runtime context passed to tools during execution."""
+
+    def __init__(
+        self,
+        project_id: str,
+        project_fs_path: str,
+        conversation_id: str,
+        user_id: str,
+        db_session=None,
+        http_client=None,
+        browser=None,
+        project_context=None,
+        current_turn: int = 0,
+        current_task_id: str | None = None,
+        knowledge_cache=None,
+        session=None,
+        framework_root: str | None = None,
+        secret_key: str = "",
+        session_memories: list | None = None,
+        upload_file_lookup: Callable[[str], bytes | None] | None = None,
+        upload_file_names: Callable[[], list[str]] | None = None,
+        db_session_factory: Callable[[], Any] | None = None,
+        app_base_url: str = "",
+        app_root_path: str = "",
+        app: Any = None,
+    ) -> None:
+        self.project_id = project_id
+        self.project_fs_path = project_fs_path
+        self.conversation_id = conversation_id
+        self.user_id = user_id
+        self.db_session = db_session
+        self.db_session_factory = db_session_factory
+        self.http_client = http_client
+        self.browser = browser
+        self.project_context = project_context
+        self.current_turn = current_turn
+        self.current_task_id = current_task_id
+        self.knowledge_cache = knowledge_cache
+        self.session = session
+        self.framework_root = framework_root
+        self.secret_key = secret_key
+        self.session_memories: list[dict] = session_memories if session_memories is not None else []
+        # Public app base URL (e.g. https://agent.agents-universe.com). Injected
+        # by the API layer from APP_BASE_URL so tools can emit fully-qualified
+        # media URLs the LLM can quote as working download addresses. Empty in
+        # local/dev/tests → tools fall back to relative /api/media paths.
+        self.app_base_url = app_base_url or ""
+        # Deployment sub-path (e.g. /agent) from APP_ROOT_PATH, appended to
+        # app_base_url when the browser must hit https://host/agent/api/....
+        self.app_root_path = app_root_path or ""
+        # The FastAPI app, when the run was started from the web service. Only
+        # needed by tools that launch their own headless agent turn (the
+        # scheduler tool's run_now); None in standalone agent-core use.
+        self.app = app
+        # Whether this run may pause for human interaction. False for headless
+        # runs (published agents) — confirmation prompts must degrade to a
+        # readable error instead of blocking on an answer nobody can give.
+        self.interactive: bool = True
+        self.upload_file_lookup = upload_file_lookup
+        self.upload_file_names = upload_file_names
+        self.ssl_verify: bool = False
+        self.browser_ssl_verify: bool = True
+        self.integration_settings: dict[str, str] = {}
+        self.api_request_no_confirm: bool = False
+        self._tool_registry: dict[str, Tool] = {}
+        self.http_client_no_proxy = None
+        self._browser_lock = asyncio.Lock()
+        # Every page this session opened (its own and each task clone's) so
+        # cleanup() can close them all — see copy_for_task. Contexts are
+        # registered the same way: an explicit BrowserContext owns its pages,
+        # and a recording is only written to disk when its context closes, so
+        # cleanup() must close them before the browser goes away.
+        self._browser_pages: list = []
+        self._browser_contexts: list = []
+        self._browser_context = None
+        # Active recording state (context/page/video/temp dir) while a
+        # record_start is in flight; None when not recording.
+        self._browser_recording: dict | None = None
+        self.mcp_manager = None  # McpConnectionManager, lazily set by attach_mcp_tools
+        # Opaque delegation state for the `delegate_agent` / `list_agents`
+        # tools, built by the API layer (api.services.delegation). None means
+        # this run cannot delegate at all — a headless agent-core run, or a
+        # turn whose app wiring predates the feature. agent-core never
+        # introspects it: it is handed straight back to the API on a call.
+        self.delegation: Any = None
+
+    def copy_for_task(self, task_id: str, turn: int) -> "ToolContext":
+        """Shallow copy for parallel task isolation.
+
+        Shares browser, http_client, db_session, project_context, mcp_manager,
+        _browser_lock, _tool_registry, delegation (all asyncio-safe or
+        read-only — the delegation context is frozen, so parallel plan tasks
+        delegating concurrently cannot corrupt each other's chain).
+        Owns independent current_task_id / current_turn so tools emit events
+        with the correct task ownership during concurrent execution.
+        """
+        import copy
+
+        clone = copy.copy(self)  # shallow - shared refs for all resources
+        # Lazy resource slots (browser, http_client) are shared through the
+        # owner reference: ensure_* writes back to the session's context so
+        # parallel task clones reuse ONE browser/client instead of each
+        # starting their own — a per-clone resource would never be closed
+        # (cleanup() only sees the shared context's slots). The browser PAGE
+        # is the exception: it is mutable navigation state, so each task owns
+        # its own (registered on the owner for cleanup).
+        clone._shared = self
+        clone._browser_page = None
+        clone._browser_context = None
+        clone._browser_recording = None
+        clone.current_task_id = task_id
+        clone.current_turn = turn
+        # Concurrent tasks must not share one SQLAlchemy async session:
+        # interleaved executes on the same session corrupt its state machine.
+        # When a factory is provided, give each task its own session — the
+        # caller (_execute_single_task) closes it when the task loop ends.
+        if self.db_session_factory is not None and self.db_session is not None:
+            try:
+                clone.db_session = self.db_session_factory()
+            except Exception:
+                _log.warning("db_session_factory failed, sharing parent session", exc_info=True)
+        return clone
+
+    async def ensure_browser(self):
+        """Lazily start and return the shared Playwright Chromium browser."""
+        if self.browser is not None:
+            return self.browser
+        async with self._browser_lock:
+            if self.browser is not None:
+                return self.browser
+            # Lazy resources live on the SHARED context (see copy_for_task):
+            # a task clone must reuse the session's browser instead of
+            # launching one Chromium process per task, and cleanup() closes
+            # only the shared context's slots.
+            owner = getattr(self, "_shared", None) or self
+            if owner.browser is not None:
+                self.browser = owner.browser
+                return owner.browser
+            from playwright.async_api import async_playwright
+
+            playwright = await async_playwright().start()
+            try:
+                proxy_url = self.proxy_url()
+                launch_kwargs: dict = {"headless": True}
+                if proxy_url:
+                    launch_kwargs["proxy"] = {"server": proxy_url}
+                browser = await playwright.chromium.launch(**launch_kwargs)
+            except Exception:
+                await playwright.stop()
+                raise
+            owner._playwright = playwright
+            owner.browser = browser
+            self.browser = browser
+            return browser
+
+    _CREDENTIAL_KEYS = frozenset({
+        "TOKEN", "SECRET", "PASSWORD", "COOKIE", "KEY", "CREDENTIAL", "AUTH",
+    })
+
+    def cfg(self, key: str, default: str = "") -> str:
+        """Read a config value — prefers injected settings over os.environ.
+
+        Credential keys are never returned from injected settings; they must be
+        stored in user_tokens and retrieved via get_token(). The settings check
+        matches only the final underscore segment (so ATLASSIAN_AUTH_TYPE is
+        allowed but GIT_TOKEN is not); the os.environ fallback keeps the
+        broader substring blocking for defense-in-depth.
+        """
+        upper = key.upper()
+        if upper.rsplit("_", 1)[-1] in self._CREDENTIAL_KEYS:
+            return default
+        from_settings = self.integration_settings.get(key)
+        if from_settings:
+            return from_settings
+        if any(segment in upper for segment in self._CREDENTIAL_KEYS):
+            return default
+        import os
+        return os.environ.get(key, default)
+
+    def proxy_url(self) -> str:
+        """Resolved outbound proxy — see resolve_proxy_url for the precedence."""
+        return resolve_proxy_url(self.integration_settings)
+
+    # Env-var keys to strip when building subprocess environments for tools
+    # that pass env to LLM-generated code (code_executor, shell).  Matches by
+    # final underscore segment OR known sensitive prefixes.
+    _ENV_DENY_SUFFIXES = _CREDENTIAL_KEYS | {"DRIVER", "URL", "Dsn".upper()}
+    _ENV_DENY_PREFIXES = (
+        "DB_", "DATABASE", "REDIS", "SECRET", "PASSWORD",
+        "TOKEN", "CREDENTIAL", "AUTH", "API_KEY", "PRIVATE",
+        # Cloud credential prefixes — keys like AWS_REGION are harmless but
+        # stripping them wholesale is the conservative default for
+        # LLM-generated code (missing region config just fails, never leaks).
+        "AWS_", "AZURE_", "GOOGLE_", "GCP_", "ALICLOUD_",
+    )
+    # Exact-match keys: PROJECTS_ROOT would reveal sibling-project locations
+    # to LLM-generated code, enabling cross-project path construction. The
+    # credential keys below have suffixes that dodge the suffix/prefix rules
+    # (ID, URI, CREDENTIALS, PWD).
+    _ENV_DENY_EXACT = frozenset({
+        "PROJECTS_ROOT",
+        "AWS_ACCESS_KEY_ID",
+        "SQLALCHEMY_DATABASE_URI",
+        "DATABASE_URL",
+        # Legacy full connection string (documented fallback in .env) — carries
+        # user:password@host. Its suffix STRING matches no deny rule.
+        "MSSQL_CONNECTION_STRING",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "MYSQL_PWD",
+        "PGPASSWORD",
+        # SSH agent socket — owning the path lets code sign with the host
+        # user's keys (e.g. git push via forwarded agent auth), the same
+        # capability class the rest of this list strips.
+        "SSH_AUTH_SOCK",
+    })
+
+    def safe_env(self, *, extra: dict[str, str] | None = None) -> dict[str, str]:
+        """Return os.environ with credential-like keys stripped.
+
+        Used by code_executor and shell so LLM-generated code cannot
+        exfiltrate SECRET_KEY, DB connection strings, etc.
+        """
+        import os
+        env: dict[str, str] = {}
+        for key, value in os.environ.items():
+            upper = key.upper()
+            if upper in self._ENV_DENY_EXACT:
+                continue
+            if upper.rsplit("_", 1)[-1] in self._ENV_DENY_SUFFIXES:
+                continue
+            if any(upper.startswith(p) for p in self._ENV_DENY_PREFIXES):
+                continue
+            env[key] = value
+        if extra:
+            env.update(extra)
+        return env
+
+    # Every spelling that can route HTTP(S) traffic through a proxy (shared
+    # with the module-level helpers above).
+    _PROXY_ENV_KEYS = _PROXY_ENV_KEYS
+    _PROXY_ENV_STALE_KEYS = _PROXY_ENV_STALE_KEYS
+
+    def proxy_env(self, env: dict[str, str]) -> dict[str, str]:
+        """Normalize proxy variables in a subprocess environment, in place.
+
+        Replaces whatever the child would have inherited with the resolved
+        proxy so sandboxed code (and any Playwright it launches by env-reading
+        libraries) reaches the network exactly like the browser tool does.
+        With no resolved proxy every spelling is removed — that doubles as the
+        empty-.env-placeholder scrub (an empty proxy value breaks URI parsers
+        in native tooling; the shell tool does the same for its own children).
+        NO_PROXY survives untouched.
+        """
+        return apply_proxy_env(env, self.proxy_url())
+
+    @property
+    def conversation_media_dir(self) -> str:
+        from pathlib import Path
+        return str(Path(self.project_fs_path) / ".tmp" / "media" / self.conversation_id)
+
+    def register_tool(self, tool: Tool) -> None:
+        self._tool_registry[tool.name] = tool
+
+    def get_tool(self, name: str) -> Tool | None:
+        return self._tool_registry.get(name)
+
+    def knowledge_dir(self) -> str:
+        from pathlib import Path
+        return str(Path(self.project_fs_path) / "knowledge")
+
+    def tests_dir(self) -> str:
+        from pathlib import Path
+        return str(Path(self.project_fs_path) / "tests")
+
+    async def cleanup(self) -> None:
+        """Release resources (browser, HTTP client, playwright, MCP) at end of session."""
+        if self.mcp_manager is not None:
+            try:
+                await self.mcp_manager.close_all()
+            except Exception:
+                _log.debug("mcp_manager close_all failed", exc_info=True)
+            self.mcp_manager = None
+        if self.http_client is not None:
+            try:
+                await self.http_client.aclose()
+            except Exception:
+                _log.debug("http_client close failed", exc_info=True)
+            self.http_client = None
+        if self.http_client_no_proxy is not None:
+            try:
+                await self.http_client_no_proxy.aclose()
+            except Exception:
+                _log.debug("http_client_no_proxy close failed", exc_info=True)
+            self.http_client_no_proxy = None
+        # Contexts close their own pages; closing them first also finalizes any
+        # in-flight video (Playwright writes the .webm when the context goes
+        # away). Left to browser.close() the recording would never be written.
+        contexts = list(getattr(self, "_browser_contexts", None) or [])
+        own_context = getattr(self, "_browser_context", None)
+        if own_context is not None and own_context not in contexts:
+            contexts.append(own_context)
+        for ctx in contexts:
+            try:
+                await ctx.close()
+            except Exception:
+                _log.debug("browser context close failed", exc_info=True)
+        self._browser_contexts = []
+        self._browser_context = None
+        # Closing the contexts above finalizes an in-flight video into its
+        # scratch dir. A recording that was never stopped is promised to be
+        # discarded at turn end — remove the dir the context just wrote to.
+        rec = getattr(self, "_browser_recording", None)
+        if isinstance(rec, dict) and rec.get("dir"):
+            try:
+                shutil.rmtree(rec["dir"], ignore_errors=True)
+            except Exception:
+                _log.debug("recording cleanup failed", exc_info=True)
+        self._browser_recording = None
+        pages = list(getattr(self, "_browser_pages", None) or [])
+        own_page = getattr(self, "_browser_page", None)
+        if own_page is not None and own_page not in pages:
+            pages.append(own_page)
+        for page in pages:
+            try:
+                await page.close()
+            except Exception:
+                _log.debug("browser page close failed", exc_info=True)
+        self._browser_pages = []
+        self._browser_page = None
+        if self.browser is not None:
+            try:
+                await self.browser.close()
+            except Exception:
+                _log.debug("browser close failed", exc_info=True)
+            self.browser = None
+        pw = getattr(self, "_playwright", None)
+        if pw is not None:
+            try:
+                await pw.stop()
+            except Exception:
+                _log.debug("playwright stop failed", exc_info=True)
+            self._playwright = None

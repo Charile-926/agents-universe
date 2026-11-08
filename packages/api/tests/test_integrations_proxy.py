@@ -1,0 +1,232 @@
+"""Tests for the /api/integrations proxy endpoints.
+
+The Kong proxy forwards the user's x-api-key to the gateway and returns the
+gateway's response body verbatim — a gateway error body that echoes the
+submitted key back ("invalid x-api-key: <token>") must be scrubbed before
+the body reaches the frontend (same rule as kong.py / api_keys.py / tokens.py).
+"""
+from __future__ import annotations
+
+import httpx
+
+
+class _FakeAsyncClient:
+    """httpx.AsyncClient stand-in returning a fixed response."""
+
+    def __init__(self, response):
+        self.response = response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def get(self, *a, **k):
+        return self.response
+
+    async def post(self, *a, **k):
+        return self.response
+
+    async def put(self, *a, **k):
+        return self.response
+
+    async def delete(self, *a, **k):
+        return self.response
+
+
+def _json_response(status: int, payload: dict) -> httpx.Response:
+    return httpx.Response(status, json=payload, request=httpx.Request("GET", "http://test/x"))
+
+
+async def test_kong_proxy_scrubs_echoed_key_from_json_error(client, monkeypatch):
+    """A 401 gateway body echoing the x-api-key must not leak the key to the
+    frontend through the JSON body path."""
+    key = "kong-key-leakme-12345"
+    resp = await client.put("/api/tokens/kong:dev", json={"value": key})
+    assert resp.status_code == 200
+
+    gateway_body = {"message": f"invalid x-api-key: {key}", "status": 401}
+    fake = _FakeAsyncClient(_json_response(401, gateway_body))
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **k: fake)
+
+    resp = await client.post(
+        "/api/integrations/kong/request",
+        json={"method": "GET", "path": "/some/api", "env": "dev"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == 401
+    assert key not in str(body)
+    assert "leakme" not in str(body)
+    assert "invalid x-api-key: [REDACTED]" in str(body)
+
+
+async def test_kong_proxy_scrubs_echoed_key_from_plaintext_error(client, monkeypatch):
+    """Non-JSON gateway error bodies (raise_for_status path) also echo the key
+    — scrub before returning."""
+    key = "kong-key-leakme-67890"
+    resp = await client.put("/api/tokens/kong:dev", json={"value": key})
+    assert resp.status_code == 200
+
+    # A non-JSON 401 body that echoes the key, returned via HTTPStatusError.
+    http_resp = httpx.Response(
+        401,
+        text=f"invalid x-api-key: {key}\n",
+        request=httpx.Request("GET", "http://test/x"),
+    )
+
+    class _RaisingClient(_FakeAsyncClient):
+        async def get(self, *a, **k):
+            raise httpx.HTTPStatusError("401 Unauthorized", request=http_resp.request, response=http_resp)
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **k: _RaisingClient(None))
+
+    resp = await client.post(
+        "/api/integrations/kong/request",
+        json={"method": "GET", "path": "/some/api", "env": "dev"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == 401
+    assert key not in str(body)
+    assert "leakme" not in str(body)
+
+
+async def test_kong_proxy_success_body_keeps_content(client, monkeypatch):
+    """Successful responses pass through unchanged (no false redaction)."""
+    key = "kong-key-keepme"
+    resp = await client.put("/api/tokens/kong:dev", json={"value": key})
+    assert resp.status_code == 200
+
+    gateway_body = {"data": "hello world"}
+    fake = _FakeAsyncClient(_json_response(200, gateway_body))
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **k: fake)
+
+    resp = await client.post(
+        "/api/integrations/kong/request",
+        json={"method": "GET", "path": "/some/api", "env": "dev"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"status": 200, "body": {"data": "hello world"}}
+
+
+async def test_kong_proxy_refuses_header_unsafe_token(client, monkeypatch):
+    """A pasted trailing newline makes the stored token illegal as a header
+    value; h11 would echo it back into _external_error's exc_info. The token
+    resolver must refuse with an actionable 400 before any outbound call —
+    pre-fix the fake gateway answered 200 and the token went out verbatim."""
+    key = "kong-key-bad\n"
+    resp = await client.put("/api/tokens/kong:dev", json={"value": key})
+    assert resp.status_code == 200
+
+    fake = _FakeAsyncClient(_json_response(200, {"data": "ok"}))
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **k: fake)
+
+    resp = await client.post(
+        "/api/integrations/kong/request",
+        json={"method": "GET", "path": "/some/api", "env": "dev"},
+    )
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert detail["code"] == "INTEGRATION_TOKEN_HEADER_INVALID"
+    assert "control character" in detail["message"]
+    assert key not in detail["message"]
+    assert "kong-key-bad" not in detail["message"]
+
+
+async def test_kong_proxy_rejects_authority_injection_paths(client, monkeypatch):
+    """path is concatenated onto the base URL — "@evil.example/x" turns the
+    netloc into user@host so the request (and the x-api-key header) goes to an
+    attacker-chosen host; "//evil" does the same. Only path-absolute
+    single-slash values are legal."""
+    key = "kong-key-pathcheck"
+    resp = await client.put("/api/tokens/kong:dev", json={"value": key})
+    assert resp.status_code == 200
+
+    fake = _FakeAsyncClient(_json_response(200, {"data": "ok"}))
+    outbound: list[str] = []
+    real_get = fake.get
+
+    async def _counting_get(url, *a, **k):
+        outbound.append(str(url))
+        return await real_get(url, *a, **k)
+
+    fake.get = _counting_get
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **k: fake)
+
+    for bad_path in ("@evil.example/x", "//evil.example/x", "/\\evil.example", "relative/x"):
+        resp = await client.post(
+            "/api/integrations/kong/request",
+            json={"method": "GET", "path": bad_path, "env": "dev"},
+        )
+        assert resp.status_code == 400, bad_path
+    assert outbound == []  # no outbound request was made for any rejected path
+
+    # A normal path still proxies.
+    resp = await client.post(
+        "/api/integrations/kong/request",
+        json={"method": "GET", "path": "/some/api", "env": "dev"},
+    )
+    assert resp.status_code == 200
+
+
+# ── client header construction ───────────────────────────────────────────
+
+
+def test_jira_client_refuses_header_unsafe_token_in_bearer_mode():
+    """Bearer puts the raw token in the Authorization header — _headers must
+    raise before h11 can echo the value back into the logged traceback."""
+    import pytest
+
+    from api.services.jira_client import JiraClient
+
+    bad = "ATATT-bad-newline\n"
+    client = JiraClient(api_token=bad, auth_type="bearer")
+    with pytest.raises(ValueError) as excinfo:
+        _ = client._headers
+    msg = str(excinfo.value)
+    assert "control character" in msg
+    assert bad not in msg
+    assert "ATATT-bad" not in msg
+
+    # basic auth base64-encodes the pair — control characters cannot echo.
+    ok = JiraClient(api_token=bad, email="user@example.com", auth_type="basic")
+    headers = ok._headers
+    assert headers["Authorization"].startswith("Basic ")
+
+
+def test_confluence_client_refuses_header_unsafe_token_in_bearer_mode():
+    import pytest
+
+    from api.services.confluence_client import ConfluenceClient
+
+    bad = "ATATT-bad-newline\n"
+    client = ConfluenceClient(api_token=bad, auth_type="bearer")
+    with pytest.raises(ValueError) as excinfo:
+        _ = client._headers
+    msg = str(excinfo.value)
+    assert "control character" in msg
+    assert bad not in msg
+    assert "ATATT-bad" not in msg
+
+    ok = ConfluenceClient(api_token=bad, email="user@example.com", auth_type="basic")
+    headers = ok._headers
+    assert headers["Authorization"].startswith("Basic ")
+
+
+def test_git_client_refuses_header_unsafe_token():
+    """GitClient always sends the raw token (Authorization: token <t>)."""
+    import pytest
+
+    from api.services.git_client import GitClient
+
+    bad = "ghp-bad-newline\n"
+    client = GitClient(token=bad, base_url="https://git.example.com")
+    with pytest.raises(ValueError) as excinfo:
+        _ = client._headers
+    msg = str(excinfo.value)
+    assert "control character" in msg
+    assert bad not in msg
+    assert "ghp-bad" not in msg

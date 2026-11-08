@@ -1,0 +1,762 @@
+"""Mock tests for GitHub tool: create_pr, fork, star operations."""
+import asyncio
+import re
+from unittest.mock import AsyncMock, patch
+
+import httpx
+import pytest
+
+from agent_core.tools.github import GitHubTool
+
+
+class FakeResponse:
+    def __init__(self, status_code: int, payload):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = ""
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise AssertionError(f"unexpected HTTP status {self.status_code}")
+
+
+@pytest.mark.asyncio
+async def test_create_pr_422_returns_unique_open_pr_as_already_exists():
+    http = AsyncMock()
+    http.post.return_value = FakeResponse(422, {"message": "Validation Failed"})
+    http.get.return_value = FakeResponse(
+        200,
+        [{
+            "number": 42,
+            "html_url": "https://ghe.example/pull/42",
+            "title": "PROJ-456 implementation",
+            "head": {"ref": "feature/PROJ-456"},
+            "base": {"ref": "main"},
+        }],
+    )
+
+    result = await GitHubTool()._op_create_pr(
+        {
+            "repository": "team/service",
+            "title": "PROJ-456 implementation",
+            "head_branch": "feature/PROJ-456",
+            "base_branch": "main",
+        },
+        "https://ghe.example/api/v3",
+        {},
+        http,
+    )
+
+    assert result["status"] == "already_exists"
+    assert result["number"] == 42
+    assert http.get.await_args.kwargs["params"] == {
+        "state": "open",
+        "head": "team:feature/PROJ-456",
+        "base": "main",
+        "per_page": 100,
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_pr_422_without_unique_match_returns_explicit_error():
+    http = AsyncMock()
+    http.post.return_value = FakeResponse(422, {})
+    http.get.return_value = FakeResponse(200, [])
+
+    result = await GitHubTool()._op_create_pr(
+        {
+            "repository": "team/service",
+            "title": "PROJ-456 implementation",
+            "head_branch": "feature/PROJ-456",
+            "base_branch": "main",
+        },
+        "https://ghe.example/api/v3",
+        {},
+        http,
+    )
+
+    assert "error" in result
+    assert "no unique open PR" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_create_pr_422_qualified_head_uses_cross_repo_head_as_is():
+    # Fork PR: head_branch is already '<fork-owner>:<branch>' — the duplicate
+    # query must use it verbatim, not double-qualify with the upstream owner.
+    http = AsyncMock()
+    http.post.return_value = FakeResponse(422, {"message": "Validation Failed"})
+    http.get.return_value = FakeResponse(
+        200,
+        [{
+            "number": 7,
+            "html_url": "https://ghe.example/pull/7",
+            "title": "PROJ-789 implementation",
+            "head": {"ref": "feature/PROJ-789"},
+            "base": {"ref": "main"},
+        }],
+    )
+
+    result = await GitHubTool()._op_create_pr(
+        {
+            "repository": "team/service",
+            "title": "PROJ-789 implementation",
+            "head_branch": "mybot:feature/PROJ-789",
+            "base_branch": "main",
+        },
+        "https://ghe.example/api/v3",
+        {},
+        http,
+    )
+
+    assert result["status"] == "already_exists"
+    assert http.get.await_args.kwargs["params"] == {
+        "state": "open",
+        "head": "mybot:feature/PROJ-789",
+        "base": "main",
+        "per_page": 100,
+    }
+
+
+@pytest.mark.asyncio
+async def test_fork_returns_fork_repo_info():
+    http = AsyncMock()
+    http.post.return_value = FakeResponse(
+        202,
+        {
+            "full_name": "mybot/service",
+            "clone_url": "https://ghe.example/mybot/service.git",
+            "ssh_url": "git@ghe.example:mybot/service.git",
+            "html_url": "https://ghe.example/mybot/service",
+            "default_branch": "main",
+        },
+    )
+
+    result = await GitHubTool()._op_fork(
+        {"repository": "team/service"}, "https://ghe.example/api/v3", {}, http
+    )
+
+    assert result["status"] == "forked"
+    assert result["full_name"] == "mybot/service"
+    assert result["parent"] == "team/service"
+    http.post.assert_awaited_once_with(
+        "https://ghe.example/api/v3/repos/team/service/forks", headers={}, json={}
+    )
+
+
+@pytest.mark.asyncio
+async def test_fork_requires_repository():
+    http = AsyncMock()
+    result = await GitHubTool()._op_fork({}, "https://ghe.example/api/v3", {}, http)
+    assert "error" in result
+    http.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_is_starred_204_means_starred():
+    http = AsyncMock()
+    http.get.return_value = FakeResponse(204, None)
+
+    result = await GitHubTool()._op_is_starred(
+        {"repository": "team/service"}, "https://ghe.example/api/v3", {}, http
+    )
+
+    assert result == {"starred": True, "repository": "team/service"}
+    http.get.assert_awaited_once_with(
+        "https://ghe.example/api/v3/user/starred/team/service", headers={}
+    )
+
+
+@pytest.mark.asyncio
+async def test_is_starred_404_means_not_starred():
+    http = AsyncMock()
+    http.get.return_value = FakeResponse(404, None)
+
+    result = await GitHubTool()._op_is_starred(
+        {"repository": "team/service"}, "https://ghe.example/api/v3", {}, http
+    )
+
+    assert result == {"starred": False, "repository": "team/service"}
+
+
+@pytest.mark.asyncio
+async def test_star_puts_star():
+    http = AsyncMock()
+    http.put.return_value = FakeResponse(204, None)
+
+    result = await GitHubTool()._op_star(
+        {"repository": "team/service"}, "https://ghe.example/api/v3", {}, http
+    )
+
+    assert result == {"status": "starred", "repository": "team/service"}
+    http.put.assert_awaited_once_with(
+        "https://ghe.example/api/v3/user/starred/team/service", headers={}
+    )
+
+
+class _FakeCtx:
+    """Minimal ToolContext stand-in: token lookup + config + shared http client."""
+
+    def __init__(self, http):
+        self.user_id = "u1"
+        self._token = None
+        self.http_client = http
+        self.http_client_no_proxy = None
+        self.ssl_verify = True
+        self._cfg = {"GIT_BASE_URL": "https://ghe.example", "GIT_API_BASE_PATH": "/api/v3"}
+        self.secret_key = "test-secret-key"
+
+    def cfg(self, key, default=None):
+        return self._cfg.get(key, default)
+
+
+async def _fake_get_token(context, service_key):
+    return "ghp_secret-token-123456"
+
+
+@pytest.mark.asyncio
+async def test_http_error_body_redacts_token(caplog):
+    """GitHub gateways echo the submitted credential back in error bodies
+    (same pattern kong.py redacts). The resolved token must never reach the
+    LLM/history inside the returned error message — nor the log, which used
+    to receive the raw body before the redaction pass."""
+    http = AsyncMock()
+
+    async def _boom(*args, **kwargs):
+        resp = httpx.Response(
+            401,
+            text='{"message": "Bad credentials: ghp_secret-token-123456"}',
+            request=httpx.Request("GET", "https://ghe.example/api/v3/user"),
+        )
+        raise httpx.HTTPStatusError(
+            "Unauthorized", request=resp.request, response=resp
+        )
+
+    http.get.side_effect = _boom
+
+    ctx = _FakeCtx(http)
+    with patch("agent_core.tools.github.get_token", _fake_get_token):
+        result = await GitHubTool().execute(
+            {"operation": "is_starred", "repository": "team/service"},
+            ctx,
+        )
+
+    assert result["error"].startswith("GitHub API returned 401")
+    assert "ghp_secret-token-123456" not in result["error"]
+    assert "REDACTED" in result["error"]
+    assert "ghp_secret-token-123456" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_error_body_credential_straddling_the_cut_is_still_redacted(caplog):
+    """Truncating before redacting cut the token in half, so the full-value
+    match missed and its prefix leaked to the LLM and the log."""
+    token = "ghp_" + "A" * 96  # 100 chars, longer than the 20-char cut overlap
+    body = "x" * 480 + token + " trailer"
+    http = AsyncMock()
+
+    async def _boom(*args, **kwargs):
+        resp = httpx.Response(
+            401,
+            text=body,
+            request=httpx.Request("GET", "https://ghe.example/api/v3/user"),
+        )
+        raise httpx.HTTPStatusError(
+            "Unauthorized", request=resp.request, response=resp
+        )
+
+    http.get.side_effect = _boom
+
+    async def _long_token(context, service_key):
+        return token
+
+    with patch("agent_core.tools.github.get_token", _long_token):
+        result = await GitHubTool().execute(
+            {"operation": "is_starred", "repository": "team/service"},
+            _FakeCtx(http),
+        )
+
+    assert token not in result["error"]
+    assert "A" * 40 not in result["error"]
+    assert "REDACTED" in result["error"]
+    assert token not in caplog.text
+    assert "A" * 40 not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_token_with_control_char_is_refused_without_echoing(caplog):
+    """A stored Git token with a pasted trailing newline must be refused
+    before headers are built. h11 echoes an illegal value back ("Illegal
+    header value b'...'") — the echo IS the credential, and this tool's
+    except Exception returns `{e}` raw to the LLM and logs it with exc_info."""
+    bad = "ghp_with-newline\n"
+
+    async def _bad_token(context, service_key):
+        return bad
+
+    ctx = _FakeCtx(AsyncMock())
+    with patch("agent_core.tools.github.get_token", _bad_token):
+        result = await GitHubTool().execute(
+            {"operation": "is_starred", "repository": "team/service"},
+            ctx,
+        )
+
+    assert "error" in result
+    assert "Authorization" in result["error"]
+    assert "control character" in result["error"]
+    assert "ghp_with-newline" not in result["error"]
+    assert "ghp_with-newline" not in caplog.text
+
+
+def _check(name: str, status: str, conclusion) -> dict:
+    return {
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "html_url": f"https://ghe.example/checks/{name}",
+    }
+
+
+async def _get_checks(check_runs: list[dict], status_payload, status_code: int = 200):
+    http = AsyncMock()
+    http.get.side_effect = [
+        FakeResponse(200, {"check_runs": check_runs}),
+        FakeResponse(status_code, status_payload),
+    ]
+    return await GitHubTool()._op_get_commit_checks(
+        {"repository": "team/service", "sha": "abc123"},
+        "https://ghe.example/api/v3",
+        {},
+        http,
+    )
+
+
+@pytest.mark.asyncio
+async def test_commit_checks_actions_only_repo_is_all_passing():
+    """Zero legacy statuses + green check-runs is the Actions-only shape.
+
+    The Commit Status API reports "pending" for a commit with no statuses,
+    so requiring combined_state == "success" pinned all_passing to False for
+    every repo that never used the legacy statuses API.
+    """
+    result = await _get_checks(
+        [_check("build", "completed", "success")],
+        {"state": "pending", "statuses": []},
+    )
+
+    assert result["all_passing"] is True
+
+
+@pytest.mark.asyncio
+async def test_commit_checks_pending_legacy_status_is_not_all_passing():
+    result = await _get_checks(
+        [_check("build", "completed", "success")],
+        {"state": "pending", "statuses": [{"context": "ci", "state": "pending"}]},
+    )
+
+    assert result["all_passing"] is False
+
+
+@pytest.mark.asyncio
+async def test_commit_checks_status_api_failure_fails_closed():
+    result = await _get_checks(
+        [_check("build", "completed", "success")],
+        {},
+        status_code=500,
+    )
+
+    assert result["combined_state"] is None
+    assert result["all_passing"] is False
+
+
+@pytest.mark.asyncio
+async def test_commit_checks_no_ci_at_all_is_not_passing():
+    result = await _get_checks([], {"state": "pending", "statuses": []})
+
+    assert result["all_passing"] is False
+
+
+@pytest.mark.asyncio
+async def test_commit_checks_failed_check_run_is_not_passing():
+    result = await _get_checks(
+        [_check("build", "completed", "failure")],
+        {"state": "success", "statuses": []},
+    )
+
+    assert result["all_passing"] is False
+
+
+# ---------------------------------------------------------------------------
+# Repository / code search
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_search_repositories_maps_fields_and_keeps_qualifiers():
+    http = AsyncMock()
+    http.get.return_value = FakeResponse(200, {"items": [{
+        "full_name": "acme/skills",
+        "description": "A skill library",
+        "stargazers_count": 12,
+        "default_branch": "main",
+        "clone_url": "https://ghe.example/acme/skills.git",
+        "html_url": "https://ghe.example/acme/skills",
+        "topics": ["claude-skills"],
+    }]})
+
+    result = await GitHubTool()._op_search_repositories(
+        {"query": "claude skills topic:claude-skills", "limit": 5, "sort": "stars"},
+        "https://ghe.example/api/v3", {}, http,
+    )
+
+    assert result["count"] == 1
+    assert result["repositories"][0]["full_name"] == "acme/skills"
+    assert result["repositories"][0]["topics"] == ["claude-skills"]
+    assert "skill_source" in result["hint"]
+    assert http.get.await_args.kwargs["params"] == {
+        "q": "claude skills topic:claude-skills", "per_page": 5, "sort": "stars",
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_limit_is_capped_and_best_match_sends_no_sort():
+    http = AsyncMock()
+    http.get.return_value = FakeResponse(200, {"items": []})
+
+    await GitHubTool()._op_search_repositories(
+        {"query": "x", "limit": 5000}, "https://ghe.example/api/v3", {}, http,
+    )
+
+    assert http.get.await_args.kwargs["params"] == {"q": "x", "per_page": 100}
+
+
+@pytest.mark.asyncio
+async def test_search_operations_require_a_query():
+    http = AsyncMock()
+
+    repos = await GitHubTool()._op_search_repositories({}, "u", {}, http)
+    code = await GitHubTool()._op_search_code({}, "u", {}, http)
+
+    assert repos["error"] == "query is required"
+    assert code["error"] == "query is required"
+    http.get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_search_code_reports_instances_without_code_search():
+    http = AsyncMock()
+    http.get.return_value = FakeResponse(404, {"message": "Not Found"})
+
+    result = await GitHubTool()._op_search_code(
+        {"query": "filename:SKILL.md pdf"}, "https://ghe.example/api/v3", {}, http,
+    )
+
+    assert "not available" in result["error"]
+    assert "search_repositories" in result["hint"]
+
+
+@pytest.mark.asyncio
+async def test_search_code_maps_results():
+    http = AsyncMock()
+    http.get.return_value = FakeResponse(200, {"items": [{
+        "repository": {"full_name": "acme/skills"},
+        "path": "skills/pdf/SKILL.md",
+        "html_url": "https://ghe.example/acme/skills/blob/main/skills/pdf/SKILL.md",
+    }]})
+
+    result = await GitHubTool()._op_search_code(
+        {"query": "filename:SKILL.md"}, "https://ghe.example/api/v3", {}, http,
+    )
+
+    assert result["results"] == [{
+        "repository": "acme/skills",
+        "path": "skills/pdf/SKILL.md",
+        "url": "https://ghe.example/acme/skills/blob/main/skills/pdf/SKILL.md",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_search_without_a_token_points_at_the_offline_catalog():
+    from agent_core.tools._auth import ToolAuthError
+
+    async def _no_token(context, service_key):
+        raise ToolAuthError("Git token not configured")
+
+    ctx = _FakeCtx(AsyncMock())
+    with patch("agent_core.tools.github.get_token", _no_token):
+        result = await GitHubTool().execute(
+            {"operation": "search_repositories", "query": "x"}, ctx,
+        )
+
+    assert "Git token not configured" in result["error"]
+    assert "list_sources" in result["hint"]
+
+
+# ---------------------------------------------------------------------------
+# get_pr_details — a card's PRs in one call
+# ---------------------------------------------------------------------------
+
+
+class _Resp:
+    def __init__(self, status_code: int, payload):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = ""
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"Client error '{self.status_code}'",
+                request=httpx.Request("GET", "https://ghe.example/api/v3/x"),
+                response=self,
+            )
+
+
+class _PRHTTP:
+    """Canned GitHub responses keyed by the PR number in the URL.
+
+    Records the start/finish of every PR entry request so a test can prove the
+    details were fetched concurrently instead of one PR after another.
+    """
+
+    base = "https://ghe.example/api/v3"
+
+    def __init__(self, fail: set[int] | None = None):
+        self.fail = fail or set()
+        self.events: list[str] = []
+
+    async def get(self, url: str, headers: dict | None = None, params: dict | None = None):
+        tail = url[len(self.base):]
+        entry = re.fullmatch(r"/repos/[^/]+/[^/]+/pulls/(\d+)", tail)
+        if entry:
+            self.events.append(f"start {tail}")
+            await asyncio.sleep(0.01)
+            self.events.append(f"end {tail}")
+            number = int(entry.group(1))
+            if number in self.fail:
+                return _Resp(404, {"message": "Not Found"})
+            return _Resp(200, {
+                "number": number, "title": f"PR {number}", "state": "open",
+                "user": {"login": "ann"}, "body": "why",
+                "base": {"ref": "main"}, "head": {"ref": f"feature/{number}", "sha": f"sha{number}"},
+            })
+        if tail == "/search/issues":
+            return _Resp(200, {"items": [
+                {"number": 7, "title": "PR 7", "state": "open",
+                 "repository_url": f"{self.base}/repos/team/svc",
+                 "html_url": f"{self.base}/repos/team/svc/pull/7"},
+            ]})
+        if tail == "/search/commits":
+            return _Resp(200, {"items": []})
+        if tail.endswith("/files"):
+            return _Resp(200, [{"filename": "a.ts", "status": "modified",
+                                "additions": 1, "deletions": 2}])
+        if tail.endswith("/commits"):
+            return _Resp(200, [{"sha": "abcdef1234567890", "commit": {"message": "fix"}}])
+        if tail.endswith("/reviews"):
+            return _Resp(200, [{"user": {"login": "rev"}, "state": "APPROVED",
+                                "body": "lgtm", "submitted_at": "2026-01-03"}])
+        if tail.endswith("/comments"):
+            return _Resp(200, [{"user": {"login": "com"}, "body": "any update?",
+                                "created_at": "2026-01-04"}])
+        if tail.endswith("/check-runs"):
+            return _Resp(200, {"check_runs": [{"name": "ci", "status": "completed",
+                                               "conclusion": "success"}]})
+        return _Resp(404, {})
+
+
+@pytest.mark.asyncio
+async def test_get_pr_details_fetches_all_prs_concurrently():
+    http = _PRHTTP()
+
+    result = await GitHubTool()._op_get_pr_details(
+        {"repository": "team/svc", "pr_numbers": [7, 8, 9]}, http.base, {}, http,
+    )
+
+    assert result["count"] == 3
+    assert [pr["number"] for pr in result["pull_requests"]] == [7, 8, 9]
+    # Reviews and comments travel with the detail — the review thread is what
+    # the QA/tech-lead workflows mean by "read the PR".
+    assert result["pull_requests"][0]["reviews"][0]["state"] == "APPROVED"
+    assert result["pull_requests"][0]["comments"][0]["body"] == "any update?"
+    assert result["pull_requests"][0]["files"][0]["filename"] == "a.ts"
+    # Every PR's entry request started before any of them finished.
+    starts = [i for i, e in enumerate(http.events)
+              if e in {f"start /repos/team/svc/pulls/{n}" for n in (7, 8, 9)}]
+    ends = [i for i, e in enumerate(http.events)
+            if e in {f"end /repos/team/svc/pulls/{n}" for n in (7, 8, 9)}]
+    assert len(starts) == 3
+    assert max(starts) < min(ends)
+
+
+@pytest.mark.asyncio
+async def test_get_pr_details_isolates_one_failed_pr():
+    """One unreachable PR must not sink the card's other PRs, and the error
+    carries no upstream body."""
+    http = _PRHTTP(fail={8})
+
+    result = await GitHubTool()._op_get_pr_details(
+        {"repository": "team/svc", "pr_numbers": [7, 8, 9]}, http.base, {}, http,
+    )
+
+    assert result["count"] == 3
+    failed = result["pull_requests"][1]
+    assert failed["number"] == 8
+    assert failed["repository"] == "team/svc"
+    assert "GitHub API returned 404" in failed["error"]
+    assert result["pull_requests"][0]["title"] == "PR 7"
+    assert result["pull_requests"][2]["title"] == "PR 9"
+
+
+@pytest.mark.asyncio
+async def test_get_pr_details_accepts_a_stringified_pr_number_list():
+    """LLM 把数组参数传成 '7,8' 时不能逐字符迭代。"""
+    http = _PRHTTP()
+
+    result = await GitHubTool()._op_get_pr_details(
+        {"repository": "team/svc", "pr_numbers": "7, 8"}, http.base, {}, http,
+    )
+
+    assert [pr["number"] for pr in result["pull_requests"]] == [7, 8]
+
+
+@pytest.mark.asyncio
+async def test_get_pr_details_reports_unparsable_numbers_as_skipped():
+    http = _PRHTTP()
+
+    result = await GitHubTool()._op_get_pr_details(
+        {"repository": "team/svc", "pr_numbers": ["7", "abc"]}, http.base, {}, http,
+    )
+
+    assert result["count"] == 1
+    assert result["skipped"] == ["abc"]
+    assert result["pull_requests"][0]["title"] == "PR 7"
+
+
+@pytest.mark.asyncio
+async def test_get_pr_details_caps_the_batch():
+    """A wide jira_key search must not fan out into dozens of concurrent reads."""
+    http = _PRHTTP()
+
+    result = await GitHubTool()._op_get_pr_details(
+        {"repository": "team/svc", "pr_numbers": list(range(1, 26))}, http.base, {}, http,
+    )
+
+    assert result["count"] == 20
+    assert "start /repos/team/svc/pulls/21" not in http.events
+    assert all("error" not in pr for pr in result["pull_requests"])
+
+
+@pytest.mark.asyncio
+async def test_get_pr_details_resolves_prs_from_a_jira_key():
+    """The common QA shape: the card knows its key, not its PR numbers."""
+    http = _PRHTTP()
+
+    result = await GitHubTool()._op_get_pr_details(
+        {"jira_key": "DDM-1"}, http.base, {}, http,
+    )
+
+    assert result["count"] == 1
+    assert result["pull_requests"][0]["number"] == 7
+    assert result["pull_requests"][0]["title"] == "PR 7"
+
+
+@pytest.mark.asyncio
+async def test_get_pr_details_requires_a_target():
+    http = _PRHTTP()
+
+    result = await GitHubTool()._op_get_pr_details({"repository": "team/svc"}, http.base, {}, http)
+
+    assert "no PRs to fetch" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# list_prs — all_repos search
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_prs_all_repos_state_all_omits_the_state_qualifier():
+    """`state=all` must not become `is:all`.
+
+    GitHub has no wildcard state value: `is:all` is an unrecognised qualifier
+    that matches nothing, so the advertised `state: all` returned an empty
+    list. Omitting the state term is what selects every state.
+    """
+    http = AsyncMock()
+    http.get.return_value = FakeResponse(200, {"items": []})
+
+    result = await GitHubTool()._op_list_prs(
+        {"all_repos": True, "state": "all", "author": "ann", "reviewer": "bob"},
+        "https://ghe.example/api/v3", {}, http,
+    )
+
+    assert result["count"] == 0
+    assert http.get.await_args.kwargs["params"]["q"] == (
+        "is:pr archived:false review-requested:bob author:ann"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["open", "closed"])
+async def test_list_prs_all_repos_keeps_explicit_open_and_closed(state):
+    http = AsyncMock()
+    http.get.return_value = FakeResponse(200, {"items": []})
+
+    await GitHubTool()._op_list_prs(
+        {"all_repos": True, "state": state}, "https://ghe.example/api/v3", {}, http,
+    )
+
+    assert http.get.await_args.kwargs["params"]["q"] == (
+        f"is:pr archived:false is:{state}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_prs_single_repo_author_filter_is_server_side():
+    """Author/reviewer on a single repo must filter server-side.
+
+    The list-PRs endpoint has no author/reviewer parameters; the old
+    client-side filter only inspected the first `limit` PRs, so matches on
+    later pages came back as count 0. Search applies the filter like the
+    all_repos path does.
+    """
+    http = AsyncMock()
+    http.get.return_value = FakeResponse(200, {"items": []})
+
+    await GitHubTool()._op_list_prs(
+        {"repository": "team/svc", "author": "ann", "reviewer": "bob"},
+        "https://ghe.example/api/v3", {}, http,
+    )
+
+    assert http.get.await_args.kwargs["params"]["q"] == (
+        "repo:team/svc is:pr is:open review-requested:bob author:ann"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "base_url", ["https://www.github.com/", "https://WWW.GitHub.com", "github.com"]
+)
+async def test_public_github_host_variants_use_api_github_com(base_url):
+    """The allowlist accepted bare `www.github.com` but not its URL form, so
+    `https://www.github.com` fell through to the Enterprise path and every
+    call hit `https://www.github.com/api/v3/...` (404)."""
+    http = AsyncMock()
+    http.get.return_value = FakeResponse(204, None)
+    ctx = _FakeCtx(http)
+    ctx._cfg["GIT_BASE_URL"] = base_url
+
+    with patch("agent_core.tools.github.get_token", _fake_get_token):
+        result = await GitHubTool().execute(
+            {"operation": "is_starred", "repository": "team/service"}, ctx,
+        )
+
+    assert result == {"starred": True, "repository": "team/service"}
+    assert http.get.await_args.args[0] == (
+        "https://api.github.com/user/starred/team/service"
+    )

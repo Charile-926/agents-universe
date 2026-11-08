@@ -1,0 +1,816 @@
+"""Execution and result delivery for scheduled tasks.
+
+Split out of ``scheduler.py`` so both the background loop and the router's
+"run now" endpoint share one launch path. Each fire is one ``ScheduledTaskRun``
+row plus, for script/playwright targets, a ``script_runs`` row created under the
+task owner's identity — which is what makes the existing live-log WebSocket
+(``/ws/script-runs/{run_id}``) and the project-deletion guard work unchanged.
+
+Agent targets run headlessly through the same kernel the publish SSE endpoint
+uses: ``run_turn(..., interactive=False)``. No client is attached, so a
+DB-only transport is passed; the kernel persists the prompt and the reply into
+the target conversation, which is the delivery.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import weakref
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+
+from sqlalchemy import select, update
+
+from agent_core.scripts.runner import execute_script, script_slot_guard
+from api.database import AsyncSessionLocal
+from api.errors import error_message
+from api.models._compat import now_utc
+from api.models.schedule import ScheduledTask, ScheduledTaskRun
+from api.services.agent_turn import Transport
+from api.services.script_artifacts import load_result
+
+_log = logging.getLogger("agents_universe.scheduler")
+
+# Headless agent turns are the only target that spends model tokens, so they get
+# their own (small) cap; scripts and Playwright runs share the runner's global
+# 3-slot guard with human-initiated runs.
+AGENT_TURN_LIMIT = 2
+MAX_BACKGROUND_RUNS = 64
+_SUMMARY_CAP = 2000
+_ERROR_CAP = 2000
+_LOG_TAIL_CHARS = 1200
+
+_agent_semaphore: asyncio.Semaphore | None = None
+_background_tasks: set[asyncio.Task] = set()
+_reserved_background_runs = 0
+
+
+# Per-task launch locks: the "is a run already active?" check and the insert
+# below are separate statements, so two concurrent launches (a tick racing a
+# manual run-now) could both pass the check. A weak-value dict keys locks by
+# schedule_id while they are held — the context manager's local reference keeps
+# the lock alive across the yield, and once the last waiter exits the entry is
+# garbage-collected, so deleted schedules never accumulate locks.
+_spawn_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+@asynccontextmanager
+async def _schedule_spawn_lock(schedule_id: str):
+    lock = _spawn_locks.get(schedule_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _spawn_locks[schedule_id] = lock
+    async with lock:
+        yield
+
+
+class ScheduleBusy(RuntimeError):
+    """A manual launch was refused; the message names the cause.
+
+    Two disjoint causes share this exception: the task's previous run is
+    still active, or the process-wide background queue is full. Callers
+    surface ``str(exc)`` so users can tell them apart — a fixed message
+    would tell someone launching an *idle* task that a run is "in progress".
+    """
+
+
+class ScheduleNotFound(LookupError):
+    """The scheduled task row no longer exists."""
+
+
+def _new_skipped_run(task: ScheduledTask, trigger: str, error: str) -> ScheduledTaskRun:
+    """A terminal ``skipped`` row written at launch time (never executed).
+
+    One timestamp for both columns: two ``now_utc()`` calls can span a tick
+    and record ``completed_at > started_at``.
+    """
+    now = now_utc()
+    return ScheduledTaskRun(
+        schedule_id=task.schedule_id,
+        project_id=str(task.project_id),
+        trigger=trigger,
+        status="skipped",
+        conversation_id=task.conversation_id,
+        error=error,
+        started_at=now,
+        completed_at=now,
+    )
+
+
+def agent_turn_slot_guard() -> asyncio.Semaphore:
+    """Lazy per-loop semaphore (an asyncio primitive binds to the running loop)."""
+    global _agent_semaphore
+    if _agent_semaphore is None:
+        _agent_semaphore = asyncio.Semaphore(AGENT_TURN_LIMIT)
+    return _agent_semaphore
+
+
+class _NullTransport(Transport):
+    """Records terminal turn events; there is no client to deliver to."""
+
+    def __init__(self) -> None:
+        self.stream_end: dict | None = None
+        self.error: str | None = None
+
+    async def send(self, conversation_id: str, data: dict) -> bool:
+        if data.get("type") == "stream_end":
+            # One turn can emit several stream_end frames: a mid-run
+            # injection freezes the partial under a STEP-boundary id
+            # (injection=True), the real terminal frame carries the
+            # persisted message id, and run_turn's tails add synthetic ones
+            # after it (abort: message_id=None; outer-exception: a fresh id
+            # never written to messages). _last_reply trusts only this
+            # frame, so a REAL id-bearing frame (no injection flag) wins
+            # once recorded and is never overwritten; injection/id-less
+            # frames record only as a fallback when no real frame has
+            # arrived yet.
+            recorded = self.stream_end or {}
+            recorded_real = bool(recorded.get("message_id")) and not recorded.get("injection")
+            frame_real = bool(data.get("message_id")) and not data.get("injection")
+            if frame_real and not recorded_real:
+                self.stream_end = data
+            elif self.stream_end is None:
+                self.stream_end = data
+        elif data.get("type") == "error":
+            self.error = data.get("message")
+        return False
+
+
+def _log_background_failure(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        _log.error("Scheduled run task failed: %s", exc, exc_info=exc)
+
+
+# ── Launch ───────────────────────────────────────────────────────────────────
+
+async def spawn_run(app, schedule_id: str, *, trigger: str) -> str:
+    """Create a ``ScheduledTaskRun`` and launch it in the background.
+
+    Returns the run id. A scheduled fire whose previous run is still active is
+    recorded as ``skipped`` (history stays honest, the task does not stack);
+    a manual launch raises :class:`ScheduleBusy` instead, so the API can answer
+    409 rather than pretending it ran.
+    """
+    global _reserved_background_runs
+    reserved = False
+    try:
+        async with _schedule_spawn_lock(schedule_id):
+            async with AsyncSessionLocal() as db:
+                task = (
+                    await db.execute(
+                        select(ScheduledTask).where(ScheduledTask.schedule_id == schedule_id)
+                    )
+                ).scalar_one_or_none()
+                if task is None:
+                    raise ScheduleNotFound(schedule_id)
+
+                active = (
+                    await db.execute(
+                        select(ScheduledTaskRun.run_id)
+                        .where(
+                            ScheduledTaskRun.schedule_id == schedule_id,
+                            ScheduledTaskRun.status.in_(("pending", "running")),
+                        )
+                        .limit(1)
+                    )
+                ).first()
+                if active:
+                    if trigger == "manual":
+                        raise ScheduleBusy("This task already has a run in progress")
+                    run = _new_skipped_run(task, trigger, "Previous run still in progress")
+                    db.add(run)
+                    await db.commit()
+                    return str(run.run_id)
+
+                queue_is_full = (
+                    len(_background_tasks) + _reserved_background_runs
+                    >= MAX_BACKGROUND_RUNS
+                )
+                if queue_is_full:
+                    if trigger == "manual":
+                        raise ScheduleBusy("Background execution queue is full")
+                    run = _new_skipped_run(
+                        task, trigger, "Background execution queue is full"
+                    )
+                    db.add(run)
+                    await db.commit()
+                    return str(run.run_id)
+
+                # Reserve capacity before commit yields to another launcher.
+                _reserved_background_runs += 1
+                reserved = True
+                run = ScheduledTaskRun(
+                    schedule_id=schedule_id,
+                    project_id=str(task.project_id),
+                    trigger=trigger,
+                    status="pending",
+                    conversation_id=task.conversation_id,
+                    started_at=now_utc(),
+                )
+                db.add(run)
+                await db.commit()
+                run_id = str(run.run_id)
+
+            bg = asyncio.create_task(execute_run(app, run_id))
+            _background_tasks.add(bg)
+            bg.add_done_callback(_background_tasks.discard)
+            bg.add_done_callback(_log_background_failure)
+            return run_id
+    finally:
+        if reserved:
+            _reserved_background_runs -= 1
+
+
+# ── Execution ────────────────────────────────────────────────────────────────
+
+class _Target:
+    """Plain snapshot of the task row — never hold ORM instances across commits."""
+
+    __slots__ = (
+        "schedule_id", "name", "project_id", "target_type", "script_id",
+        "spec_slug", "agent_slug", "prompt", "env_json", "conversation_id",
+        "notify", "created_by",
+    )
+
+    def __init__(self, task: ScheduledTask) -> None:
+        self.schedule_id = str(task.schedule_id)
+        self.name = task.name
+        self.project_id = str(task.project_id)
+        self.target_type = task.target_type
+        self.script_id = str(task.script_id) if task.script_id else None
+        self.spec_slug = task.spec_slug
+        self.agent_slug = task.agent_slug
+        self.prompt = task.prompt
+        self.env_json = task.env_json
+        self.conversation_id = task.conversation_id
+        self.notify = bool(task.notify)
+        self.created_by = task.created_by
+
+
+async def execute_run(app, run_id: str) -> None:
+    """Body of one scheduled run. Never raises — failures land on the run row."""
+    try:
+        async with AsyncSessionLocal() as db:
+            run = (
+                await db.execute(
+                    select(ScheduledTaskRun).where(ScheduledTaskRun.run_id == run_id)
+                )
+            ).scalar_one_or_none()
+            if run is None:
+                return
+            if run.status == "skipped":  # written terminal at creation time
+                return
+            task_row = (
+                await db.execute(
+                    select(ScheduledTask).where(
+                        ScheduledTask.schedule_id == run.schedule_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if task_row is None:
+                run.status = "failed"
+                run.error = "Scheduled task was deleted before the run started"
+                run.completed_at = now_utc()
+                await db.commit()
+                return
+            target = _Target(task_row)
+            run.status = "running"
+            run.started_at = now_utc()
+            await db.commit()
+
+        if target.target_type == "script":
+            outcome = await _run_script_target(target)
+        elif target.target_type == "playwright":
+            outcome = await _run_playwright_target(target)
+        elif target.target_type == "agent":
+            outcome = await _run_agent_target(app, target)
+        else:
+            outcome = _Outcome("failed", None, f"Unknown target type: {target.target_type}")
+
+        await _finalize(target, run_id, outcome)
+    except asyncio.CancelledError:
+        await _finalize_failure(run_id, "Execution cancelled by server shutdown")
+        raise
+    except Exception as exc:  # noqa: BLE001 - the run row is the error surface
+        _log.exception("Scheduled run %s failed", run_id)
+        await _finalize_failure(run_id, str(exc))
+
+
+class _Outcome:
+    __slots__ = ("status", "summary", "error", "script_run_id", "reply_persisted")
+
+    def __init__(
+        self,
+        status: str,
+        summary: str | None = None,
+        error: str | None = None,
+        script_run_id: str | None = None,
+        reply_persisted: bool = False,
+    ) -> None:
+        self.status = status
+        self.summary = summary
+        self.error = error
+        self.script_run_id = script_run_id
+        # True when the kernel already wrote this run's message into the
+        # target conversation (agent targets) — delivery must then only
+        # nudge the socket, or the reply shows up twice.
+        self.reply_persisted = reply_persisted
+
+
+async def _finalize_failure(run_id: str, message: str) -> None:
+    try:
+        async with AsyncSessionLocal() as db:
+            run = (
+                await db.execute(
+                    select(ScheduledTaskRun).where(ScheduledTaskRun.run_id == run_id)
+                )
+            ).scalar_one_or_none()
+            if run is None or run.status in ("completed", "failed", "skipped"):
+                return
+            run.status = "failed"
+            run.error = message[:_ERROR_CAP]
+            run.completed_at = now_utc()
+            await db.commit()
+    except Exception:  # noqa: BLE001 - best effort, never mask the original error
+        _log.exception("Could not mark scheduled run %s failed", run_id)
+
+
+async def _finalize(target: _Target, run_id: str, outcome: _Outcome) -> None:
+    """Write the terminal run state, mirror it onto the task, deliver the summary."""
+    async with AsyncSessionLocal() as db:
+        run = (
+            await db.execute(
+                select(ScheduledTaskRun).where(ScheduledTaskRun.run_id == run_id)
+            )
+        ).scalar_one_or_none()
+        if run is None:
+            return
+        run.status = outcome.status
+        run.summary = (outcome.summary or "")[:_SUMMARY_CAP] or None
+        run.error = (outcome.error or "")[:_ERROR_CAP] or None
+        if outcome.script_run_id:
+            run.script_run_id = outcome.script_run_id
+        run.completed_at = now_utc()
+        await db.execute(
+            update(ScheduledTask)
+            .where(ScheduledTask.schedule_id == target.schedule_id)
+            .values(last_run_at=now_utc(), last_status=outcome.status)
+        )
+        await db.commit()
+
+    if target.notify and outcome.status in ("completed", "failed"):
+        await deliver_result(target, outcome)
+
+
+# ── Targets ──────────────────────────────────────────────────────────────────
+
+async def _run_script_target(target: _Target) -> _Outcome:
+    from api.models.script import AutomationScript, ScriptRun
+    from api.paths import resolve_project_fs_path
+
+    sem = script_slot_guard()
+    await sem.acquire()
+    try:
+        async with AsyncSessionLocal() as db:
+            script = (
+                await db.execute(
+                    select(AutomationScript).where(
+                        AutomationScript.script_id == target.script_id,
+                        AutomationScript.project_id == target.project_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if script is None:
+                return _Outcome("failed", None, "Script no longer exists in this project")
+            if script.script_type == "playwright":
+                return _Outcome("failed", None, "Playwright specs are scheduled as target_type=playwright")
+            content, script_type = script.content, script.script_type
+
+            # Resolve the workspace BEFORE the run row exists. A row created
+            # and then abandoned at "pending" never reaches a terminal state
+            # (no startup sweep settles script runs) and blocks project
+            # deletion forever — project_deletion counts pending/running
+            # ScriptRuns as live work.
+            try:
+                project_fs = await resolve_project_fs_path(target.project_id, db)
+            except Exception as exc:  # noqa: BLE001
+                return _Outcome("failed", None, f"Cannot resolve workspace: {exc}")
+
+            run = ScriptRun(
+                script_id=target.script_id,
+                triggered_by=target.created_by,
+                status="pending",
+                started_at=now_utc(),
+            )
+            db.add(run)
+            await db.commit()
+            script_run_id = str(run.run_id)
+
+        await execute_script(
+            script_run_id, content, script_type, target.created_by, project_fs
+        )
+
+        async with AsyncSessionLocal() as db:
+            done = (
+                await db.execute(
+                    select(ScriptRun).where(ScriptRun.run_id == script_run_id)
+                )
+            ).scalar_one_or_none()
+            if done is None:
+                return _Outcome("failed", None, "Script run row disappeared", script_run_id)
+            status = "completed" if done.status == "completed" else "failed"
+            exit_code = done.exit_code
+            log_text = (done.stdout_log or "") + (done.stderr_log or "")
+            result = load_result(done)
+
+        summary = _script_summary(target, status, exit_code, log_text, result)
+        error = None if status == "completed" else f"Exit code {exit_code}"
+        return _Outcome(status, summary, error, script_run_id)
+    finally:
+        sem.release()
+
+
+async def _run_playwright_target(target: _Target) -> _Outcome:
+    # Lazy import: the playwright executor lives with the scripts router, which
+    # must not import the scheduler back (see routers/scripts.py).
+    from api.models.script import ScriptRun
+    from api.paths import resolve_project_fs_path
+    from api.routers.scripts import (
+        _execute_playwright,
+        _get_or_create_playwright_anchor,
+        _resolve_playwright_spec,
+        _validated_playwright_env,
+    )
+
+    if not target.spec_slug:
+        return _Outcome("failed", None, "No spec configured for this task")
+
+    try:
+        request_env = _validated_playwright_env(json.loads(target.env_json or "{}"))
+    except (ValueError, TypeError):
+        return _Outcome("failed", None, "env_json is not valid JSON")
+    except Exception as exc:  # noqa: BLE001 - HTTPException from validation
+        return _Outcome("failed", None, error_message(exc))
+
+    sem = script_slot_guard()
+    await sem.acquire()
+    try:
+        async with AsyncSessionLocal() as db:
+            try:
+                anchor = await _get_or_create_playwright_anchor(
+                    db, target.project_id, target.created_by
+                )
+                anchor_id = str(anchor.script_id)
+            except Exception as exc:  # noqa: BLE001
+                return _Outcome("failed", None, f"Could not prepare the Playwright anchor: {exc}")
+
+            # Workspace and spec validation BEFORE the run row exists — same
+            # no-phantom-pending rule as the script target: a row abandoned
+            # at "pending" never reaches a terminal state (no startup sweep
+            # settles script runs) and blocks project deletion forever.
+            try:
+                project_fs = await resolve_project_fs_path(target.project_id, db)
+                _resolve_playwright_spec(project_fs, target.spec_slug)
+            except Exception as exc:  # noqa: BLE001 - 404 HTTPException when missing
+                return _Outcome("failed", None, error_message(exc))
+
+            run = ScriptRun(
+                script_id=anchor_id,
+                triggered_by=target.created_by,
+                # Same tagging as a UI-triggered run: the anchor script is
+                # shared, so spec_slug is what makes the run findable in that
+                # spec's history.
+                spec_slug=target.spec_slug,
+                status="pending",
+                started_at=now_utc(),
+            )
+            db.add(run)
+            await db.commit()
+            script_run_id = str(run.run_id)
+
+        await _execute_playwright(
+            script_run_id, target.spec_slug, request_env, target.created_by, project_fs
+        )
+
+        async with AsyncSessionLocal() as db:
+            done = (
+                await db.execute(
+                    select(ScriptRun).where(ScriptRun.run_id == script_run_id)
+                )
+            ).scalar_one_or_none()
+            if done is None:
+                return _Outcome("failed", None, "Playwright run row disappeared", script_run_id)
+            status = "completed" if done.status == "completed" else "failed"
+            exit_code = done.exit_code
+            log_text = (done.stdout_log or "") + (done.stderr_log or "")
+            result = load_result(done)
+
+        summary = _script_summary(target, status, exit_code, log_text, result)
+        error = None if status == "completed" else f"Exit code {exit_code}"
+        return _Outcome(status, summary, error, script_run_id)
+    finally:
+        sem.release()
+
+
+async def _run_agent_target(app, target: _Target) -> _Outcome:
+    from api.models.conversation import Conversation
+    from api.services.agent_turn import run_turn
+    from api.websocket.manager import manager
+
+    sem = agent_turn_slot_guard()
+    await sem.acquire()
+    try:
+        async with AsyncSessionLocal() as db:
+            conversation_id = await _resolve_conversation(db, target)
+            if conversation_id is None:
+                return _Outcome("failed", None, "Target conversation is unavailable")
+
+            conv = (
+                await db.execute(
+                    select(Conversation).where(
+                        Conversation.conversation_id == conversation_id,
+                        Conversation.project_id == target.project_id,
+                        Conversation.user_id == target.created_by,
+                        Conversation.status == "active",
+                    )
+                )
+            ).scalar_one_or_none()
+            if conv is None:
+                return _Outcome("failed", None, "Target conversation is unavailable")
+
+        if not await manager.claim_turn(conversation_id):
+            # A human is mid-turn in that conversation — do not interleave.
+            return _Outcome("skipped", None, "Conversation is busy with another turn")
+        # No release_turn here: run_turn's own finally releases the claim
+        # before its final await (agent.close), and a claim re-taken during
+        # that window belongs to its new owner — a caller-side release would
+        # discard the new owner's claim mid-turn.
+        manager.ensure_abort_event(conversation_id)
+        manager.reset_abort(conversation_id)
+        transport = _NullTransport()
+        await run_turn(
+            conversation_id,
+            ws=SimpleNamespace(app=app),
+            msg={
+                "content": f"[定时任务 · {target.name}]\n{target.prompt or ''}".strip(),
+                "agent_id": target.agent_slug,
+            },
+            user_id=target.created_by,
+            transport=transport,
+            interactive=False,
+            actor_user_id=target.created_by,
+        )
+
+        async with AsyncSessionLocal() as db:
+            text, failure = await _last_reply(db, transport)
+        if transport.error:
+            # A turn-level error event means this run failed, whatever the
+            # history holds — scoring it from the latest assistant row would
+            # report the PREVIOUS turn's reply as this run's result.
+            return _Outcome(
+                "failed", None, transport.error, reply_persisted=bool(text)
+            )
+        if failure == "interrupted":
+            # A stop/abort left a partial message row. It must not score as
+            # completed, or the schedule reports a truncated answer as the
+            # result; deliver_result still sees the persisted partial.
+            return _Outcome(
+                "failed", None, "The agent run was interrupted",
+                reply_persisted=bool(text),
+            )
+        if failure == "error":
+            # The turn persisted its own failure notice (refusal, content
+            # filter, empty output) — a message row exists, but the run failed.
+            return _Outcome(
+                "failed", None, (text or "The agent failed")[:_ERROR_CAP],
+                reply_persisted=True,
+            )
+        if not text:
+            return _Outcome("failed", None, "The agent produced no reply")
+        return _Outcome("completed", text[:_SUMMARY_CAP], reply_persisted=True)
+    finally:
+        sem.release()
+
+
+async def _resolve_conversation(db, target: _Target) -> str | None:
+    """Target conversation id, creating one for the task owner on first use."""
+    if target.conversation_id:
+        return target.conversation_id
+
+    from api.models.agent import Agent
+    from api.models.conversation import Conversation
+
+    agent_id = None
+    if target.agent_slug:
+        agent = (
+            await db.execute(select(Agent).where(Agent.slug == target.agent_slug))
+        ).scalars().first()
+        # Mirror routers/conversations.create_conversation: a project-scoped
+        # agent row is valid only within its own project — binding a foreign
+        # project's row would drag its FK into this conversation (and break
+        # the foreign project's deletion). Leave unbound rather than bind wrong.
+        if agent is not None and (
+            agent.project_id is None or agent.project_id == target.project_id
+        ):
+            agent_id = str(agent.agent_id)
+
+    conv = Conversation(
+        project_id=target.project_id,
+        user_id=target.created_by,
+        agent_id=agent_id,
+        title=f"定时任务: {target.name}",
+    )
+    db.add(conv)
+    await db.commit()
+    conversation_id = str(conv.conversation_id)
+
+    # Write the id back so later fires reuse the same thread — and bind it
+    # onto this run's snapshot too, or deliver_result's
+    # `if not target.conversation_id` early-return skips the first fire's
+    # conversation_updated nudge for a freshly auto-created conversation.
+    target.conversation_id = conversation_id
+    await db.execute(
+        update(ScheduledTask)
+        .where(ScheduledTask.schedule_id == target.schedule_id)
+        .values(conversation_id=conversation_id)
+    )
+    await db.commit()
+    return conversation_id
+
+
+async def _last_reply(db, transport: _NullTransport) -> tuple[str, str | None]:
+    """``(content, failure_kind)`` of the assistant message THIS turn persisted.
+
+    *failure_kind* is ``"interrupted"`` (user Stop / aborted turn), ``"error"``
+    (the turn persisted its own failure notice), or None. Only the id carried
+    by this turn's stream_end counts: a failed turn sends either no stream_end
+    at all or a synthetic id that was never written to messages, and falling
+    back to the conversation's latest assistant row would score the run
+    completed with the previous turn's reply.
+    """
+    from api.models.conversation import Message as DbMessage
+
+    end_frame = transport.stream_end or {}
+    message_id = end_frame.get("message_id")
+    if not message_id:
+        return "", None
+    row = (
+        await db.execute(
+            select(DbMessage.content, DbMessage.knowledge_refs).where(
+                DbMessage.message_id == message_id
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        return "", None
+    content, refs_json = row
+    errored = False
+    interrupted = end_frame.get("stop_reason") in ("aborted", "interrupted")
+    if refs_json:
+        try:
+            parsed = json.loads(refs_json)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            errored = bool(parsed.get("error"))
+            interrupted = interrupted or bool(parsed.get("interrupted"))
+    if interrupted:
+        return content or "", "interrupted"
+    return content or "", ("error" if errored else None)
+
+
+def _script_summary(
+    target: _Target, status: str, exit_code: int | None, log_text: str,
+    result: dict | None = None,
+) -> str:
+    lines = [
+        f"定时任务「{target.name}」{_status_label(status)}",
+        f"退出码: {exit_code}",
+    ]
+    verdict = _result_line(result)
+    if verdict:
+        # The parsed verdict beats the raw tail: the stored log is head-capped,
+        # so a long test run's conclusion is exactly what it dropped.
+        lines.append(verdict)
+    else:
+        tail = log_text[-_LOG_TAIL_CHARS:].strip()
+        if tail:
+            lines.append("日志尾部:")
+            lines.append(tail)
+    return "\n".join(lines)
+
+
+def _result_line(result: dict | None) -> str:
+    """One-line verdict from a stored Playwright result, if there is one."""
+    counts = (result or {}).get("counts") or {}
+    if not counts:
+        return ""
+    parts = [f"{counts.get('passed', 0)} 通过", f"{counts.get('failed', 0)} 失败"]
+    for key, label in (("flaky", "不稳定"), ("skipped", "跳过")):
+        if counts.get(key):
+            parts.append(f"{counts[key]} {label}")
+    line = " · ".join(parts)
+    duration = (result or {}).get("duration_ms") or 0
+    if duration:
+        line += f"（{duration / 1000:.1f}s）"
+    failed = [t.get("title") for t in (result.get("failed_tests") or []) if t.get("title")]
+    if failed:
+        line += "\n失败用例: " + "、".join(failed[:5])
+    return line
+
+
+def _status_label(status: str) -> str:
+    return {"completed": "执行成功", "failed": "执行失败", "skipped": "已跳过"}.get(
+        status, status
+    )
+
+
+# ── Result delivery ──────────────────────────────────────────────────────────
+
+async def deliver_result(target: _Target, outcome: _Outcome) -> None:
+    """Deliver the run result to the task's conversation as an assistant message.
+
+    When the kernel already persisted this run's message (agent targets,
+    ``outcome.reply_persisted``) only the socket is nudged — appending the
+    summary again would post the reply twice. Deliberately silent on every
+    failure path: a deleted or busy conversation must not fail the run itself.
+    The turn claim serializes the insert against a live user turn so sequence
+    numbers cannot interleave.
+    """
+    if not target.conversation_id:
+        return
+    from api.models.conversation import Conversation
+    from api.services.agent_turn import _persist_assistant_message
+    from api.websocket.manager import manager
+
+    async with AsyncSessionLocal() as db:
+        conv = (
+            await db.execute(
+                select(Conversation).where(
+                    Conversation.conversation_id == target.conversation_id,
+                    Conversation.project_id == target.project_id,
+                    Conversation.user_id == target.created_by,
+                    Conversation.status == "active",
+                )
+            )
+        ).scalar_one_or_none()
+        if conv is None:
+            _log.info(
+                "Skipping result delivery for schedule %s: conversation unavailable",
+                target.schedule_id,
+            )
+            return
+
+    if outcome.reply_persisted:
+        # The message row is already in the history; open sockets still need
+        # the refresh signal (nothing else sends one for a headless turn).
+        try:
+            await manager.send(
+                target.conversation_id, {"type": "conversation_updated"}
+            )
+        except Exception:  # noqa: BLE001 - delivery is best-effort
+            _log.exception(
+                "Could not notify scheduled result for schedule %s",
+                target.schedule_id,
+            )
+        return
+
+    claimed = False
+    for _ in range(5):
+        if await manager.claim_turn(target.conversation_id):
+            claimed = True
+            break
+        await asyncio.sleep(2)
+    if not claimed:
+        _log.info(
+            "Skipping result delivery for schedule %s: conversation busy",
+            target.schedule_id,
+        )
+        return
+
+    try:
+        async with AsyncSessionLocal() as db:
+            await _persist_assistant_message(
+                db,
+                target.conversation_id,
+                outcome.summary or outcome.error or "(no output)",
+                [],
+                agent_slug=None,
+                model_name=None,
+            )
+        await manager.send(
+            target.conversation_id, {"type": "conversation_updated"}
+        )
+    except Exception:  # noqa: BLE001 - delivery is best-effort
+        _log.exception(
+            "Could not deliver scheduled result to conversation %s",
+            target.conversation_id,
+        )
+    finally:
+        manager.release_turn(target.conversation_id)

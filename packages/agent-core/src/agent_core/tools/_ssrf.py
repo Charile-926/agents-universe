@@ -1,0 +1,246 @@
+"""SSRF protection — validate URLs and resolved IPs before outbound requests.
+
+Blocks:
+- Non-http(s) schemes
+- Private/loopback/link-local/multicast/metadata IP ranges (after DNS resolution)
+- Restricted ports
+- Excessive redirects (each hop re-validated)
+- Oversized responses
+"""
+from __future__ import annotations
+
+import ipaddress
+import re
+import socket
+from urllib.parse import urlparse
+
+# AWS/GCP/Azure metadata endpoints
+_METADATA_IPS = frozenset({
+    "169.254.169.254",
+    "fd00:ec2::254",
+    "metadata.google.internal",
+})
+
+_ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+# Frontend dev servers (Vite 5173/4173/5174, others) are legitimate targets
+# for browser/web_fetch tools even with SSRF_ENABLED=false — without them in
+# the allowlist an agent can never open its own dev frontend.
+_ALLOWED_PORTS = frozenset({80, 443, 8080, 8443, 8000, 3000, 5000, 9090, 5173, 4173, 5174})
+
+_MAX_REDIRECTS = 5
+
+_MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+class SSRFError(Exception):
+    """Raised when a URL or resolved IP fails SSRF validation."""
+    pass
+
+
+def _is_ip_blocked(ip_str: str) -> bool:
+    """Check if an IP address belongs to a blocked range."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True  # Unparseable = blocked
+
+    if addr.is_loopback:
+        return True
+    if addr.is_private:
+        return True
+    if addr.is_link_local:
+        return True
+    if addr.is_multicast:
+        return True
+    if addr.is_reserved:
+        return True
+    if addr.is_unspecified:
+        return True
+    # Any other non-public range: RFC 6598 shared space (100.64.0.0/10,
+    # including Alibaba Cloud's 100.100.100.200 metadata endpoint) is
+    # neither is_private nor is_link_local, so the checks above miss it.
+    if not addr.is_global:
+        return True
+
+    # IPv4-mapped IPv6 — check the embedded v4
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+        return _is_ip_blocked(str(addr.ipv4_mapped))
+
+    # Cloud metadata (169.254.169.254)
+    if ip_str in _METADATA_IPS:
+        return True
+
+    return False
+
+
+# Hostname strings glibc's inet_aton maps to real addresses even though
+# ipaddress.ip_address() rejects every one of them since Python 3.9.6:
+# integer ("2130706433" == 127.0.0.1), hex ("0x7f000001"), octal/leading-zero
+# dotted ("010.0.0.1" == 8.0.0.1), abbreviated ("127.1" == 127.0.0.1). A
+# literal-IP guard that only consults ipaddress calls these "hostnames" and
+# lets the request through — glibc's getaddrinfo then connects to the mapped
+# loopback/private/metadata address, defeating the always-on literal check
+# whenever SSRF_ENABLED skips DNS resolution (the default).
+_NUMERIC_HOST_RE = re.compile(r"^[0-9a-fA-FxX.]+$")
+
+
+def _idna_host(host: str) -> str:
+    """ASCII form of *host* under the IDNA codec getaddrinfo applies.
+
+    getaddrinfo encodes non-ASCII hostnames with the IDNA codec, which maps
+    the ideographic/fullwidth dot variants to "." and applies NFKC (fullwidth
+    digits become ASCII). Checking the raw string would call "127。0。0。1" a
+    hostname while the resolver connects to loopback.
+    """
+    if host.isascii():
+        return host
+    try:
+        return host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return host
+
+
+def _inet_aton_mapped(host: str) -> str | None:
+    """Dotted quad a numeric *host* resolves to under inet_aton semantics.
+
+    inet_aton accepts up to four dot-separated components (decimal, octal
+    when leading 0, hex with 0x), the last absorbing the remaining bytes:
+    "127.1" is 127.0.0.1, "2130706433" is 127.0.0.1, "2852039166" is
+    169.254.169.254 (the AWS metadata address). Returns None when *host* is
+    not an inet_aton-accepted form — i.e. a real hostname that DNS resolves
+    on its own.
+    """
+    if not host:
+        return None
+    # Resolve IDNA dot/digit variants before the numeric-shape check — they
+    # are "unicode hostnames" to a raw scan but plain dotted quads to the
+    # resolver.
+    host = _idna_host(host)
+    if len(host) > 64 or not _NUMERIC_HOST_RE.match(host):
+        return None
+    if host.startswith(".") or host.endswith(".") or ".." in host:
+        return None  # inet_aton rejects these; getaddrinfo then fails DNS — inert
+    parts = host.split(".")
+    if not 1 <= len(parts) <= 4:
+        return None
+    components: list[int] = []
+    for part in parts:
+        try:
+            if part.lower().startswith("0x"):
+                value = int(part[2:], 16)
+            elif len(part) > 1 and part.startswith("0"):
+                value = int(part, 8)
+            else:
+                value = int(part, 10)
+        except ValueError:
+            return None  # e.g. "08.0.0.1" — invalid octal, inet_aton fails
+        if value > 0xFFFFFFFF:
+            return None
+        components.append(value)
+    address = 0
+    for value in components[:-1]:
+        if value > 0xFF:
+            return None  # non-last components are bytes — inet_aton fails
+        address = (address << 8) | value
+    last = components[-1]
+    remaining = 4 - (len(components) - 1)
+    if last >= (1 << (8 * remaining)):
+        return None
+    address = (address << (8 * remaining)) | last
+    return str(ipaddress.IPv4Address(address))
+
+
+def validate_url(url: str, *, allow_any_port: bool = False) -> None:
+    """Validate URL scheme, host, and port BEFORE making a request.
+
+    Raises SSRFError if the URL is not safe to fetch.
+    This does NOT resolve DNS — call validate_resolved_ip() after resolution.
+    """
+    parsed = urlparse(url)
+
+    if parsed.scheme not in _ALLOWED_SCHEMES:
+        raise SSRFError(f"Blocked scheme: {parsed.scheme!r} (allowed: http, https)")
+
+    host = parsed.hostname
+    if not host:
+        raise SSRFError("URL has no hostname")
+
+    # Block metadata hostnames. Check the IDNA form too: fullwidth letters
+    # normalize to the ASCII name the resolver actually queries.
+    normalized_host = _idna_host(host)
+    if host.lower() in _METADATA_IPS or normalized_host.lower() in _METADATA_IPS:
+        raise SSRFError(f"Blocked metadata host: {host}")
+
+    # Check if host is a literal IP address
+    try:
+        ipaddress.ip_address(normalized_host)
+        # It IS an IP literal — validate it
+        if _is_ip_blocked(normalized_host):
+            raise SSRFError(f"Blocked IP in URL: {host}")
+    except ValueError:
+        # Not a canonical IP literal — but it may still be an inet_aton
+        # alternate form ipaddress rejects ("2130706433" is 127.0.0.1,
+        # "2852039166" is the AWS metadata address). glibc's getaddrinfo
+        # accepts these, so letting one through is an SSRF bypass whenever
+        # SSRF_ENABLED skips DNS resolution. Map and re-check.
+        mapped = _inet_aton_mapped(host)
+        if mapped is not None and _is_ip_blocked(mapped):
+            raise SSRFError(f"Blocked IP in URL: {host} (={mapped})")
+
+    # Port check — `parsed.port` raises ValueError on non-numeric
+    # or out-of-range ports ("http://h:abc/", "http://h:99999/"); callers
+    # catch SSRFError only, so the error escaped the tool and surfaced as a
+    # cryptic exception string. Normalize to the structured error.
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise SSRFError(f"Invalid port in URL: {exc}") from exc
+    if port is not None and not allow_any_port and port not in _ALLOWED_PORTS:
+        raise SSRFError(f"Blocked port: {port} (allowed: {sorted(_ALLOWED_PORTS)})")
+
+
+def validate_resolved_ip(ip_str: str, original_url: str = "") -> None:
+    """Validate a resolved IP address. Call after DNS resolution.
+
+    Raises SSRFError if the IP is in a blocked range.
+    """
+    if _is_ip_blocked(ip_str):
+        raise SSRFError(
+            f"DNS resolved to blocked IP: {ip_str}"
+            + (f" (from {original_url})" if original_url else "")
+        )
+
+
+def resolve_and_validate(hostname: str, port: int = 443) -> list[str]:
+    """Resolve hostname via DNS and validate all returned IPs.
+
+    Returns list of safe IP addresses.
+    Raises SSRFError if ALL resolved IPs are blocked, or resolution fails.
+    """
+    try:
+        results = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as e:
+        raise SSRFError(f"DNS resolution failed for {hostname}: {e}")
+
+    if not results:
+        raise SSRFError(f"DNS returned no results for {hostname}")
+
+    safe_ips = []
+    for family, _type, _proto, _canonname, sockaddr in results:
+        ip = sockaddr[0]
+        if not _is_ip_blocked(ip):
+            safe_ips.append(ip)
+
+    if not safe_ips:
+        blocked = [sockaddr[0] for _, _, _, _, sockaddr in results]
+        raise SSRFError(
+            f"All resolved IPs for {hostname} are blocked: {blocked}"
+        )
+
+    return safe_ips
+
+
+def validate_redirect(new_url: str, *, allow_any_port: bool = False) -> None:
+    """Validate a redirect target URL. Same rules as validate_url."""
+    validate_url(new_url, allow_any_port=allow_any_port)

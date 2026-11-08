@@ -1,0 +1,618 @@
+"""Scheduled-task router: CRUD, validation matrix, authorization, run-now."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pytest
+from sqlalchemy import select
+
+from api.models.conversation import Conversation
+from api.models.schedule import ScheduledTask, ScheduledTaskRun
+from api.models.script import AutomationScript
+
+
+async def _make_script(db, project_id: str, *, script_type: str = "python") -> AutomationScript:
+    script = AutomationScript(
+        project_id=project_id,
+        name="nightly",
+        script_type=script_type,
+        content="print('hi')",
+    )
+    db.add(script)
+    await db.commit()
+    await db.refresh(script)
+    return script
+
+
+async def _make_conversation(db, project_id: str, user_id: str = "test-user") -> Conversation:
+    conv = Conversation(project_id=project_id, user_id=user_id, title="target")
+    db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
+    return conv
+
+
+def _body(project, **overrides) -> dict:
+    body = {
+        "name": "nightly",
+        "target_type": "script",
+        "cron_expr": "0 9 * * *",
+        "timezone": "Asia/Shanghai",
+    }
+    body.update(overrides)
+    return body
+
+
+class TestCreate:
+    async def test_creates_script_task_with_next_run(self, client, db, make_project):
+        project = await make_project()
+        script = await _make_script(db, str(project.project_id))
+
+        resp = await client.post(
+            f"/api/projects/{project.project_id}/schedules",
+            json=_body(project, script_id=str(script.script_id)),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["target_type"] == "script"
+        assert data["script_id"] == str(script.script_id)
+        # 09:00 Asia/Shanghai == 01:00 UTC
+        assert datetime.fromisoformat(data["next_run_at"]) == datetime(
+            2026, 9, 10, 1, 0, tzinfo=timezone.utc
+        ) or datetime.fromisoformat(data["next_run_at"]).hour == 1
+
+    async def test_create_stores_only_the_active_target_fields(self, client, db, make_project):
+        # A form that posts every target field must not leave stale values on
+        # the row: a later PATCH that switches target_type would resurrect them.
+        project = await make_project()
+        script = await _make_script(db, str(project.project_id))
+
+        resp = await client.post(
+            f"/api/projects/{project.project_id}/schedules",
+            json=_body(
+                project,
+                script_id=str(script.script_id),
+                spec_slug="leftover-spec",
+                agent_slug="leftover-agent",
+                prompt="leftover prompt",
+            ),
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["script_id"] == str(script.script_id)
+        assert data["spec_slug"] is None
+        assert data["agent_slug"] is None
+        assert data["prompt"] is None
+
+    async def test_disabled_task_has_no_next_run(self, client, db, make_project):
+        project = await make_project()
+        script = await _make_script(db, str(project.project_id))
+        resp = await client.post(
+            f"/api/projects/{project.project_id}/schedules",
+            json=_body(project, script_id=str(script.script_id), enabled=False),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["next_run_at"] is None
+
+    async def test_list_scopes_to_project(self, client, db, make_project):
+        project = await make_project()
+        other = await make_project()
+        script = await _make_script(db, str(project.project_id))
+        await client.post(
+            f"/api/projects/{project.project_id}/schedules",
+            json=_body(project, script_id=str(script.script_id)),
+        )
+        resp = await client.get(f"/api/projects/{other.project_id}/schedules")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    @pytest.mark.parametrize("cron", ["", "not a cron", "0 9 * *", "99 9 * * *", "*/0 * * * *"])
+    async def test_rejects_invalid_cron(self, client, db, make_project, cron):
+        project = await make_project()
+        script = await _make_script(db, str(project.project_id))
+        resp = await client.post(
+            f"/api/projects/{project.project_id}/schedules",
+            json=_body(project, script_id=str(script.script_id), cron_expr=cron),
+        )
+        assert resp.status_code == 422
+
+    async def test_rejects_unknown_timezone(self, client, db, make_project):
+        project = await make_project()
+        script = await _make_script(db, str(project.project_id))
+        resp = await client.post(
+            f"/api/projects/{project.project_id}/schedules",
+            json=_body(project, script_id=str(script.script_id), timezone="Mars/Olympus"),
+        )
+        assert resp.status_code == 422
+
+    async def test_rejects_script_from_another_project(self, client, db, make_project):
+        project = await make_project()
+        other = await make_project()
+        foreign = await _make_script(db, str(other.project_id))
+        resp = await client.post(
+            f"/api/projects/{project.project_id}/schedules",
+            json=_body(project, script_id=str(foreign.script_id)),
+        )
+        assert resp.status_code == 422
+
+    async def test_rejects_playwright_anchor_as_script_target(self, client, db, make_project):
+        project = await make_project()
+        anchor = await _make_script(db, str(project.project_id), script_type="playwright")
+        resp = await client.post(
+            f"/api/projects/{project.project_id}/schedules",
+            json=_body(project, script_id=str(anchor.script_id)),
+        )
+        assert resp.status_code == 422
+
+    async def test_rejects_missing_playwright_spec(self, client, db, make_project):
+        project = await make_project()
+        resp = await client.post(
+            f"/api/projects/{project.project_id}/schedules",
+            json=_body(project, target_type="playwright", spec_slug="login-flow"),
+        )
+        assert resp.status_code == 422
+
+    async def test_accepts_existing_playwright_spec(self, client, db, make_project):
+        project = await make_project()
+        generated = (
+            __import__("pathlib").Path(__import__("os").environ["PROJECTS_ROOT"])
+            / project.slug / "tests" / "generated"
+        )
+        generated.mkdir(parents=True, exist_ok=True)
+        (generated / "login-flow.spec.ts").write_text("test.describe('login', () => {})")
+        resp = await client.post(
+            f"/api/projects/{project.project_id}/schedules",
+            json=_body(project, target_type="playwright", spec_slug="login-flow"),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["spec_slug"] == "login-flow"
+
+    async def test_agent_target_requires_prompt_and_known_slug(self, client, db, make_project):
+        project = await make_project()
+        conv = await _make_conversation(db, str(project.project_id))
+        resp = await client.post(
+            f"/api/projects/{project.project_id}/schedules",
+            json=_body(
+                project, target_type="agent", agent_slug="tech-lead",
+                prompt="   ", conversation_id=str(conv.conversation_id),
+            ),
+        )
+        assert resp.status_code == 422
+
+        resp = await client.post(
+            f"/api/projects/{project.project_id}/schedules",
+            json=_body(
+                project, target_type="agent", agent_slug="no-such-agent",
+                prompt="report", conversation_id=str(conv.conversation_id),
+            ),
+        )
+        assert resp.status_code == 422
+
+    async def test_agent_target_accepts_global_agent(self, client, db, make_project):
+        project = await make_project()
+        conv = await _make_conversation(db, str(project.project_id))
+        resp = await client.post(
+            f"/api/projects/{project.project_id}/schedules",
+            json=_body(
+                project, target_type="agent", agent_slug="tech-lead",
+                prompt="summarise yesterday's commits",
+                conversation_id=str(conv.conversation_id),
+            ),
+        )
+        assert resp.status_code == 200, resp.text
+
+    async def test_rejects_conversation_of_another_user(self, client, db, make_project, as_user):
+        project = await make_project()
+        foreign = await _make_conversation(db, str(project.project_id), user_id="someone-else")
+        async with as_user("test-user"):
+            resp = await client.post(
+                f"/api/projects/{project.project_id}/schedules",
+                json=_body(
+                    project, target_type="agent", agent_slug="tech-lead",
+                    prompt="hi", conversation_id=str(foreign.conversation_id),
+                ),
+            )
+        assert resp.status_code == 422
+
+    async def test_rejects_env_larger_than_column(self, client, db, make_project):
+        """env_json is Unicode(2000); 16 keys × 500-char values serializes to
+        ~8KB. The fire-time value cap never runs at author time, so without a
+        serialized-size check MSSQL raises DataError → 500 (SQLite stores it
+        silently and breaks later reads)."""
+        project = await make_project()
+        script = await _make_script(db, str(project.project_id))
+        big_env = {f"K{i:02d}": "x" * 250 for i in range(16)}  # ~4.3KB JSON
+
+        resp = await client.post(
+            f"/api/projects/{project.project_id}/schedules",
+            json=_body(project, script_id=str(script.script_id), env=big_env),
+        )
+        assert resp.status_code == 422, resp.text
+
+        created = (
+            await client.post(
+                f"/api/projects/{project.project_id}/schedules",
+                json=_body(project, script_id=str(script.script_id)),
+            )
+        ).json()
+        resp = await client.patch(
+            f"/api/schedules/{created['schedule_id']}", json={"env": big_env}
+        )
+        assert resp.status_code == 422, resp.text
+
+
+class TestUpdate:
+    async def test_patch_cron_recomputes_next_run(self, client, db, make_project):
+        project = await make_project()
+        script = await _make_script(db, str(project.project_id))
+        created = (
+            await client.post(
+                f"/api/projects/{project.project_id}/schedules",
+                json=_body(project, script_id=str(script.script_id)),
+            )
+        ).json()
+
+        resp = await client.patch(
+            f"/api/schedules/{created['schedule_id']}", json={"cron_expr": "*/5 * * * *"}
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["cron_expr"] == "*/5 * * * *"
+        assert resp.json()["next_run_at"] != created["next_run_at"]
+
+    async def test_disabling_clears_next_run(self, client, db, make_project):
+        project = await make_project()
+        script = await _make_script(db, str(project.project_id))
+        created = (
+            await client.post(
+                f"/api/projects/{project.project_id}/schedules",
+                json=_body(project, script_id=str(script.script_id)),
+            )
+        ).json()
+
+        resp = await client.patch(
+            f"/api/schedules/{created['schedule_id']}", json={"enabled": False}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["next_run_at"] is None
+        assert resp.json()["enabled"] is False
+
+    async def test_patch_name_keeps_target(self, client, db, make_project):
+        project = await make_project()
+        script = await _make_script(db, str(project.project_id))
+        created = (
+            await client.post(
+                f"/api/projects/{project.project_id}/schedules",
+                json=_body(project, script_id=str(script.script_id)),
+            )
+        ).json()
+        resp = await client.patch(
+            f"/api/schedules/{created['schedule_id']}", json={"name": "renamed"}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["name"] == "renamed"
+        assert resp.json()["script_id"] == str(script.script_id)
+
+    async def test_patch_name_preserves_overdue_next_run(
+        self, client, db, make_project
+    ):
+        """A cadence-untouched PATCH must not recompute next_run_at.
+
+        An occurrence that is already due (next_run_at <= now, scheduler tick
+        not yet claimed it) would otherwise be pushed a full period into the
+        future by an unrelated name/description edit — the imminent fire is
+        then silently lost.
+        """
+        from datetime import timedelta
+
+        project = await make_project()
+        script = await _make_script(db, str(project.project_id))
+        created = (
+            await client.post(
+                f"/api/projects/{project.project_id}/schedules",
+                json=_body(project, script_id=str(script.script_id)),
+            )
+        ).json()
+        # Whole seconds: some DATETIME dialects (MSSQL) truncate microseconds.
+        due_at = (datetime.now(timezone.utc) - timedelta(minutes=1)).replace(
+            microsecond=0
+        )
+        task = (
+            await db.execute(
+                select(ScheduledTask).where(
+                    ScheduledTask.schedule_id == created["schedule_id"]
+                )
+            )
+        ).scalar_one()
+        task.next_run_at = due_at
+        await db.commit()
+
+        resp = await client.patch(
+            f"/api/schedules/{created['schedule_id']}", json={"name": "renamed"}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["next_run_at"] == due_at.isoformat()
+
+    async def test_owner_can_disable_after_conversation_deleted(
+        self, client, db, make_project
+    ):
+        """The stored conversation is not re-validated on a cron/enabled PATCH
+        — the model says the task must outlive a deleted conversation, and the
+        owner must still be able to disable it after soft-deleting the
+        conversation (hard delete only exists via project cascade)."""
+        project = await make_project()
+        conv = await _make_conversation(db, str(project.project_id))
+        created = (
+            await client.post(
+                f"/api/projects/{project.project_id}/schedules",
+                json=_body(
+                    project, target_type="agent", agent_slug="tech-lead",
+                    prompt="go", conversation_id=str(conv.conversation_id),
+                ),
+            )
+        ).json()
+        conv.status = "deleted"
+        await db.commit()
+
+        resp = await client.patch(
+            f"/api/schedules/{created['schedule_id']}", json={"enabled": False}
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["enabled"] is False
+
+    async def test_teammate_can_patch_task_bound_to_owners_conversation(
+        self, client, db, make_project, as_user
+    ):
+        """Only authorize_project gates PATCH — the requester is not the task
+        owner. Re-validating the stored conversation against the requester's
+        user_id made every teammate PATCH 422 (only DELETE worked)."""
+        project = await make_project()
+        conv = await _make_conversation(db, str(project.project_id))
+        created = (
+            await client.post(
+                f"/api/projects/{project.project_id}/schedules",
+                json=_body(
+                    project, target_type="agent", agent_slug="tech-lead",
+                    prompt="go", conversation_id=str(conv.conversation_id),
+                ),
+            )
+        ).json()
+
+        async with as_user("teammate"):
+            resp = await client.patch(
+                f"/api/schedules/{created['schedule_id']}", json={"enabled": False}
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["enabled"] is False
+
+    async def test_explicit_rebind_still_validates_conversation(
+        self, client, db, make_project
+    ):
+        """An explicitly-changed conversation_id keeps create-time semantics:
+        it must be the task owner's own active conversation."""
+        project = await make_project()
+        conv = await _make_conversation(db, str(project.project_id))
+        created = (
+            await client.post(
+                f"/api/projects/{project.project_id}/schedules",
+                json=_body(
+                    project, target_type="agent", agent_slug="tech-lead",
+                    prompt="go", conversation_id=str(conv.conversation_id),
+                ),
+            )
+        ).json()
+        foreign = await _make_conversation(
+            db, str(project.project_id), user_id="someone-else"
+        )
+
+        resp = await client.patch(
+            f"/api/schedules/{created['schedule_id']}",
+            json={"conversation_id": str(foreign.conversation_id)},
+        )
+        assert resp.status_code == 422, resp.text
+
+
+class TestDeleteAndRuns:
+    async def test_delete_removes_task_and_history(self, client, db, make_project):
+        project = await make_project()
+        script = await _make_script(db, str(project.project_id))
+        created = (
+            await client.post(
+                f"/api/projects/{project.project_id}/schedules",
+                json=_body(project, script_id=str(script.script_id)),
+            )
+        ).json()
+
+        run = ScheduledTaskRun(
+            schedule_id=created["schedule_id"],
+            project_id=str(project.project_id),
+            trigger="schedule",
+            status="completed",
+        )
+        db.add(run)
+        await db.commit()
+
+        resp = await client.delete(f"/api/schedules/{created['schedule_id']}")
+        assert resp.status_code == 200
+        assert (await db.execute(
+            select(ScheduledTaskRun).where(ScheduledTaskRun.schedule_id == created["schedule_id"])
+        )).first() is None
+        assert (await db.execute(
+            select(ScheduledTask).where(ScheduledTask.schedule_id == created["schedule_id"])
+        )).first() is None
+
+    async def test_runs_history_is_returned(self, client, db, make_project):
+        project = await make_project()
+        script = await _make_script(db, str(project.project_id))
+        created = (
+            await client.post(
+                f"/api/projects/{project.project_id}/schedules",
+                json=_body(project, script_id=str(script.script_id)),
+            )
+        ).json()
+        db.add(ScheduledTaskRun(
+            schedule_id=created["schedule_id"],
+            project_id=str(project.project_id),
+            trigger="schedule",
+            status="failed",
+            error="boom",
+        ))
+        await db.commit()
+
+        resp = await client.get(f"/api/schedules/{created['schedule_id']}/runs")
+        assert resp.status_code == 200
+        rows = resp.json()
+        assert len(rows) == 1
+        assert rows[0]["status"] == "failed"
+        assert rows[0]["error"] == "boom"
+
+
+class TestRunNow:
+    async def test_run_now_launches_and_returns_run_id(
+        self, client, db, make_project, monkeypatch
+    ):
+        project = await make_project()
+        script = await _make_script(db, str(project.project_id))
+        created = (
+            await client.post(
+                f"/api/projects/{project.project_id}/schedules",
+                json=_body(project, script_id=str(script.script_id)),
+            )
+        ).json()
+
+        launched: list[tuple[str, str]] = []
+
+        async def fake_spawn(app, schedule_id, *, trigger):
+            launched.append((schedule_id, trigger))
+            return "run-123"
+
+        monkeypatch.setattr("api.services.scheduled_runs.spawn_run", fake_spawn)
+        resp = await client.post(f"/api/schedules/{created['schedule_id']}/run")
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"run_id": "run-123", "status": "pending"}
+        assert launched == [(created["schedule_id"], "manual")]
+
+    async def test_run_now_conflicts_when_busy(self, client, db, make_project, monkeypatch):
+        from api.services.scheduled_runs import ScheduleBusy
+
+        project = await make_project()
+        script = await _make_script(db, str(project.project_id))
+        created = (
+            await client.post(
+                f"/api/projects/{project.project_id}/schedules",
+                json=_body(project, script_id=str(script.script_id)),
+            )
+        ).json()
+
+        async def fake_spawn(app, schedule_id, *, trigger):
+            raise ScheduleBusy("Background execution queue is full")
+
+        monkeypatch.setattr("api.services.scheduled_runs.spawn_run", fake_spawn)
+        resp = await client.post(f"/api/schedules/{created['schedule_id']}/run")
+        assert resp.status_code == 409
+        # The 409 detail must carry the actual cause — a fixed "run in
+        # progress" would mislabel the queue-full rejection on an idle task.
+        detail = resp.json()["detail"]
+        assert detail["code"] == "SCHEDULE_BUSY"
+        assert detail["message"] == "Background execution queue is full"
+
+    async def test_run_now_returns_404_when_task_vanished(
+        self, client, db, make_project, monkeypatch
+    ):
+        """A concurrent delete between the router's _load_task and spawn_run's
+        re-select must surface as 404, not escape as a 500."""
+        from api.services.scheduled_runs import ScheduleNotFound
+
+        project = await make_project()
+        script = await _make_script(db, str(project.project_id))
+        created = (
+            await client.post(
+                f"/api/projects/{project.project_id}/schedules",
+                json=_body(project, script_id=str(script.script_id)),
+            )
+        ).json()
+
+        async def fake_spawn(app, schedule_id, *, trigger):
+            raise ScheduleNotFound(schedule_id)
+
+        monkeypatch.setattr("api.services.scheduled_runs.spawn_run", fake_spawn)
+        resp = await client.post(f"/api/schedules/{created['schedule_id']}/run")
+        assert resp.status_code == 404
+        detail = resp.json()["detail"]
+        assert detail["code"] == "SCHEDULE_NOT_FOUND"
+        assert detail["message"] == "Scheduled task not found"
+
+    async def test_run_now_skips_author_time_conversation_recheck(
+        self, client, db, make_project, monkeypatch
+    ):
+        """run-now revalidated the stored conversation as the requester even
+        though the runtime validates against target.created_by (and scheduled
+        fires never call _validate_target) — after a soft-delete the owner's
+        manual run 422'd instead of spawning."""
+        project = await make_project()
+        conv = await _make_conversation(db, str(project.project_id))
+        created = (
+            await client.post(
+                f"/api/projects/{project.project_id}/schedules",
+                json=_body(
+                    project, target_type="agent", agent_slug="tech-lead",
+                    prompt="go", conversation_id=str(conv.conversation_id),
+                ),
+            )
+        ).json()
+        conv.status = "deleted"
+        await db.commit()
+
+        async def fake_spawn(app, schedule_id, *, trigger):
+            return "run-9"
+
+        monkeypatch.setattr("api.services.scheduled_runs.spawn_run", fake_spawn)
+        resp = await client.post(f"/api/schedules/{created['schedule_id']}/run")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["run_id"] == "run-9"
+
+
+class TestPreview:
+    async def test_preview_returns_three_future_times(self, client, make_project):
+        project = await make_project()
+        resp = await client.post(
+            f"/api/projects/{project.project_id}/schedules/preview",
+            json={"cron_expr": "0 9 * * *", "timezone": "UTC"},
+        )
+        assert resp.status_code == 200, resp.text
+        runs = [datetime.fromisoformat(x) for x in resp.json()["next_runs"]]
+        assert len(runs) == 3
+        assert runs == sorted(runs)
+        assert all(r.hour == 9 for r in runs)
+
+    async def test_preview_rejects_invalid_expression(self, client, make_project):
+        project = await make_project()
+        resp = await client.post(
+            f"/api/projects/{project.project_id}/schedules/preview",
+            json={"cron_expr": "nope", "timezone": "UTC"},
+        )
+        assert resp.status_code == 422
+
+
+class TestAuthorization:
+    async def test_other_user_cannot_read_private_project_tasks(
+        self, client, db, make_project, as_user
+    ):
+        project = await make_project(created_by="owner", visibility="private")
+        script = await _make_script(db, str(project.project_id))
+        async with as_user("owner"):
+            created = (
+                await client.post(
+                    f"/api/projects/{project.project_id}/schedules",
+                    json=_body(project, script_id=str(script.script_id)),
+                )
+            ).json()
+
+        async with as_user("intruder"):
+            assert (await client.get(f"/api/schedules/{created['schedule_id']}")).status_code == 403
+            assert (await client.delete(f"/api/schedules/{created['schedule_id']}")).status_code == 403
+            assert (
+                await client.get(f"/api/schedules/{created['schedule_id']}/runs")
+            ).status_code == 403
+
+    async def test_unknown_schedule_is_404(self, client):
+        assert (await client.get("/api/schedules/does-not-exist")).status_code == 404

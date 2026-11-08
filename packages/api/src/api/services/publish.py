@@ -1,0 +1,400 @@
+"""Agent-as-a-Service runtime: SSE conversation orchestration for published agents.
+
+A published agent exposes its project resources to external callers over SSE.
+The conversation is owned by the *publisher* (``conversations.user_id =
+owner_id``) so every run — regardless of who calls — is attributed to and
+billed against the publisher's model config, and is marked
+``source='publish'`` so it never appears in the publisher's sidebar.
+
+Isolation: one conversation per ``(publish, viewer)`` on the embedded SSO
+page and per ``(publish, thread_id)`` on the API-key stream — never shared
+across publishes. The scope is stored in ``publish_id`` plus one of
+``viewer_id`` / ``thread_id`` on the conversation row.
+
+Security invariants (see credential-leak-redaction memory):
+
+- API keys are stored as SHA-256 hashes + a 4-char hint; the plaintext is
+  shown exactly once at issue time and never logged, echoed, or persisted.
+- Key comparison is constant-time (``hashlib.compare_digest``).
+- Non-interactive runs degrade to a readable error instead of blocking on a
+  human prompt (``interactive=False`` through the turn kernel).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import json
+import logging
+import secrets
+import uuid
+from dataclasses import dataclass, field
+
+from api.errors import api_error
+from sqlalchemy import case, select
+
+from api.json_utils import dumps as json_dumps
+
+_log = logging.getLogger("agents_universe.publish")
+
+# External key namespace prefix — the raw key carries the publish id so a
+# single lookup finds the right row without scanning all keys.
+_PUBLISH_KEY_PREFIX = "pua_"
+
+
+def generate_publish_key(publish_id: str) -> str:
+    """Return a fresh API key for *publish_id* (shown once to the publisher).
+
+    The key embeds the publish id as a routing hint: ``pua_<pubid>_<secret>``.
+    Only the SHA-256 of the full key is stored.
+    """
+    return f"{_PUBLISH_KEY_PREFIX}{publish_id}_{secrets.token_urlsafe(32)}"
+
+
+def hash_publish_key(key: str) -> str:
+    """SHA-256 of the full key, hex digest (compare via compare_digest)."""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def publish_key_hint(key: str) -> str:
+    """Last 4 chars of the secret tail for display."""
+    return "..." + key[-4:] if len(key) > 4 else "****"
+
+
+async def authenticate_publish_key(db, key: str):
+    """Resolve *key* to (publish_id, key_row) or None.
+
+    The key's ``pua_<publish_id>_`` prefix routes straight to the owning
+    publish; the stored SHA-256 hash is compared in constant time.
+    """
+    from sqlalchemy import select
+
+    from api.models.publish import PublishKey
+
+    if not key.startswith(_PUBLISH_KEY_PREFIX):
+        return None
+    try:
+        _, pubid, _ = key.split("_", 2)
+    except ValueError:
+        return None
+    if not pubid:
+        return None
+    result = await db.execute(
+        select(PublishKey).where(
+            PublishKey.publish_id == pubid,
+            PublishKey.is_active == True,  # noqa: E712
+        )
+    )
+    for row in result.scalars().all():
+        if hmac.compare_digest(row.key_hash, hash_publish_key(key)):
+            return pubid, row
+    return None
+
+
+@dataclass
+class SSEStream:
+    """Async-queue-backed SSE event stream handed to a turn as its transport.
+
+    ``run_turn`` pushes dict events here via ``send``; the HTTP handler drains
+    the queue into the ``text/event-stream`` response. The queue is bounded so
+    a slow client cannot balloon memory — if the client stalls past the
+    buffer, the turn's pushes drop (False) instead of blocking forever.
+    """
+
+    queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=256))
+
+    async def send(self, conversation_id: str, data: dict) -> bool:
+        try:
+            self.queue.put_nowait(data)
+            return True
+        except asyncio.QueueFull:
+            _log.warning("SSE queue full for %s — dropping event", conversation_id)
+            return False
+
+
+def sse_format(data: dict) -> str:
+    """Render a turn event as one SSE ``data:`` frame (JSON, no id/retry).
+
+    Turn events can carry datetimes (tool results, injected message
+    timestamps); the date-safe encoder keeps one such value from aborting the
+    whole response mid-stream.
+    """
+    return f"data: {json_dumps(data, ensure_ascii=False)}\n\n"
+
+
+async def _find_publish_conversation_id(
+    db, publish, *, viewer_id: str | None, thread_id: str | None
+) -> str | None:
+    """Latest active publish conversation for (publish, viewer) / (publish, thread).
+
+    Exactly one of viewer_id / thread_id must be given — the two surfaces
+    never mix, and the two namespaces stay structurally disjoint (a client
+    thread id can never collide with a viewer id because each lookup
+    predicates on exactly one column). Legacy rows whose scope columns are
+    NULL (created before the columns existed) never match. ORDER BY includes
+    conversation_id as a deterministic tiebreak so duplicates — see the race
+    note in get_or_create_publish_conversation — resolve stably.
+    """
+    from sqlalchemy import select
+
+    from api.models.conversation import Conversation
+
+    if (viewer_id is None) == (thread_id is None):
+        raise ValueError("provide exactly one of viewer_id / thread_id")
+    discriminator = (
+        Conversation.viewer_id == viewer_id
+        if viewer_id is not None
+        else Conversation.thread_id == thread_id
+    )
+    result = await db.execute(
+        select(Conversation.conversation_id)
+        .where(
+            Conversation.project_id == publish.project_id,
+            Conversation.user_id == publish.owner_id,
+            Conversation.source == "publish",
+            Conversation.status == "active",
+            Conversation.publish_id == str(publish.publish_id),
+            discriminator,
+        )
+        .order_by(Conversation.created_at.desc(), Conversation.conversation_id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_or_create_publish_conversation(
+    db, publish, *, viewer_id: str | None = None, thread_id: str | None = None,
+    title: str | None = None,
+) -> str:
+    """Return the conversation id for a published agent, creating it on first use.
+
+    Isolation is per (publish, viewer) on the embedded page and per (publish,
+    thread) on the API stream — one of viewer_id / thread_id must identify
+    the scope. ``source='publish'`` keeps the row out of the publisher's
+    sidebar; user_id = owner so the turn kernel's ownership checks pass and
+    history is attributed to the publisher.
+
+    Race note: the find-then-insert is not atomic (no unique constraint —
+    legacy NULL-scope rows make one dialect-infeasible). Concurrent first
+    loads for the same scope can insert duplicates; the lookup's
+    ORDER BY created_at DESC makes later calls converge on the newest row,
+    so an orphan self-heals and is never returned again.
+    """
+    from sqlalchemy import select
+
+    from api.models.agent import Agent
+    from api.models.conversation import Conversation
+
+    existing = await _find_publish_conversation_id(
+        db, publish, viewer_id=viewer_id, thread_id=thread_id
+    )
+    if existing:
+        return existing
+
+    # Resolve the agent's DB row; a project-scoped agent shadows the global
+    # row of the same slug (order via _publish_agent_scope_order — a bare
+    # scalar_one_or_none would raise MultipleResultsFound on such pairs).
+    result = await db.execute(
+        select(Agent)
+        .where(Agent.slug == publish.agent_slug)
+        .order_by(_publish_agent_scope_order())
+    )
+    agent = result.scalars().first()
+    agent_id = agent.agent_id if agent else None
+
+    conv = Conversation(
+        conversation_id=str(uuid.uuid4()),
+        project_id=publish.project_id,
+        agent_id=agent_id,
+        user_id=publish.owner_id,
+        source="publish",
+        publish_id=str(publish.publish_id),
+        viewer_id=viewer_id,
+        thread_id=thread_id,
+        title=title or publish.title or f"发布: {publish.agent_slug}",
+    )
+    db.add(conv)
+    await db.commit()
+    return str(conv.conversation_id)
+
+
+def _publish_agent_scope_order():
+    """Scope ordering for same-slug agent rows: the project-scoped row wins.
+
+    ``ORDER BY CASE WHEN project_id IS NULL THEN 1 ELSE 0 END`` sorts the
+    global row (NULL) last. CASE instead of a bare ``project_id IS NULL``
+    predicate: T-SQL rejects ORDER BY on a boolean expression (the same
+    pattern and reasoning as routers/knowledge.py's metadata ordering).
+    """
+    from api.models.agent import Agent
+
+    return case((Agent.project_id.is_(None), 1), else_=0)
+
+
+async def _get_publish_agent(db, publish) -> dict | None:
+    """Agent display row for a publish, or None when the definition vanished."""
+    from api.models.agent import Agent
+
+    result = await db.execute(
+        select(Agent)
+        .where(Agent.slug == publish.agent_slug)
+        .order_by(_publish_agent_scope_order())
+    )
+    agent = result.scalars().first()
+    if agent is None:
+        return None
+    # Locale map for the embedded page; the top-level fields stay canonical.
+    i18n: dict | None = None
+    if agent.i18n:
+        try:
+            data = json.loads(agent.i18n)
+            i18n = data if isinstance(data, dict) and data else None
+        except (json.JSONDecodeError, TypeError):
+            i18n = None
+    return {
+        "slug": agent.slug,
+        "display_name": agent.display_name,
+        "description": agent.description,
+        "project_id": agent.project_id,
+        "i18n": i18n,
+    }
+
+
+async def get_publish_viewer_payload(
+    db, publish, viewer_id: str, conversation_id: str | None
+) -> dict:
+    """Public page payload for a publish, scoped to the logged-in viewer.
+
+    Every run on the viewer's own publish conversation executes as the
+    publisher, so the conversation row (and its history) is attributed to
+    the publisher. The viewer NEVER owns it — instead they get a *viewer
+    token* that lets the /session endpoints resolve and run that
+    conversation. The token is derived from a server secret (not stored),
+    so there is nothing to leak or revoke. The conversation_id comes from
+    the caller (it already resolved the row); this function never re-queries
+    conversations, keeping the unscoped shared-row lookup out.
+    """
+    agent = await _get_publish_agent(db, publish)
+    return {
+        "publish_id": str(publish.publish_id),
+        "agent": agent,
+        "project_id": str(publish.project_id),
+        "title": publish.title,
+        "description": publish.description,
+        # Unused by the frontend; kept for payload-shape stability.
+        "has_conversation": bool(conversation_id),
+        # Token binding this viewer to their own publish conversation. The
+        # WS /session paths exchange it for run rights under the publisher.
+        "token": publish_viewer_token(str(publish.publish_id), viewer_id),
+    }
+
+
+def publish_viewer_token(publish_id: str, viewer_id: str) -> str:
+    """HMAC token proving *viewer_id* may open the publish conversation.
+
+    Derived from the server secret — the same secret used to sign the
+    WebSocket-cookie path. No DB storage; recomputed on every check.
+    """
+    import hashlib
+    import hmac
+
+    from api.config import get_settings
+
+    secret = get_settings().secret_key.encode("utf-8")
+    msg = f"publish:{publish_id}:viewer:{viewer_id}".encode("utf-8")
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()[:32]
+
+
+async def require_publish_project_open(db, publish, viewer_id: str | None) -> None:
+    """403 PROJECT_PRIVATE when the publish's project has gone private.
+
+    A private project exposes its resources only to its creator and whitelisted
+    members: the embed-page paths pass the logged-in viewer and let members
+    through, while the API-key stream has no identity at all and is cut off
+    outright (``viewer_id=None``). A missing project row (project hard-deleted
+    after publishing) keeps today's degraded behavior — this gate covers the
+    visibility flip only.
+    """
+    from api.models.project import Project
+
+    project = (await db.execute(
+        select(Project).where(Project.project_id == publish.project_id)
+    )).scalar_one_or_none()
+    if project is None or project.visibility != "private":
+        return
+    from api.dependencies.auth import PROJECT_PRIVATE_DENIED, has_project_access
+
+    if viewer_id is None or not await has_project_access(db, project, viewer_id):
+        raise api_error(403, "PROJECT_PRIVATE", PROJECT_PRIVATE_DENIED["message"])
+
+
+async def authorize_publish_viewer(
+    db, publish_id: str, viewer_id: str, token: str
+):
+    """Verify *token* opens *publish_id* for *viewer_id*; return the publish."""
+    from api.models.publish import AgentPublish
+
+    # hmac.compare_digest raises TypeError on non-ASCII str operands, and the
+    # token arrives from an unauthenticated query parameter.
+    if not isinstance(token, str) or not token.isascii():
+        return None
+    result = await db.execute(
+        select(AgentPublish).where(
+            AgentPublish.publish_id == publish_id,
+            AgentPublish.page_enabled == True,  # noqa: E712
+        )
+    )
+    publish = result.scalar_one_or_none()
+    if publish is None:
+        return None
+    if not hmac.compare_digest(publish_viewer_token(publish_id, viewer_id), token):
+        return None
+    # A token minted before the project flipped private must not keep opening
+    # the publish — re-check visibility on every /session call.
+    await require_publish_project_open(db, publish, viewer_id)
+    return publish
+
+
+async def _serialize_publish_messages(db, publish, conversation_id: str, limit: int = 500):
+    """Messages of a publish conversation in the frontend's serialized shape."""
+    from api.models.conversation import Message as DbMessage
+
+    result = await db.execute(
+        select(DbMessage)
+        .where(DbMessage.conversation_id == conversation_id)
+        .order_by(DbMessage.sequence_num.desc())
+        .limit(limit)
+    )
+    messages = list(result.scalars().all())
+    messages.reverse()
+    out = []
+    for m in messages:
+        # Same knowledge_refs split as routers/conversations.serialize_message
+        # — images/attachments/interrupted/error are keys INSIDE the refs
+        # object, and the flags must survive reloads on the publish page too.
+        refs = _parse_json_col(m.knowledge_refs, None)
+        out.append({
+            "message_id": str(m.message_id),
+            "role": m.role,
+            "content": m.content or "",
+            "agent_slug": m.agent_slug,
+            "model_name": m.model_name,
+            "tool_calls": _parse_json_col(m.tool_calls, []),
+            "images": refs and refs.get("images") or None,
+            "attachments": refs and refs.get("attachments") or None,
+            "interrupted": bool(refs and refs.get("interrupted")),
+            "error": bool(refs and refs.get("error")),
+            "sequence_num": m.sequence_num,
+            "created_at": m.created_at.isoformat(),
+        })
+    return out
+
+
+def _parse_json_col(raw, default):
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return default
