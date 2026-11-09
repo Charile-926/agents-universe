@@ -1,10 +1,8 @@
-"""Code executor tool - sandboxed Python/Bash subprocess with 30s timeout.
+"""代码执行工具——带 30 秒超时的沙箱 Python/Bash 子进程。
 
-Python code runs under a file-access audit-hook guard (agent_core.sandbox_guard)
-that restricts reads/writes to the project directory.  Bash code is validated
-line-by-line against the same path rules as the shell tool.  The working
-directory and scratch files live inside the project (.tmp/work/) so the guard
-covers them; no TEMP/TMP/TMPDIR injection.
+Python 代码在文件访问审计钩子守卫（agent_core.sandbox_guard）下运行，把读写
+限制在项目目录内。Bash 代码按与 shell 工具相同的路径规则逐行校验。工作目录和
+临时文件都位于项目内（.tmp/work/），因此守卫能覆盖它们；不注入 TEMP/TMP/TMPDIR。
 """
 from __future__ import annotations
 
@@ -43,32 +41,28 @@ _TIMEOUT = 30
 _PW_TIMEOUT = 120
 _MAX_OUTPUT = 20_000
 
-# Bash control-structure keywords whose lines are skipped during validation.
+# 校验期间跳过其所在行的 Bash 控制结构关键字。
 _BASH_CONTROL = frozenset({
     "if", "then", "else", "elif", "fi", "for", "do", "done",
     "while", "until", "case", "esac", "function", "select", "in",
     "{", "}", "!",
 })
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-# Bash assignment-prefix keywords: `export C=$(...)`, `local x=...`, etc.
-# perform the same assignment with command substitution as a bare `C=$(...)`,
-# so the validator must strip the prefix before the _ASSIGN_RE match below or
-# `export C=$(echo /etc/passwd)` skips the taint branch and `cat $C` expands
-# to an unvalidated absolute path. Optional single-letter flags are consumed
-# (`declare -p`, `readonly -a`).
+# Bash 赋值前缀关键字：`export C=$(...)`、`local x=...` 等，与裸 `C=$(...)`
+# 一样执行带命令替换的赋值，因此校验器必须在下方 _ASSIGN_RE 匹配前先剥离前缀，
+# 否则 `export C=$(echo /etc/passwd)` 会跳过污染分支，`cat $C` 展开为未校验的
+# 绝对路径。可选的单字母标志也一并消费（`declare -p`、`readonly -a`）。
 _ASSIGN_PREFIX_RE = re.compile(r"^(?:export|local|declare|typeset|readonly)(?:\s+-[A-Za-z]+)*\s+")
-# Scheme prefix of a proxy URL. The userinfo is peeled off with this instead of
-# urlparse because a scheme-less "user:pass@host:port" parses as scheme="user"
-# and the credential would be missed entirely.
+# 代理 URL 的协议前缀。用它而非 urlparse 来剥离用户信息，因为无协议的
+# "user:pass@host:port" 会被解析成 scheme="user"，凭证会被整个漏掉。
 _SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
 
 
 def _proxy_credential_variants(proxy_url: str) -> dict[str, str]:
-    """Substrings of a credentialed proxy URL that must never reach output.
+    """带凭证代理 URL 中绝不能出现在输出里的子串。
 
-    Ordered widest-first so the whole URL is replaced before its parts. A
-    username without a password is not treated as a secret: masking every
-    occurrence of a short name would garble unrelated output.
+    按最宽优先排序，使整个 URL 先于其各部分被替换。不带密码的用户名不视为密钥：
+    屏蔽短名称的每次出现会搅乱无关输出。
     """
     if not proxy_url or "@" not in proxy_url:
         return {}
@@ -81,8 +75,7 @@ def _proxy_credential_variants(proxy_url: str) -> dict[str, str]:
         "PROXY_CREDENTIALS": userinfo,
         "PROXY_PASSWORD": password,
     }
-    # Percent-encoded spellings reach error messages verbatim, and their
-    # decoded form leaks the credential the encoding was hiding.
+    # 百分号编码的拼写会原样进入错误消息，其解码形式会泄漏编码本想隐藏的凭证。
     decoded_userinfo = unquote(userinfo)
     if decoded_userinfo != userinfo:
         variants["PROXY_CREDENTIALS_DECODED"] = decoded_userinfo
@@ -93,25 +86,23 @@ def _proxy_credential_variants(proxy_url: str) -> dict[str, str]:
 
 
 def redact_proxy_credentials(text: str, proxy_url: str) -> str:
-    """Scrub a credentialed proxy URL out of tool-visible text.
+    """从工具可见文本中清洗带凭证的代理 URL。
 
-    Sandboxed code that prints its own environment — or a requests/httpx error
-    echoing the proxy it could not reach — would otherwise hand the credential
-    to the model and to the server log. Applied after decode and before
-    truncation; exact substring replacement, like shell.redact_secrets.
+    打印自身环境的沙箱代码——或回显其无法连接代理的 requests/httpx 错误——否则会
+    把凭证交给模型和服务器日志。在解码之后、截断之前应用；精确子串替换，同
+    shell.redact_secrets。
     """
     return redact_secrets(text, _proxy_credential_variants(proxy_url))
 
 
 def _live_payloads(text: str, *, quotes_literal: bool) -> list[str]:
-    r"""Substitution payloads bash will execute inside *text*.
+    r"""bash 会在 *text* 内执行的替换载荷。
 
-    ``quotes_literal=False`` is heredoc-body context: quotes are plain
-    characters there, so `$(...)` inside them still executes.``quotes_literal=True`` is shell-parsed context (a payload's own
-    content): single-quoted regions never execute and are skipped, while
-    double quotes do execute. Recursion into each payload matters because
-    an outer shlex pass keeps backslash escapes inside quotes —
-    `"$(c\url x)"` would otherwise hide `curl` from a single-level scan.
+    ``quotes_literal=False`` 是 heredoc 正文上下文：那里引号是普通字符，因此其中的
+    `$(...)` 仍会执行。``quotes_literal=True`` 是 shell 解析上下文（载荷自身的
+    内容）：单引号区域绝不执行并被跳过，双引号则会执行。递归进入每个载荷很重要，
+    因为外层 shlex 处理会保留引号内的反斜杠转义——否则 `"$(c\url x)"` 会让
+    单级扫描漏掉 `curl`。
     """
     payloads: list[str] = []
     i, n = 0, len(text)
@@ -123,13 +114,13 @@ def _live_payloads(text: str, *, quotes_literal: bool) -> list[str]:
         if quotes_literal and c == "'":
             end = text.find("'", i + 1)
             if end == -1:
-                break  # unterminated — bash syntax error, nothing executes
+                break  # 未闭合——bash 语法错误，没有东西执行
             i = end + 1
             continue
         if c == "`":
             end = text.find("`", i + 1)
             if end == -1:
-                break  # unterminated — _validate_substitutions fails closed first
+                break  # 未闭合——_validate_substitutions 先失败关闭
             payload = text[i + 1 : end]
             payloads.append(payload)
             payloads.extend(_live_payloads(payload, quotes_literal=True))
@@ -138,7 +129,7 @@ def _live_payloads(text: str, *, quotes_literal: bool) -> list[str]:
         if c == "$" and i + 1 < n and text[i + 1] == "(":
             close = _skip_subst_parens(text, i + 2)
             if close is None:
-                break  # unclosed — refused by _validate_substitutions
+                break  # 未闭合——被 _validate_substitutions 拒绝
             payload = text[i + 2 : close]
             payloads.append(payload)
             payloads.extend(_live_payloads(payload, quotes_literal=True))
@@ -189,57 +180,50 @@ class CodeExecutorTool(Tool):
         "required": ["code"],
     }
 
-    # ctypes is on the text blocklist (not the runtime import blocklist —
-    # pandas imports it internally); user code naming it explicitly is
-    # rejected, while library imports keep working.
+    # ctypes 在文本黑名单上（不在运行时导入黑名单——pandas 内部会导入它）；显式
+    # 点名它的用户代码被拒绝，而库的导入继续可用。
     _BLOCKED_IMPORTS = re.compile(
         r"\b(subprocess|os\.system|os\.popen|os\.execv|os\.execl|os\.fork|pty|ctypes|_ctypes|pexpect|fabric|invoke)\b"
     )
-    # Playwright mode allows subprocess (browser launch) but still blocks
-    # direct os.system/fork/pty/ctypes etc. The audit hook blocks the
-    # runtime calls regardless; this regex is the text-level first gate.
+    # Playwright 模式允许 subprocess（启动浏览器），但仍拦截直接的
+    # os.system/fork/pty/ctypes 等。审计钩子无论如何都会拦截运行时调用；该正则是
+    # 文本级的第一道门。
     _BLOCKED_IMPORTS_PW = re.compile(
         r"\b(os\.system|os\.popen|os\.execv|os\.execl|os\.fork|pty|ctypes|_ctypes|pexpect|fabric|invoke)\b"
     )
     _BLOCKED_BASH = re.compile(
-        # interpreters bypass the python-only audit hook (perl -e runs
-        # arbitrary code) and git reaches the network via GIT_SSH_COMMAND /
-        # credential helpers / proxies — this regex also gates scripts.py.
-        # Database clients (mysql/psql/redis-cli/mongosh/...) reach the
-        # compose-internal databases that hold session/secret data; bash mode
-        # has no socket audit hook, so they are blocked here like curl/wget.
+        # 解释器能绕过仅针对 Python 的审计钩子（perl -e 运行任意代码），git 经
+        # GIT_SSH_COMMAND / 凭证助手 / 代理访问网络——该正则也把关 scripts.py。
+        # 数据库客户端（mysql/psql/redis-cli/mongosh/...）能访问存放会话/密钥数据的
+        # compose 内部数据库；bash 模式没有套接字审计钩子，因此像 curl/wget 一样
+        # 在此拦截。
         r"\b(curl|wget|npx|npm|node|tsx|python3?|ssh|scp|rsync|nc|ncat|telnet|ftp|"
         r"mysql|mariadb|psql|redis-cli|redis-server|mongosh|mongo|"
         r"clickhouse-client|tsql|"
-        # shell/meta-programming words run arbitrary code as a prelude to
-        # reading host files — `eval "$(echo cat /etc/hostname)"`,
-        # `echo 'cat /etc/passwd' > x.sh; . x.sh`, `bash x.sh` all bypass the
-        # token checks while executing the payload for real. trap/alias/shopt
-        # are shell BUILTINS with the same power (trap 'cat /etc/passwd'
-        # EXIT runs at script end; alias + shopt -s expand_aliases runs
-        # aliased commands in non-interactive bash); xargs/dd smuggle the
-        # command/path construction into data tokens (`echo /etc/passwd |
-        # xargs cat`, `dd if=/etc/passwd`) the token checks never see.
+        # shell/元编程词在读取主机文件前先运行任意代码——`eval "$(echo cat
+        # /etc/hostname)"`、`echo 'cat /etc/passwd' > x.sh; . x.sh`、`bash x.sh`
+        # 都在真实执行载荷时绕过令牌检查。trap/alias/shopt 是具备同等能力的 shell
+        # 内建命令（trap 'cat /etc/passwd' EXIT 在脚本结束时运行；alias 加
+        # shopt -s expand_aliases 在非交互 bash 中运行别名命令）；xargs/dd 把
+        # 命令/路径构造偷渡进令牌检查看不到的数据令牌（`echo /etc/passwd | xargs
+        # cat`、`dd if=/etc/passwd`）。
         r"bash|sh|zsh|dash|ksh|fish|ash|eval|source|exec|command|builtin|env|"
         r"perl|ruby|php|git|socat|openssl|unset|trap|alias|shopt|xargs|dd)\b|"
-        # ANSI-C quoting ($'\x2fetc\x2fpasswd') hides '/' and '..' inside a
-        # token shlex never unescapes — bash decodes it into an absolute
-        # path at runtime, past every check.
+        # ANSI-C 引用（$'\x2fetc\x2fpasswd'）把 '/' 和 '..' 藏在 shlex 从不反转义的
+        # 令牌里——bash 在运行时把它解码成绝对路径，越过所有检查。
         r"\$\'|"
-        # dot command (`. script.sh`) is not a \b word — match it at start /
-        # after a separator only, so `./tool.sh` keeps working.
+        # 点命令（`. script.sh`）不是 \b 词——只在开头/分隔符之后匹配，使
+        # `./tool.sh` 继续可用。
         r"(?:^|[\s;|&])\.(?=\s|$)"
     )
 
     @classmethod
     def _payload_blocked_word(cls, text: str, *, quotes_literal: bool) -> str | None:
-        r"""Blocked word inside a live substitution payload of *text*, else None.
+        r"""*text* 的活替换载荷内的封禁词，没有则返回 None。
 
-        The line-level shlex keeps backslash escapes inside quotes, so
-        `"$(c\url x)"` hides `curl` from a whole-line search even though the
-        substitution executes it — walking the payloads separately sees the
-        unquoted inner text. Raises ValueError when a payload cannot be
-        tokenized (fail closed).
+        行级 shlex 保留引号内的反斜杠转义，因此 `"$(c\url x)"` 让整行搜索漏掉
+        `curl`，尽管替换会执行它——单独遍历载荷即可看到未加引号的内部文本。载荷无法
+        分词时抛 ValueError（失败关闭）。
         """
         for payload in _live_payloads(text, quotes_literal=quotes_literal):
             lexer = shlex.shlex(payload, posix=True)
@@ -252,17 +236,13 @@ class CodeExecutorTool(Tool):
 
     @classmethod
     def _find_blocked_bash(cls, code: str) -> str | None:
-        r"""The blocked word a bash script contains, else None.
+        r"""bash 脚本包含的封禁词，没有则返回 None。
 
-        Scan PER LOGICAL LINE and skip heredoc bodies: whole-code shlex
-        raised on an apostrophe in a heredoc body and the raw-text
-        fallback then missed a backslash-obfuscated command on a later
-        line (`c\url http://...`), which bash unescapes back to `curl`
-        and executes for real. Body lines are stdin data — their live
-        substitution payloads are checked by _validate_bash instead,
-        which knows whether the delimiter was quoted. Raises ValueError
-        when a line cannot be tokenized (fail closed). Shared with the
-        script runner.
+        按逻辑行扫描并跳过 heredoc 正文：整段代码的 shlex 会因 heredoc 正文里的
+        撇号报错，原始文本回退随后漏掉后一行上反斜杠混淆的命令（`c\url
+        http://...`），bash 会把它反转义回 `curl` 并真实执行。正文行是 stdin 数据
+        ——其活替换载荷改由 _validate_bash 检查，它知道定界符是否被引用。某行无法
+        分词时抛 ValueError（失败关闭）。与脚本运行器共享。
         """
         for logical, is_heredoc_body in split_logical_lines(code):
             if is_heredoc_body:
@@ -282,11 +262,9 @@ class CodeExecutorTool(Tool):
         code = params["code"]
         language = params.get("language", "python")
 
-        # The JSON-schema enum is advisory — a hand-built tool call can pass
-        # anything. Every guard below is keyed on the exact string, so an
-        # unknown value ("sh", "shell", "Bash") skipped them all and fell
-        # through to the bash branch: arbitrary shell with no blocklist, no
-        # path validation. Reject unknown values instead.
+        # JSON schema 的 enum 只是建议性的——手工构造的工具调用可传任何值。下方每个
+        # 守卫都以精确字符串为键，因此未知值（"sh"、"shell"、"Bash"）会跳过它们，
+        # 全部落到 bash 分支：没有黑名单、没有路径校验的任意 shell。改为拒绝未知值。
         if language not in ("python", "python-playwright", "bash"):
             return {"error": f"Unsupported language {language!r}. Use python, python-playwright or bash."}
 
@@ -295,19 +273,17 @@ class CodeExecutorTool(Tool):
         if language == "python-playwright" and self._BLOCKED_IMPORTS_PW.search(code):
             return {"error": "Code uses a blocked module (os.system, pty, ctypes, etc.). Use the shell tool for commands."}
         if language == "bash":
-            # ANSI-C quoting ($'\x2fetc\x2fpasswd') hides '/' and '..'
-            # inside a token that bash decodes at runtime — the shlex
-            # unescape below strips the quotes so the $'-pattern never
-            # matches, and the token checks see only decoded content. Check
-            # the RAW code; a literal `$'` text in a data echo is a rare
-            # false positive, fail-closed.
+            # ANSI-C 引用（$'\x2fetc\x2fpasswd'）把 '/' 和 '..' 藏在 bash 运行时才
+            # 解码的令牌里——下方 shlex 反转义会剥离引号，使 $'-模式永远匹配不上，
+            # 令牌检查只看到解码内容。检查原始代码；数据 echo 里字面 `$'` 文本是罕见
+            # 误报，失败关闭。
             if "$'" in code:
                 return {"error": "Bash code_executor is for data processing only. ANSI-C quoting ($'...') is not allowed."}
             # \b-word 正则跑在原始代码上可被反斜杠混淆绕过（`c\url ...` 中
             # "curl" 不是连续子串，但 bash 执行时反斜杠转义还原出真正的
             # `curl`）。先按 shlex 还原转义再匹配，堵住该旁路。
-            # A line that cannot be tokenized is refused (see
-            # _find_blocked_bash for the per-line / heredoc-body rationale).
+            # 无法分词的行会被拒绝（逐行/heredoc 正文的理由见
+            # _find_blocked_bash）。
             try:
                 blocked = self._find_blocked_bash(code)
             except ValueError:
@@ -317,19 +293,17 @@ class CodeExecutorTool(Tool):
 
         project_cwd = Path(context.project_fs_path)
 
-        # Validate bash code for path escapes before spawning.  Command
-        # substitution is allowed here (unlike the shell tool) because it is
-        # common in data-processing snippets and _BLOCKED_BASH already strips
-        # the external commands that could abuse it.
+        # 启动前校验 bash 代码是否存在路径越界。这里允许命令替换（与 shell 工具不同），
+        # 因为它在数据处理片段中很常见，且 _BLOCKED_BASH 已剥离可能滥用它的外部
+        # 命令。
         if language == "bash":
             reason = self._validate_bash(code, project_cwd)
             if reason:
                 return {"error": reason}
 
-        # Scratch directory inside the project (.tmp/work/) so the Python
-        # file-access guard covers script files and image outputs.  Cleaned up
-        # in finally.  No TEMP/TMP/TMPDIR injection - the user explicitly
-        # requested the temp dir stay inside the project.
+        # 项目内的临时目录（.tmp/work/），使 Python 文件访问守卫能覆盖脚本文件和
+        # 图片输出。在 finally 中清理。不注入 TEMP/TMP/TMPDIR——用户明确要求临时目录
+        # 留在项目内。
         work_dir = project_cwd / ".tmp" / "work" / f"code-{uuid.uuid4().hex[:8]}"
         try:
             work_dir.mkdir(parents=True, exist_ok=True)
@@ -338,36 +312,32 @@ class CodeExecutorTool(Tool):
 
             if language in ("python", "python-playwright"):
                 code_file = work_dir / "script.py"
-                # newline="" out on Windows: text-mode write_text would
-                # translate \n to \r\n, and a bash script read back on Linux
-                # (or in Git Bash/WSL) chokes on the trailing \r in command
-                # names and file paths.
+                # Windows 上用 newline="\n"：文本模式 write_text 会把 \n 转成
+                # \r\n，而在 Linux（或 Git Bash/WSL）回读的 bash 脚本会因命令名和
+                # 文件路径里的尾随 \r 出错。
                 code_file.write_text(code, encoding="utf-8", newline="\n")
                 cmd = [sys.executable, str(code_file)]
-            else:  # bash — the only remaining value after the guard above
-                # Bash runs from a script FILE (not `bash -s` via stdin) so the
-                # script's own stdin stays free: a bare `cat`/`read` gets EOF
-                # instead of swallowing the remaining script lines.  The path
-                # is relative to the cwd (project root) so it works identically
-                # in Linux bash, Git Bash, and WSL — no drive-letter mapping.
+            else:  # bash——上面守卫之后唯一剩下的值
+                # Bash 从脚本“文件”运行（而非经 stdin 的 `bash -s`），使脚本自身的
+                # stdin 保持空闲：裸 `cat`/`read` 得到 EOF，而不是吞掉剩余脚本行。
+                # 路径相对 cwd（项目根），在 Linux bash、Git Bash 和 WSL 中行为一致
+                # ——无需盘符映射。
                 code_file = work_dir / "script.sh"
                 code_file.write_text(code, encoding="utf-8", newline="\n")
                 cmd = ["bash", code_file.relative_to(project_cwd).as_posix()]
 
-            # safe_env() strips SECRET_KEY, DB connection strings, etc.
-            # python_guard_env arms the sitecustomize audit hook in the child
-            # (strict=True denies subprocess.Popen calls, matching the
-            # _BLOCKED_PYTHON regex above as a second layer; subprocess import
-            # stays allowed so matplotlib/pandas keep working).
+            # safe_env() 剥离 SECRET_KEY、数据库连接字符串等。
+            # python_guard_env 在子进程中武装 sitecustomize 审计钩子（strict=True
+            # 拒绝 subprocess.Popen 调用，作为第二层与上面的 _BLOCKED_PYTHON 正则
+            # 对应；subprocess 导入仍允许，使 matplotlib/pandas 继续工作）。
             extra: dict[str, str] = {
                 "OUTPUT_DIR": str(output_dir),
                 "PROJECT_DIR": str(project_cwd),
             }
-            # Network policy follows the SANDBOX_NETWORK config (see
-            # .env.example): unset/empty -> allow all network (Playwright
-            # downloads, screen recording, ...); localhost -> loopback only;
-            # none -> all sockets blocked. Only a restricting mode needs to
-            # be passed down; "all" is the sitecustomize default.
+            # 网络策略遵循 SANDBOX_NETWORK 配置（见 .env.example）：未设置/空——
+            # 允许所有网络（Playwright 下载、屏幕录制……）；localhost——仅环回；
+            # none——阻断所有套接字。只有限制模式需要向下传递；"all" 是
+            # sitecustomize 默认。
             network_mode = (context.cfg("SANDBOX_NETWORK") or "").strip().lower()
             if language == "python":
                 extra["HOME"] = str(work_dir)
@@ -375,50 +345,43 @@ class CodeExecutorTool(Tool):
                 if network_mode in ("localhost", "none"):
                     extra["_AGENT_NETWORK_MODE"] = network_mode
             elif language == "python-playwright":
-                # Keep the real HOME so Playwright finds browser binaries
-                # (PLAYWRIGHT_BROWSERS_PATH is inherited from the Docker ENV).
-                # Non-strict: allow subprocess.Popen for browser launching.
-                # Network follows SANDBOX_NETWORK (default: allow all).
+                # 保留真实 HOME，使 Playwright 能找到浏览器二进制（PLAYWRIGHT_BROWSERS_PATH
+                # 从 Docker ENV 继承）。非严格：允许 subprocess.Popen 以启动浏览器。
+                # 网络遵循 SANDBOX_NETWORK（默认：允许所有）。
                 extra.update(python_guard_env(project_cwd, strict=False))
                 if network_mode in ("localhost", "none"):
                     extra["_AGENT_NETWORK_MODE"] = network_mode
             else:  # bash
-                # Inheriting the real HOME hands the sandbox the host's dotfiles
-                # (.aws/.azure/.ssh), and bash's $HOME is on the
-                # project-internal path whitelist (_SAFE_ENV_PATH_VARS) — that
-                # whitelist is only sound when HOME actually points inside the
-                # project. Point it at the scratch dir, like python does.
+                # 继承真实 HOME 会把主机的点文件（.aws/.azure/.ssh）交给沙箱，而
+                # bash 的 $HOME 在项目内路径白名单（_SAFE_ENV_PATH_VARS）上——该
+                # 白名单只有在 HOME 确实指向项目内时才可靠。像 python 一样把它指向
+                # 临时目录。
                 extra["HOME"] = str(work_dir)
 
-            # Proxy env comes after safe_env() because a merge can only set
-            # values, never delete the empty HTTPS_PROXY placeholder or evict a
-            # conflicting inherited spelling. Every network mode gets the same
-            # proxy as the browser tool — SANDBOX_NETWORK decides which sockets
-            # the guard allows, not which proxy the process is configured with.
-            # A Chromium the code launches itself does NOT read these vars
-            # (Playwright only honors an explicit launch(proxy=...) kwarg), but
-            # requests/httpx/urllib and child processes do.
+            # 代理环境在 safe_env() 之后处理，因为合并只能设置值，无法删除空的
+            # HTTPS_PROXY 占位符或驱逐冲突的继承拼写。每个网络模式都拿到与浏览器工具
+            # 相同的代理——由 SANDBOX_NETWORK 决定守卫允许哪些套接字，而非进程配置
+            # 哪个代理。代码自己启动的 Chromium 不读这些变量（Playwright 只认显式的
+            # launch(proxy=...) 参数），但 requests/httpx/urllib 和子进程会读。
             proxy_url = context.proxy_url()
             env = context.proxy_env(context.safe_env(extra=extra))
 
-            # Bound before the await: a cancellation delivered while
-            # create_subprocess_exec is still awaiting would otherwise hit the
-            # except handlers with `proc` unbound, replacing the
-            # CancelledError with an UnboundLocalError (the run then could not
-            # be cancelled cleanly).
+            # 在 await 之前绑定：否则在 create_subprocess_exec 仍在等待时送达的取消，
+            # 会带着未绑定的 `proc` 命中 except 处理，用 UnboundLocalError 取代
+            # CancelledError（运行随后无法干净地取消）。
             proc: asyncio.subprocess.Process | None = None
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
-                    # DEVNULL stdin: scripts reading stdin get a clean EOF,
-                    # matching "run a script file" semantics.
+                    # stdin 用 DEVNULL：读 stdin 的脚本得到干净 EOF，符合“运行脚本
+                    # 文件”的语义。
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=str(project_cwd),
                     env=env,
-                    # Own session on POSIX so a forked/backgrounded
-                    # grandchild dies with the tree on timeout/abort.
+                    # POSIX 上用独立会话，使分叉/后台的孙进程在超时/中止时随进程树
+                    # 一起终止。
                     **spawn_in_new_session(),
                 )
                 timeout = _PW_TIMEOUT if language == "python-playwright" else _TIMEOUT
@@ -430,8 +393,8 @@ class CodeExecutorTool(Tool):
                 _log.warning("code_executor timed out after %ds (language=%s)", timeout, language)
                 return {"error": f"Execution timed out after {timeout}s", "exit_code": -1}
             except asyncio.CancelledError:
-                # Task cancelled: kill the child before its finally-rmtree of
-                # work_dir (a live child would hold the script file open).
+                # 任务取消：在子进程 finally 里 rmtree work_dir 之前先杀掉它（存活
+                # 子进程会让脚本文件保持打开）。
                 if proc is not None:
                     terminate_process_tree(proc)
                     await proc.wait()
@@ -440,9 +403,8 @@ class CodeExecutorTool(Tool):
                 _log.warning("code_executor failed to start subprocess: %s", exc)
                 return {"error": f"Failed to start code execution: {exc}"}
 
-            # Redact before truncation so a proxy credential straddling the
-            # _MAX_OUTPUT boundary is fully masked; the log line below reads
-            # the same scrubbed text.
+            # 在截断之前脱敏，使跨越 _MAX_OUTPUT 边界的代理凭证被完整屏蔽；下方日志
+            # 行读取同一清洗后的文本。
             stdout_text = redact_proxy_credentials(
                 stdout.decode(errors="replace"), proxy_url)[:_MAX_OUTPUT]
             stderr_text = redact_proxy_credentials(
@@ -451,11 +413,9 @@ class CodeExecutorTool(Tool):
                 _log.warning("code_executor failed (exit=%d, language=%s)\nstderr: %s",
                              proc.returncode, language, stderr_text[:500])
 
-            # Collect outputs from the isolated output directory: PNGs surface
-            # as images, everything else as downloadable attachments. Names
-            # are server-generated (the media whitelist rejects spaces and
-            # unicode — the sandboxed code can write any filename), the
-            # original name rides in the record's `name` field.
+            # 从隔离的输出目录收集产物：PNG 以图片呈现，其他一切作为可下载附件。
+            # 名称由服务器生成（媒体白名单拒绝空格和 unicode——沙箱代码可写任意
+            # 文件名），原始名放在记录的 `name` 字段里。
             images: list[dict[str, str]] = []
             files: list[dict[str, Any]] = []
             media_path = Path(context.conversation_media_dir)
@@ -497,34 +457,29 @@ class CodeExecutorTool(Tool):
             shutil.rmtree(work_dir, ignore_errors=True)
 
     # ------------------------------------------------------------------
-    # Bash validation
+    # Bash 校验
     # ------------------------------------------------------------------
 
     @staticmethod
     def _validate_bash(code: str, project_root: Path) -> str | None:
-        """Best-effort line-by-line path-escape check for bash scripts.
+        """对 bash 脚本做尽力而为的逐行路径越界检查。
 
-        Skips comments, control-structure keywords, variable assignments, and
-        heredoc bodies.  Physical lines whose quotes don't close are joined
-        with the following lines first — a quoted string may legitimately
-        span multiple lines.  Command substitution is allowed (the
-        _BLOCKED_BASH regex already strips external commands that could abuse
-        it); the remaining path tokens are checked by validate_command.
+        跳过注释、控制结构关键字、变量赋值和 heredoc 正文。引号未闭合的物理行先与
+        后续行拼接——带引号字符串可合法跨多行。允许命令替换（_BLOCKED_BASH 正则
+        已剥离可能滥用它的外部命令）；剩余路径令牌由 validate_command 检查。
         """
         in_heredoc = False
         heredoc_delim: str | None = None
         heredoc_quoted = False
         buffer = ""
         buffer_start = 0
-        # Variable names whose values were captured from command substitution
-        # (`x=$(echo /etc/passwd)`). Later path positions using them expand to
-        # anything at runtime — validate_command rejects those references.
+        # 值从命令替换捕获的变量名（`x=$(echo /etc/passwd)`）。之后在路径位置使用
+        # 它们时，运行时会展开为任意内容——validate_command 拒绝这些引用。
         tainted: set[str] = set()
-        # Variable names assigned on earlier lines of this script. Seeded into
-        # each per-line validate_command so `d=data` on line 1 still satisfies
-        # the assigned-path-prefix rule on line 3 (`cat $d/x`); every value was
-        # validated when its assignment line passed (_check_simple rejects
-        # `..` and absolute paths), so carrying the name forward is safe.
+        # 本脚本更早行上赋值的变量名。注入每次逐行 validate_command，使第 1 行的
+        # `d=data` 仍能在第 3 行满足已赋值路径前缀规则（`cat $d/x`）；每个值在其
+        # 赋值行通过时都已校验（_check_simple 拒绝 `..` 和绝对路径），因此向前
+        # 携带该名安全。
         assigned: set[str] = set()
         lines = code.splitlines()
         idx = 0
@@ -538,18 +493,14 @@ class CodeExecutorTool(Tool):
                     heredoc_delim = None
                     heredoc_quoted = False
                     continue
-                # an UNQUOTED heredoc body runs command substitution
-                # when bash executes it — `cat <<EOF` + `$(cat /app/.env)` in
-                # the body previously sailed through because body lines were
-                # skipped wholesale. Quoted delimiters (<<'EOF') are literal
-                # and safe to skip.
+                # 未加引号的 heredoc 正文在 bash 执行时会运行命令替换——`cat <<EOF`
+                # 加正文里的 `$(cat /app/.env)` 之前因正文行被整体跳过而蒙混过关。
+                # 引用定界符（<<'EOF'）是字面量，跳过安全。
                 if not heredoc_quoted:
-                    # Single quotes are plain characters in a heredoc body —
-                    # $(...) inside them still executes, so scan them. bash
-                    # joins backslash-newline in an unquoted body too (and a
-                    # continuation target is not delimiter-checked), so merge
-                    # continuation lines before the scan: `$(cat \` + the
-                    # `/etc/passwd)` line must be checked as one substitution.
+                    # 单引号在 heredoc 正文里是普通字符——其中的 $(...) 仍执行，
+                    # 因此要扫描。bash 也会在未加引号正文里拼接反斜杠-换行（且续接
+                    # 目标不做定界符检查），所以扫描前先合并续接行：`$(cat \` 加
+                    # `/etc/passwd)` 行必须作为一个替换整体检查。
                     body = line
                     while ends_with_continuation(body) and idx < len(lines):
                         body = body[:-1] + lines[idx]
@@ -559,13 +510,11 @@ class CodeExecutorTool(Tool):
                     )
                     if reason:
                         return reason
-                    # Body lines are skipped by _find_blocked_bash (they are
-                    # stdin data), but an unquoted body's $(...) / backticks
-                    # execute for real — and bash mode has no socket audit
-                    # hook, so `$(curl ...)` or `$(python ...)` planted here
-                    # would reach the network / an unguarded interpreter past
-                    # the blocklist. Scan the payloads only: the surrounding
-                    # data words are still not commands.
+                    # 正文行被 _find_blocked_bash 跳过（它们是 stdin 数据），但未加
+                    # 引号正文的 $(...) / 反引号会真实执行——bash 模式没有套接字审计
+                    # 钩子，因此埋在这里的 `$(curl ...)` 或 `$(python ...)` 会越过
+                    # 黑名单访问网络/未守卫的解释器。只扫描载荷：周围的数据词仍不是
+                    # 命令。
                     reason = CodeExecutorTool._blocked_substitutions(body)
                     if reason:
                         return reason
@@ -578,30 +527,24 @@ class CodeExecutorTool(Tool):
                 buffer = ""
                 continue
             if has_unclosed_quote(candidate):
-                # Multi-line quoted string — accumulate and retry with the
-                # next physical line before validating.
+                # 多行带引号字符串——先累积，在校验前与下一物理行重试。
                 buffer = candidate
                 continue
             buffer = ""
-            # Detect heredoc start to skip body lines on subsequent iterations.
-            # A line-wide regex search matched "<<EOF" INSIDE quotes
-            # (`echo "x <<EOF"`) and put the following lines in heredoc-skip
-            # mode while bash ran them for real — arbitrary commands escaped
-            # validation. _find_heredoc_start scans the raw line with quote
-            # tracking, and also captures the delimiter's quoted flag: a
-            # quoted delimiter (<<'EOF') makes the body literal, so its
-            # $(...) must not be treated as executable.
+            # 检测 heredoc 开始，以便后续迭代跳过正文行。整行正则搜索会匹配引号
+            # “内”的 "<<EOF"（`echo "x <<EOF"`），在 bash 真实运行后续行时把它们
+            # 置于 heredoc 跳过模式——任意命令逃过校验。_find_heredoc_start 用引号
+            # 跟踪扫描原始行，同时捕获定界符的引用标志：引用定界符（<<'EOF'）使
+            # 正文成为字面量，因此其 $(...) 不得当作可执行。
             heredoc = _find_heredoc_start(stripped)
             if heredoc is not None:
                 heredoc_delim, heredoc_quoted = heredoc
                 in_heredoc = True
             first_word = stripped.split()[0].rstrip(";")
             if first_word in _BASH_CONTROL:
-                # Control-structure lines used to skip validation wholesale —
-                # but their bodies execute for real: `for i in $(cat
-                # ../sibling/.env)` and `do cat ../x; done` both bypassed the
-                # path checks (the control keywords themselves validate as
-                # plain in-project tokens, so the full-line check is safe).
+                # 控制结构行过去被整体跳过校验——但其正文会真实执行：`for i in
+                # $(cat ../sibling/.env)` 和 `do cat ../x; done` 都绕过了路径检查
+                # （控制关键字本身作为普通项目内令牌校验，因此整行检查安全）。
                 reason = validate_command(
                     stripped,
                     cwd=project_root,
@@ -613,73 +556,58 @@ class CodeExecutorTool(Tool):
                 if reason:
                     return f"Line {buffer_start}: {reason}\n  -> {stripped}"
                 continue
-            # `export C=$(...)` / `local x=...` are assignments too — strip the
-            # prefix so `export C=$(echo /etc/passwd)` cannot skip the taint
-            # branch (its `$C` would then expand past validation).
+            # `export C=$(...)` / `local x=...` 也是赋值——剥离前缀，使
+            # `export C=$(echo /etc/passwd)` 无法跳过污染分支（否则其 `$C` 会越过
+            # 校验展开）。
             assign_body = _ASSIGN_PREFIX_RE.sub("", stripped) if _ASSIGN_PREFIX_RE.match(stripped) else stripped
             if _ASSIGN_RE.match(assign_body):
-                # assignment lines are skipped wholesale, but
-                # `X=$(cat /app/.env)` performs command substitution — the
-                # payload must be validated like any other command. The rest
-                # of the line still runs (`x=$(echo /etc/passwd); cat $x`
-                # puts the captured value into a path argument), so the whole
-                # line goes through validate_command with substitution-captured
-                # names tracked as tainted.
+                # 赋值行被整体跳过，但 `X=$(cat /app/.env)` 执行命令替换——载荷必须
+                # 像任何其他命令一样校验。该行其余部分仍运行（`x=$(echo /etc/passwd);
+                # cat $x` 把捕获值放进路径参数），因此整行经 validate_command，
+                # 替换捕获的名作为污染跟踪。
                 reason = CodeExecutorTool._validate_substitutions(stripped, buffer_start, project_root)
                 if reason:
                     return reason
                 try:
-                    # Quote-aware tokens: `a="x y" b=$t` must yield two
-                    # assignments — plain whitespace split would cut at the
-                    # space inside the quotes, drop out of the loop at `y"`,
-                    # and leave `b` untracked for `cat $b` to slip through.
+                    # 引号感知令牌：`a="x y" b=$t` 必须产生两个赋值——普通空白
+                    # 拆分行会在引号内空格处切断，在 `y"` 处退出循环，让 `b` 未被
+                    # 跟踪，使 `cat $b` 溜过。
                     assign_tokens = shlex.split(stripped)
                 except ValueError:
-                    # Unclosed quote — the line is a bash syntax error and
-                    # validate_command rejects it below; nothing to taint.
+                    # 未闭合引号——该行是 bash 语法错误，validate_command 会在下方
+                    # 拒绝；没有东西需要污染。
                     assign_tokens = []
                 for tok in assign_tokens:
                     if not _ASSIGN_RE.match(tok):
-                        # Not an assignment — a payload word (`hi)` glued by
-                        # shlex to `x=$(echo hi)`) or a command token; keep
-                        # scanning so a later assignment on the same line is
-                        # still tracked (`x=$(echo hi) C=$(echo /etc/passwd)`
-                        # must taint C).
+                        # 不是赋值——被 shlex 粘到 `x=$(echo hi)` 上的载荷词
+                        # （`hi)`）或命令令牌；继续扫描，使同行稍后的赋值仍被跟踪
+                        # （`x=$(echo hi) C=$(echo /etc/passwd)` 必须污染 C）。
                         continue
-                    # `export x=/etc/passwd` — the NAME= prefix dissolves the
-                    # absolute-path scan when the token validates as a plain
-                    # positional (the prefix is the whole token's leading
-                    # segment). The VALUE must pass assignment validation:
-                    # absolute/tilde/`..` paths and untracked variable
-                    # references are rejected, and the name only gets
-                    # "assigned" status on a clean value.
+                    # `export x=/etc/passwd`——当令牌作为普通位置参数校验时，NAME=
+                    # 前缀会消解绝对路径扫描（前缀是整个令牌的开头段）。值必须通过
+                    # 赋值校验：绝对/波浪号/`..` 路径和未跟踪变量引用被拒绝，且只有
+                    # 值干净时该名才获得“已赋值”状态。
                     reason = _check_assignment(tok, allow_dollar=True,
                                                assigned_vars=assigned)
                     if reason:
                         return f"Line {buffer_start}: {reason}\n  -> {stripped}"
                     name, _, value = tok.partition("=")
-                    # shlex (no punctuation_chars) glues a command separator
-                    # onto the token (`x=;`, `x=a&&b`) — bash parses it as a
-                    # boundary, so `x=;` IS an empty assignment and must not
-                    # grant "assigned" status.
+                    # shlex（无 punctuation_chars）会把命令分隔符粘到令牌上
+                    # （`x=;`、`x=a&&b`）——bash 把它解析为边界，因此 `x=;` 是空
+                    # 赋值，不得授予“已赋值”状态。
                     value = value.rstrip(";&|()")
                     refs = set(_dollar_vars(value))
-                    # A variable that expands a tainted variable (`y=$x`) is
-                    # tainted itself — `y=$x; cat $y` smuggles the captured
-                    # path through a relay the same way `x=$(echo /etc/passwd);
-                    # cat $x` does. A reference to an UNTRACKED name is
-                    # tainted too: host env vars ($SHELL) expand to host
-                    # paths, and an unset var expands to EMPTY, collapsing
-                    # `$x/etc/hostname` into an absolute path. Only names
-                    # assigned earlier on this line/screen and the
-                    # server-injected project-internal vars are predictable.
+                    # 展开污染变量的变量（`y=$x`）自身也污染——`y=$x; cat $y` 像
+                    # `x=$(echo /etc/passwd); cat $x` 一样通过中继偷渡捕获路径。对
+                    # 未跟踪名的引用也污染：主机环境变量（$SHELL）展开为主机路径，
+                    # 未设置变量展开为空，使 `$x/etc/hostname` 坍缩成绝对路径。只有
+                    # 本屏/本行更早赋值的名和服务器注入的项目内变量可预测。
                     untracked = refs - assigned - _SAFE_ENV_PATH_VARS
                     if "$(" in value or "`" in value or (refs & tainted) or untracked:
                         tainted.add(name)
-                    # Only non-empty values qualify as "assigned" — `x=`
-                    # expands to nothing, so `cat $x/etc/hostname` collapses
-                    # to an absolute path past the checks. (validate_command
-                    # independently rejects ${x:-...} expansions in values.)
+                    # 只有非空值才算“已赋值”——`x=` 展开为空，因此
+                    # `cat $x/etc/hostname` 会越过检查坍缩成绝对路径。
+                    # （validate_command 独立拒绝值中的 ${x:-...} 展开。）
                     if value:
                         assigned.add(name)
                 reason = validate_command(
@@ -711,17 +639,15 @@ class CodeExecutorTool(Tool):
     def _validate_substitutions(
         line: str, line_num: int, project_root: Path, *, single_quotes_literal: bool = True
     ) -> str | None:
-        """Validate command-substitution payloads in lines that are otherwise
-        skipped by _validate_bash (unquoted heredoc bodies, assignment values).
+        """校验本会被 _validate_bash 跳过的行中的命令替换载荷（未引用 heredoc
+        正文、赋值值）。
 
-        `X=$(cat /app/.env)` and heredoc bodies with `$(...)` execute payloads
-        when bash runs the line; the payload must pass the same path-scoped
-        validation as any other command. `$(< file)` (pure file read) is
-        rejected outright. _check_all_substitutions walks every nesting level —
-        `$(cat $(echo /etc/passwd))` only gets caught when the OUTER layer is
-        validated (the inner one is a harmless data command). In an unquoted
-        heredoc body quotes are plain characters to bash (substitution still
-        runs), so single_quotes_literal=False.
+        `X=$(cat /app/.env)` 和带 `$(...)` 的 heredoc 正文在 bash 运行该行时执行
+        载荷；载荷必须通过与任何其他命令相同的路径范围校验。`$(< file)`（纯文件
+        读取）被直接拒绝。_check_all_substitutions 遍历每个嵌套层——
+        `$(cat $(echo /etc/passwd))` 只有外层被校验时才会被抓到（内层是无害的数据
+        命令）。未引用 heredoc 正文里引号对 bash 是普通字符（替换仍运行），因此
+        single_quotes_literal=False。
         """
         reason = _check_all_substitutions(
             line,
@@ -735,13 +661,11 @@ class CodeExecutorTool(Tool):
 
     @staticmethod
     def _blocked_substitutions(text: str) -> str | None:
-        """Refuse blocked commands inside live substitution payloads.
+        """拒绝活替换载荷内的封禁命令。
 
-        Complements _find_blocked_bash, which skips heredoc bodies: only an
-        unquoted body's payloads execute (quoted bodies are literal and
-        never reach here), so only they need the command-word check. Body
-        context keeps quotes literal — `$(...)` inside a plain `'` in an
-        unquoted body still runs.
+        补充跳过 heredoc 正文的 _find_blocked_bash：只有未引用正文的载荷会执行
+        （引用正文是字面量，从不到这里），因此只有它们需要命令词检查。正文上下文
+        让引号保持字面——未引用正文里普通单引号中的 `$(...)` 仍运行。
         """
         try:
             match = CodeExecutorTool._payload_blocked_word(text, quotes_literal=False)

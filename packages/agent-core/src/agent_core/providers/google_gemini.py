@@ -1,9 +1,8 @@
-"""Google Gemini provider via the google-genai SDK.
+"""基于 google-genai SDK 的 Google Gemini 供应方。
 
-The previous google.generativeai package is EOL (no fixes since 2024); this
-module targets its successor google-genai. The new SDK's Client is
-instance-scoped, so the old genai.configure() process-global key (and the
-request lock that serialized configure + request) is gone entirely.
+旧的 google.generativeai 包已停止维护（2024 年起无修复）；本模块面向其继任者
+google-genai。新 SDK 的 Client 是实例级的，因此旧的 genai.configure() 进程全局
+密钥（以及把 configure 和请求串行化的请求锁）已彻底移除。
 """
 from __future__ import annotations
 
@@ -26,9 +25,8 @@ from .base import (
     thinking_enabled_by_env,
 )
 
-# Cleared around Client construction: google-genai builds its httpx client
-# there and would otherwise read the ambient proxy env (same behavior the
-# old genai.configure path enforced).
+# 在构造 Client 前后临时清空：google-genai 会在那里构建 httpx 客户端，否则会读取
+# 环境中的代理变量（旧 genai.configure 路径强制的行为相同）。
 _PROXY_KEYS = [
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
     "http_proxy", "https_proxy", "all_proxy",
@@ -38,13 +36,11 @@ _PROXY_KEYS = [
 def _continuation_target_index(
     seen_arg_keys: dict[int, set[str]], chunk_args: dict, fallback: int
 ) -> int:
-    """Pick which tool call a nameless continuation chunk continues.
+    """选择一个无名续接块所延续的是哪一次工具调用。
 
-    Gemini splits large arguments across chunks; the continuation parts carry
-    an empty name, so "the previous call" is not necessarily the one being
-    continued when parallel function calls interleave. Match by argument-key
-    overlap with each call's accumulated args; with no overlap anywhere, fall
-    back to the most recent call (previous behavior).
+    Gemini 会把较大的参数拆到多个数据块中；续接部分携带空名字，因此当并行函数
+    调用交错时，“上一次调用”不一定是被延续的那个。按参数键与各调用已累积参数的
+    重叠度匹配；到处都没有重叠时，退化为最近一次调用（旧行为）。
     """
     chunk_keys = set(chunk_args)
     target = fallback
@@ -61,27 +57,24 @@ def _context_window(model: str) -> int:
     m = model.lower()
     if "ultra" in m:
         return 32_768
-    # All Gemini 1.5+ and 2.x+ models have 1M context
+    # 所有 Gemini 1.5+ 和 2.x+ 模型都有 100 万上下文。
     return 1_048_576
 
 
-# Output-token ceilings per model family. Agent configs default max_tokens to
-# 128000 (agent.py AgentConfig), which Gemini rejects with 400
-# INVALID_ARGUMENT. The Anthropic and OpenAI providers clamp for the same
-# reason; Gemini must not forward the default raw.
+# 逐模型家族的输出 token 上限。Agent 配置默认 max_tokens 为 128000（agent.py 的
+# AgentConfig），Gemini 会以 400 INVALID_ARGUMENT 拒绝它。Anthropic 和 OpenAI
+# 供应方出于同样原因做限制；Gemini 不能原样转发该默认值。
 def _max_output_tokens(model: str) -> int:
     m = model.lower()
     if "gemini-2.5" in m or "gemini-3" in m:
-        # The API's upper bound is exclusive, so 65535 is the largest valid
-        # request for the 65536-token families.
+        # API 的上界是开区间，因此对 65536 token 家族，65535 是最大的合法请求。
         return 65_535
-    # 1.5/2.0 families cap at 8192.
+    # 1.5/2.0 家族上限为 8192。
     return 8_192
 
 
-# Finish reasons that mean the model produced content but it was blocked or
-# withheld. Masking any of these as END_TURN would end the turn silently:
-# no truncation warning, no refusal signal, the UI never learns why.
+# 表示模型已产出内容但被拦截或扣留的完成原因。把其中任何一个伪装成 END_TURN 都会
+# 静默结束本轮：没有截断警告、没有拒绝信号，界面永远不知道原因。
 _BLOCKED_FINISH_REASONS = frozenset({
     "SAFETY",
     "RECITATION",
@@ -95,8 +88,8 @@ _BLOCKED_FINISH_REASONS = frozenset({
 
 
 def _part_text(part) -> str | None:
-    """Part.text raises ValueError when the part carries no text field
-    (unlike the old SDK, which returned None)."""
+    """当该 part 没有文本字段时，Part.text 会抛 ValueError（旧 SDK 则返回
+    None）。"""
     try:
         return part.text
     except ValueError:
@@ -104,12 +97,11 @@ def _part_text(part) -> str | None:
 
 
 def _prompt_block_reason(feedback) -> str:
-    """Name of a prompt-level block reason, or '' when the prompt passed.
+    """提示级拦截原因的名称，提示通过时返回 ''。
 
-    Gemini blocks the PROMPT itself by returning no candidates and setting
-    ``prompt_feedback.block_reason``; the candidate-level finish-reason
-    mapping never sees it, so without this check the turn ends as an empty
-    normal reply with no refusal signal.
+    Gemini 通过不返回候选并设置 ``prompt_feedback.block_reason`` 来拦截提示本身；
+    候选级的完成原因映射永远看不到它，因此没有这个检查，本轮会以空的普通回复结束、
+    没有拒绝信号。
     """
     reason = getattr(feedback, "block_reason", None)
     name = getattr(reason, "name", None) or (str(reason) if reason else "")
@@ -119,7 +111,7 @@ def _prompt_block_reason(feedback) -> str:
 
 
 async def _prepend_chunk(first, rest):
-    """Yield an already-consumed first chunk before iterating *rest*."""
+    """在迭代 *rest* 之前，先产出已消费的首个数据块。"""
     if first is not None:
         yield first
     async for chunk in rest:
@@ -127,40 +119,36 @@ async def _prepend_chunk(first, rest):
 
 
 class GoogleGeminiProvider(LLMProvider):
-    """Google Gemini via the google-genai SDK."""
+    """通过 google-genai SDK 调用 Google Gemini。"""
 
     def __init__(self, api_key: str, model: str = "gemini-1.5-flash", base_url: str | None = None, url_mode: str = "base_url", context_window: int | None = None, ssl_verify: bool = False, thinking_enabled: bool | None = None, reasoning_effort: str | None = None) -> None:
         self._api_key = api_key
         self._model_name = model
         self._base_url = base_url
         self._ssl_verify = ssl_verify
-        # Per-config override from Settings -> AI Models; None = name-matched default.
+        # 来自“设置 -> AI 模型”的逐配置覆盖；None = 名称匹配默认值。
         self._context_window_override = context_window
-        # Cached client, built lazily on first request and released in
-        # close(). The SDK Client owns an httpx connection pool that must be
-        # closed, so it cannot be rebuilt per call.
+        # 缓存的客户端，首次请求时惰性构建并在 close() 中释放。SDK Client 持有
+        # 必须关闭的 httpx 连接池，因此不能逐次调用重建。
         self._client_cache: genai.Client | None = None
-        # include_thoughts switch: explicit per-config override wins, else
-        # AGENT_EXTENDED_THINKING (default on); also flipped off when the
-        # model/gateway rejects ThinkingConfig with 400. reasoning_effort is
-        # OpenAI-only — accepted so the provider-agnostic cred dict never
-        # TypeErrors a turn.
+        # include_thoughts 开关：显式的逐配置覆盖优先，否则取
+        # AGENT_EXTENDED_THINKING（默认开启）；当模型/网关以 400 拒绝
+        # ThinkingConfig 时也会关闭。reasoning_effort 仅 OpenAI 使用——这里接受
+        # 它，使与供应方无关的凭证字典绝不会让某轮 TypeError。
         self._thinking_enabled = thinking_enabled if thinking_enabled is not None else thinking_enabled_by_env()
 
     def _client(self) -> genai.Client:
-        """Instance-scoped client, built once — google-genai has no process
-        globals, and the connection pool inside the Client is meant to be
-        reused across requests."""
+        """实例级客户端，只构建一次——google-genai 没有进程全局变量，且 Client
+        内部的连接池本就设计为跨请求复用。"""
         if self._client_cache is not None:
             return self._client_cache
         http_options = genai_types.HttpOptions(
             **({"base_url": self._base_url.rstrip("/")} if self._base_url else {}),
             client_args={"verify": self._ssl_verify},
-            # 300s total (HttpOptions.timeout is milliseconds; the SDK maps it
-            # to httpx/aiohttp per-request timeouts). The SDK default is None,
-            # which the transport layers read as INFINITE — a blackholed
-            # endpoint would hang the turn until process-level cancellation.
-            # Matches the phased 300s ceilings in the openai/anthropic providers.
+            # 总计 300 秒（HttpOptions.timeout 单位为毫秒；SDK 把它映射为
+            # httpx/aiohttp 的逐请求超时）。SDK 默认值为 None，传输层会当作
+            # 无限——一个黑洞端点会让本轮一直挂起到进程级取消。与 openai/
+            # anthropic 供应方分阶段的 300 秒上限一致。
             timeout=300_000,
         )
         saved = {k: os.environ.pop(k) for k in _PROXY_KEYS if k in os.environ}
@@ -171,8 +159,8 @@ class GoogleGeminiProvider(LLMProvider):
         return self._client_cache
 
     async def close(self) -> None:
-        """Release the cached client's httpx connection pool (Agent.close()
-        awaits this after every run)."""
+        """释放缓存客户端的 httpx 连接池（每次运行后 Agent.close() 会等待
+        本方法）。"""
         client = self._client_cache
         self._client_cache = None
         if client is not None:
@@ -208,11 +196,9 @@ class GoogleGeminiProvider(LLMProvider):
                         "response": {"result": msg.content if isinstance(msg.content, str) else json.dumps(msg.content)},
                     }
                 }
-                # parallel tool calls produce consecutive tool
-                # messages. Each must not become its own user turn - Gemini
-                # rejects alternating violations from adjacent user contents
-                # carrying function_response parts. Merge into the previous
-                # user content when it holds only function_response parts.
+                # 并行工具调用会产生连续的工具消息。每个都不能变成独立的用户轮次
+                # ——Gemini 拒绝相邻用户内容携带 function_response 部分造成的交替
+                # 违规。当前一条用户内容只含 function_response 部分时，合并进它。
                 if (
                     contents
                     and contents[-1]["role"] == "user"
@@ -238,9 +224,8 @@ class GoogleGeminiProvider(LLMProvider):
                             "args": args,
                         }
                     })
-                # A delegated child's persisted reply can sit immediately
-                # before its parent's tool-using final message; merge into
-                # that model turn instead of emitting an adjacent one.
+                # 委派子智能体持久化的回复可能紧挨在其父级使用工具的最终消息之前；
+                # 合并进那个 model 轮次，而不是发出相邻的一个。
                 if contents and contents[-1]["role"] == "model":
                     contents[-1]["parts"].extend(parts)
                 else:
@@ -261,15 +246,11 @@ class GoogleGeminiProvider(LLMProvider):
                         })
                     else:
                         parts.append({"text": part.get("text", "")})
-            # Consecutive same-role contents — a mid-run injection lands
-            # right after the tool-results turn, two queued injections land
-            # back to back, a persisted injection is rebuilt after the
-            # synthesized tool rows on every later turn, and a delegated
-            # child's persisted reply is replayed right before its parent's.
-            # Gemini rejects adjacent user OR model contents ("multiturn
-            # requests alternate between user and model"), so merge the
-            # parts into the previous content instead of starting a new
-            # turn.
+            # 连续的同角色内容——运行中途的注入正好落在工具结果轮次之后，两个排队
+            # 的注入背靠背出现，持久化注入在之后每轮都于合成工具行之后重建，委派
+            # 子智能体持久化的回复重放到其父级之前。Gemini 拒绝相邻的用户或 model
+            # 内容（"multiturn requests alternate between user and model"），因此
+            # 把各部分合并进前一条内容，而不是开启新轮次。
             if contents and contents[-1]["role"] == role:
                 contents[-1]["parts"].extend(parts)
             else:
@@ -311,8 +292,8 @@ class GoogleGeminiProvider(LLMProvider):
             system_instruction=system or None,
             tools=self._to_gemini_tools(tools) if tools else None,
         )
-        # Without include_thoughts the API never returns thought parts at all
-        # — the thinking UI would stay empty even though the model thinks.
+        # 没有 include_thoughts，API 根本不会返回思考部分——即使模型在思考，思考
+        # 界面也会一直为空。
         if thinking and self._thinking_supported():
             kwargs["thinking_config"] = genai_types.ThinkingConfig(include_thoughts=True)
         return genai_types.GenerateContentConfig(**kwargs)
@@ -334,10 +315,9 @@ class GoogleGeminiProvider(LLMProvider):
 
     @staticmethod
     def _normalize_stop(fr_name: str, has_tool_calls: bool) -> StopReason:
-        # finish_reason may be MAX_TOKENS (output limit hit) or SAFETY/
-        # RECITATION (content blocked) - masking it as a normal END_TURN
-        # would end the turn silently: no truncation warning, no refusal
-        # signal, the UI never learns the reply was cut off.
+        # finish_reason 可能是 MAX_TOKENS（触及输出上限）或 SAFETY/RECITATION
+        # （内容被拦截）——把它伪装成普通 END_TURN 会静默结束本轮：没有截断警告、
+        # 没有拒绝信号，界面永远不知道回复被切断。
         if has_tool_calls:
             return StopReason.TOOL_USE
         if fr_name == "MAX_TOKENS":
@@ -363,7 +343,7 @@ class GoogleGeminiProvider(LLMProvider):
                 config=config,
             )
         except Exception as exc:
-            # Model/gateway rejected ThinkingConfig — retry once without.
+            # 模型/网关拒绝了 ThinkingConfig——去掉它重试一次。
             if config.thinking_config is not None and "think" in str(exc).lower():
                 self._disable_thinking(f"request rejected thinking_config: {exc}")
                 response = await client.aio.models.generate_content(
@@ -387,22 +367,20 @@ class GoogleGeminiProvider(LLMProvider):
         text_parts = []
         tool_calls = []
         for part in candidate.content.parts:
-            # Thought parts are display-only here (non-stream path has no UI
-            # channel) — they must not leak into the visible assistant text.
+            # 思考部分在这里仅供展示（非流式路径没有界面通道）——它们不能泄漏到
+            # 可见的助手文本中。
             if getattr(part, "thought", False):
                 continue
             fc = part.function_call
             if fc:
-                # Gemini occasionally emits a function_call part with
-                # an empty name (mirrors the stream path's continuation
-                # chunks). A nameless call would surface as "Unknown tool:"
-                # in the loop - drop it instead.
+                # Gemini 偶尔会发出名字为空的 function_call 部分（对应流式路径的
+                # 续接块）。无名调用会在循环里以 "Unknown tool:" 出现——改为丢弃。
                 if not (fc.name or "").strip():
                     continue
                 tool_calls.append({
                     "id": f"call_{uuid.uuid4().hex[:12]}",
                     "type": "function",
-                    # A no-argument call reports args=None; dict(None) raises.
+                    # 无参调用报告 args=None；dict(None) 会抛错。
                     "function": {"name": fc.name, "arguments": json.dumps(dict(fc.args or {}))},
                 })
                 continue
@@ -439,10 +417,9 @@ class GoogleGeminiProvider(LLMProvider):
                 contents=contents,
                 config=config,
             )
-            # The SDK method is a coroutine that only builds the async
-            # iterator; the HTTP request is issued on the first iteration.
-            # Prefetch one chunk so a request-time ThinkingConfig rejection
-            # surfaces in this try instead of inside the loop below.
+            # SDK 方法是一个只构建异步迭代器的协程；HTTP 请求在首次迭代时发出。
+            # 预取一个数据块，使请求时的 ThinkingConfig 拒绝在这个 try 中浮现，
+            # 而不是在下方循环内部。
             chunk_iter = chunk_stream.__aiter__()
             first_chunk = await chunk_iter.__anext__()
         except StopAsyncIteration:
@@ -465,25 +442,21 @@ class GoogleGeminiProvider(LLMProvider):
         tool_call_index = 0
         has_tool_calls = False
         last_usage = None
-        # Gemini streams a terminal chunk whose finish_reason reports why the
-        # generation ended (MAX_TOKENS on the output limit, SAFETY/RECITATION
-        # on a content block) - without it every cut-off reply would read as
-        # a normal end of turn.
+        # Gemini 会流式发出一个终端数据块，其 finish_reason 报告生成为何结束（输出
+        # 上限时为 MAX_TOKENS，内容被拦截时为 SAFETY/RECITATION）——没有它，每个
+        # 被切断的回复都会被读成正常的轮次结束。
         last_finish_reason = None
-        # Prompt-level block reason, if Gemini refused the prompt itself.
-        # Such chunks carry no candidates, so nothing in the candidate loop
-        # below would ever record why the reply is empty.
+        # 提示级拦截原因（若 Gemini 拒绝了提示本身）。这种数据块不带候选，因此
+        # 下方候选循环里没有任何东西会记录回复为何为空。
         prompt_block = ""
-        # Argument-key fingerprint per call index: nameless continuation
-        # chunks are matched to the call they continue via key overlap
-        # (see _continuation_target_index) instead of assuming the most
-        # recent call - parallel calls interleave their continuation chunks.
+        # 每次调用索引的参数键指纹：无名续接块通过键重叠（见
+        # _continuation_target_index）匹配到它所延续的调用，而不是假定为最近一次
+        # 调用——并行调用的续接块会交错。
         seen_arg_keys: dict[int, set[str]] = {}
         async for chunk in _prepend_chunk(first_chunk, chunk_iter):
-            # Capture usage BEFORE the content short-circuits below: Gemini
-            # reports usage_metadata on the terminal chunk, which carries
-            # finish_reason but no parts — the old placement (after the
-            # `continue`) dropped the token counts of every such stream.
+            # 在下方内容短路之前先捕获用量：Gemini 在终端块上报告 usage_metadata，
+            # 该块带 finish_reason 但没有 parts——旧位置（`continue` 之后）丢弃了
+            # 每个这种流的 token 计数。
             if chunk.usage_metadata:
                 last_usage = chunk.usage_metadata
             block = _prompt_block_reason(getattr(chunk, "prompt_feedback", None))
@@ -498,9 +471,8 @@ class GoogleGeminiProvider(LLMProvider):
             if not candidate.content or not candidate.content.parts:
                 continue
             for part in candidate.content.parts:
-                # Thought parts arrive alongside (or before) visible content
-                # when include_thoughts is on — route them to the thinking
-                # channel. Without this they were mis-labeled as normal text.
+                # include_thoughts 开启时，思考部分随可见内容一起（或在其之前）
+                # 到达——把它们路由到思考通道。没有这个，它们会被误标为普通文本。
                 if getattr(part, "thought", False):
                     thought_text = _part_text(part)
                     if thought_text:
@@ -511,7 +483,7 @@ class GoogleGeminiProvider(LLMProvider):
                     name = (fc.name or "").strip()
                     args_json = json.dumps(dict(fc.args)) if fc.args else ""
                     if name:
-                        # First (or only) chunk of a function call.
+                        # 一次函数调用的首个（或唯一）数据块。
                         seen_arg_keys[tool_call_index] = set(dict(fc.args)) if fc.args else set()
                         yield StreamChunk(
                             delta="",
@@ -521,17 +493,14 @@ class GoogleGeminiProvider(LLMProvider):
                                 "function": {"name": name, "arguments": args_json},
                             },
                         )
-                        # has_tool_calls must be set only when a delta was
-                        # actually emitted - a nameless function_call part at
-                        # index 0 (skipped below) is dropped as unparseable
-                        # and must not report finish_reason="tool_calls" with
-                        # nothing to consume.
+                        # has_tool_calls 只应在确实发出增量时设置——索引 0 处
+                        # 无名的 function_call 部分（下方跳过）作为不可解析被丢弃，
+                        # 不能在没有东西可消费时报告 finish_reason="tool_calls"。
                         has_tool_calls = True
                         tool_call_index += 1
                     elif tool_call_index > 0:
-                        # Continuation chunk: Gemini splits large arguments
-                        # across chunks with an empty name - emit under the
-                        # matched call's index so the loop merges the fragments.
+                        # 续接块：Gemini 以空名字把较大参数拆到多个数据块——在匹配
+                        # 调用的索引下发出，使循环合并这些片段。
                         chunk_args = dict(fc.args) if fc.args else {}
                         target = _continuation_target_index(
                             seen_arg_keys, chunk_args, tool_call_index - 1
@@ -558,8 +527,8 @@ class GoogleGeminiProvider(LLMProvider):
         if has_tool_calls:
             yield StreamChunk(finish_reason="tool_calls", stop_reason=StopReason.TOOL_USE, usage=usage_dict)
         else:
-            # Surface the terminal chunk's finish_reason so the loop can warn
-            # about truncation / refusal instead of ending the turn silently.
+            # 暴露终端块的 finish_reason，使循环能对截断/拒绝发出警告，而不是静默
+            # 结束本轮。
             fr_name = str(getattr(last_finish_reason, "name", ""))
             if fr_name == "MAX_TOKENS":
                 yield StreamChunk(finish_reason="max_tokens", stop_reason=StopReason.MAX_TOKENS, usage=usage_dict)

@@ -1,16 +1,12 @@
-"""Markdown → Jira wiki markup conversion for issue bodies.
+"""把 issue 正文从 Markdown 转换为 Jira wiki 标记。
 
-Jira's REST v2 API renders a string ``body`` as Jira wiki markup, not
-Markdown.  A Markdown ``### heading`` therefore comes back as a three-level
-nested numbered list ("1.1.1 heading") and ``-`` bullets / ``1.`` lists
-render as plain text.  Every body written to Jira goes through
-``markdown_to_wiki`` so agents can keep writing Markdown and the rendered
-comment stays readable.
+Jira 的 REST v2 API 把字符串 ``body`` 渲染为 Jira wiki 标记而非 Markdown。因此
+Markdown 的 ``### 标题`` 会回来变成三级嵌套编号列表（"1.1.1 标题"），``-``
+项目符号 / ``1.`` 列表渲染为纯文本。每个写入 Jira 的正文都经过
+``markdown_to_wiki``，使智能体可以继续写 Markdown，渲染的注释保持可读。
 
-The conversion is intentionally line-based and pragmatic, not a full
-Markdown parser.  Lines that are already wiki markup (e.g. the
-``{color:red}...{color}`` self-adapt-DB marking from the Jira conventions)
-pass through untouched.
+转换刻意基于行、务实，不是完整 Markdown 解析器。已是 wiki 标记的行（如 Jira 约定
+里 ``{color:red}...{color}`` 的自适应数据库标记）原样通过。
 """
 from __future__ import annotations
 
@@ -29,12 +25,12 @@ _IMAGE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
 _LINK = re.compile(r"\[([^\]!][^\]]*)\]\(([^)\s]+)\)")
 _CODE_SPAN = re.compile(r"`([^`\n]+)`")
 _BOLD = re.compile(r"\*\*([^*\n]+)\*\*")
-# Already-wiki lines must not be re-interpreted as Markdown.
+# 已是 wiki 的行不得被重新解释为 Markdown。
 _WIKI_PREFIX = re.compile(r"^(?:h[1-6]\.|bq\.|----|\{)")
 
 
 def _inline(md: str) -> str:
-    """Convert inline Markdown constructs (images, links, code, bold)."""
+    """转换行内 Markdown 构造（图片、链接、代码、加粗）。"""
     s = _IMAGE.sub(r"!\2|\1!", md)
     s = _LINK.sub(r"[\1|\2]", s)
     s = _CODE_SPAN.sub(r"{{\1}}", s)
@@ -49,9 +45,8 @@ def markdown_to_wiki(md: str) -> str:
     lines = md.split("\n")
     out: list[str] = []
     in_code = False
-    # (indent, depth) stack for the current list block — relative depth
-    # handles both 2-space and 4-space markdown nesting.  Reset whenever a
-    # non-list line appears.
+    # 当前列表块的（缩进, 深度）栈——相对深度同时处理 2 空格和 4 空格的
+    # Markdown 嵌套。出现非列表行时重置。
     indent_stack: list[tuple[int, int]] = []
 
     def list_item_depth(indent: int) -> int:
@@ -71,7 +66,7 @@ def markdown_to_wiki(md: str) -> str:
         line = lines[i]
         stripped = line.strip()
 
-        # Fenced code blocks → {code} blocks.
+        # 围栏代码块 → {code} 块。
         fence = _FENCE.match(line)
         if fence:
             if in_code:
@@ -88,16 +83,16 @@ def markdown_to_wiki(md: str) -> str:
             i += 1
             continue
 
-        # Already wiki markup (e.g. {color:red}[SELF-ADAPT-DB] ... {color}):
-        # pass through untouched instead of re-interpreting it as Markdown.
+        # 已是 wiki 标记（如 {color:red}[SELF-ADAPT-DB] ... {color}）：原样通过，
+        # 而非重新解释为 Markdown。
         if _WIKI_PREFIX.match(stripped):
             out.append(line)
             reset_list()
             i += 1
             continue
 
-        # Markdown table → wiki table (||header|| / |cell|).  The separator
-        # row (|---|---|) has no wiki equivalent and is dropped.
+        # Markdown 表格 → wiki 表格（||表头|| / |单元格|）。分隔行（|---|---|）
+        # 没有 wiki 对应物，被丢弃。
         if _TABLE_SEP.match(line) or _TABLE_ROW.match(line):
             block: list[str] = []
             has_sep = False
@@ -120,14 +115,14 @@ def markdown_to_wiki(md: str) -> str:
             reset_list()
             continue
 
-        # Horizontal rule.
+        # 水平线。
         if _HR.match(line):
             out.append("----")
             reset_list()
             i += 1
             continue
 
-        # Blockquote → bq.
+        # 引用块 → bq.
         bq = _BLOCKQUOTE.match(line)
         if bq:
             out.append("bq. " + _inline(bq.group(1)))
@@ -135,8 +130,8 @@ def markdown_to_wiki(md: str) -> str:
             i += 1
             continue
 
-        # ATX headings → h1. ... h6.  A bare Markdown "###" would otherwise
-        # render as a third-level nested numbered list ("1.1.1").
+        # ATX 标题 → h1. ... h6. 否则裸的 Markdown "###" 会渲染为三级嵌套编号
+        # 列表（"1.1.1"）。
         heading = _HEADING.match(line)
         if heading:
             level = len(heading.group(1))
@@ -145,7 +140,7 @@ def markdown_to_wiki(md: str) -> str:
             i += 1
             continue
 
-        # List items: wiki nests by repeating the marker per depth level.
+        # 列表项：wiki 按深度级别重复标记来嵌套。
         task = _TASKLIST.match(line)
         if task:
             out.append("*" * list_item_depth(len(task.group(1))) + " " + _inline(task.group(2)))
@@ -162,7 +157,7 @@ def markdown_to_wiki(md: str) -> str:
             i += 1
             continue
 
-        # Plain paragraph.
+        # 普通段落。
         out.append(_inline(line))
         reset_list()
         i += 1

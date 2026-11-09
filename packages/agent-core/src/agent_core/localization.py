@@ -1,36 +1,33 @@
-"""Frontmatter localization helpers.
+"""前置元数据（frontmatter）本地化辅助函数。
 
-User-facing definition fields (agent ``display_name``/``description``/
-``placeholder``/``starter_prompts``, skill/workflow ``description``) accept
-either a plain scalar — one value shared by every locale, the pre-i18n shape
-every existing file uses — or a locale map::
+面向用户的定义字段（Agent 的 ``display_name``/``description``/``placeholder``/
+``starter_prompts``，技能/工作流的 ``description``）既可以是普通标量——所有
+语言共用一个值，即现有文件使用的国际化之前的形态——也可以是语言映射：
 
     description:
       en-US: "Authoritative English one-liner."
       zh-CN: "一句话中文说明。"
 
-Normalizing both shapes here keeps every downstream consumer on the same
-contract: a single **canonical** string for legacy columns, LLM-facing
-prompts, and ordering keys, plus the full locale map for UI serialization.
-The canonical language is caller-selectable because the two families differ:
+在这里统一两种形态，让每个下游消费方遵循同一契约：为旧版列、面向 LLM 的提示
+词和排序键提供单一的**规范（canonical）**字符串，同时为界面序列化保留完整语言
+映射。规范语言可由调用方选择，因为两大家族有所不同：
 
-- agent UI fields use zh-first so existing Chinese content keeps driving the
-  ``agents.display_name`` sort key and the ``[display_name]:`` history prefix;
-- skill/workflow descriptions use en-first so the text injected into the
-  LLM prompt (``## Available Workflows``) stays byte-identical.
+- Agent 界面字段以中文优先，使现有中文内容继续驱动 ``agents.display_name``
+  排序键和 ``[display_name]:`` 历史前缀；
+- 技能/工作流描述以英文优先，使注入 LLM 提示词（``## Available Workflows``）
+  的文本保持字节级一致。
 """
 from __future__ import annotations
 
 import re
 
-#: Locale-shaped mapping key: ``zh``, ``en-US`` — not arbitrary dict keys, so
-#: a skill ref (``{slug, description}``) or other structured frontmatter
-#: value is never mistaken for a translation map.
+#: 语言形态的映射键：``zh``、``en-US``——不是任意字典键，因此技能引用
+#: （``{slug, description}``）或其他结构化前置元数据值，绝不会被误判为翻译映射。
 LOCALE_RE = re.compile(r"^[a-z]{2}(-[A-Z]{2})?$")
 
 
 def is_locale_map(value: object) -> bool:
-    """True when *value* is a non-empty dict whose keys are all locale codes."""
+    """当 *value* 是非空字典且所有键都是语言代码时为真。"""
     return isinstance(value, dict) and bool(value) and all(
         isinstance(key, str) and LOCALE_RE.match(key) for key in value
     )
@@ -41,17 +38,16 @@ def normalize_i18n_field(
     *,
     canonical_order: tuple[str, ...] = ("zh-CN", "en-US"),
 ) -> tuple[str | None, dict[str, str] | None]:
-    """Normalize a scalar-or-locale-map frontmatter field.
+    """规范化一个标量或语言映射的前置元数据字段。
 
-    Returns ``(canonical, locale_map)``:
+    返回 ``(规范值, 语言映射)``：
 
-    - plain string → ``(value, None)`` — one value shared by every locale;
-    - locale map of string values → ``(selected, full_map)`` — the canonical
-      entry is the first language in *canonical_order* present in the map
-      (falling back to the map's first entry when none match);
-    - anything else (None, numbers, dicts with non-locale keys or non-string
-      values) → ``(None, None)`` — callers log/skip, never raise, so one bad
-      file cannot fail a whole directory sync.
+    - 普通字符串 → ``(值, None)``——所有语言共用一个值；
+    - 字符串值的语言映射 → ``(选中值, 完整映射)``——规范条目是映射中存在的
+      *canonical_order* 里的第一种语言（都不匹配时退化为映射的第一个条目）；
+    - 其他任何东西（None、数字、含非语言键或非字符串值的字典）→
+      ``(None, None)``——调用方记录/跳过，绝不抛出，使一个坏文件不会导致整个
+      目录同步失败。
     """
     if isinstance(value, str):
         return value, None
@@ -76,12 +72,11 @@ def normalize_i18n_prompts(
     *,
     canonical_order: tuple[str, ...] = ("zh-CN", "en-US"),
 ) -> tuple[list[str], dict[str, list[str]] | None]:
-    """Normalize ``starter_prompts``: scalar, shared list, or locale map.
+    """规范化 ``starter_prompts``：标量、共享列表或语言映射。
 
-    Returns ``(canonical_list, locale_map)``. A bare string is ONE prompt
-    (prompts contain commas — never comma-split); a list is shared by every
-    locale; a locale map carries one list (or single string) per language.
-    Blank entries are dropped. Any other shape yields ``([], None)``.
+    返回 ``(规范列表, 语言映射)``。裸字符串是一个提示词（提示词内含逗号——
+    绝不按逗号拆分）；列表由所有语言共用；语言映射为每种语言携带一个列表
+    （或单个字符串）。空白条目会丢弃。其他任何形态产生 ``([], None)``。
     """
     if isinstance(value, str):
         text = value.strip()

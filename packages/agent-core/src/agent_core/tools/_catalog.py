@@ -1,16 +1,13 @@
-"""Integration catalog loader — resolves api_request endpoint_key to concrete
-request defaults from the project's integrations/custom-api knowledge file.
+"""集成目录加载器——把 api_request 的 endpoint_key 解析为项目
+integrations/custom-api 知识文件中的具体请求默认值。
 
-The catalog is Markdown with one YAML fenced block per integration (see
-knowledge/_template/custom-api.md). This module is the single server-side
-reader so the catalog acts as the source of truth for endpoint resolution;
-agents pass an endpoint_key and the tool fills in method default, path,
-per-environment base_url, allowed_hosts, response_json_path, and auth
-defaults from the catalog.
+目录是 Markdown，每个集成一个 YAML 围栏块（见 knowledge/_template/custom-api.md）。
+本模块是唯一的服务端读取器，使目录成为端点解析的事实来源；智能体传 endpoint_key，
+工具从目录填入方法默认、路径、按环境的 base_url、allowed_hosts、response_json_path
+和认证默认。
 
-Parsing is deliberately permissive: a malformed block never breaks the whole
-catalog, and a missing/unreadable file yields an empty dict (callers decide
-fallback semantics).
+解析刻意宽松：格式错误的块不会破坏整个目录，缺失/无法读取的文件产生空字典
+（调用方决定回退语义）。
 """
 from __future__ import annotations
 
@@ -35,20 +32,19 @@ _YAML_FENCE_RE = re.compile(
 
 
 def strip_jsonpath_prefix(path: str) -> str:
-    """Normalize a catalog response_json_path to plain dot notation.
+    """把目录的 response_json_path 规范化为纯点号表示。
 
-    The catalog template historically uses JSONPath-ish "$.data"; the tool's
-    extractor expects "data". Leading "$." / "." characters are stripped.
+    目录模板历史上用类 JSONPath 的 "$.data"；工具的提取器期望 "data"。剥离开头的
+    "$." / "." 字符。
     """
     return path.lstrip("$.")
 
 
 async def load_integration_catalog(context: ToolContext) -> dict[str, dict[str, Any]]:
-    """Load and index the project's integration catalog.
+    """加载并索引项目的集成目录。
 
-    Returns {integration_key: parsed_yaml_block}. Missing file, read errors,
-    and per-block parse failures are logged and skipped — this function never
-    raises and never returns None.
+    返回 {integration_key: 已解析 YAML 块}。缺失文件、读取错误和逐块解析失败被记录
+    并跳过——本函数从不抛异常，也从不返回 None。
     """
     catalog_path = Path(context.knowledge_dir()) / "integrations" / "custom-api.md"
     if not await asyncio.to_thread(catalog_path.exists):
@@ -61,7 +57,7 @@ async def load_integration_catalog(context: ToolContext) -> dict[str, dict[str, 
         _log.warning("integration catalog read failed: %s", exc)
         return {}
 
-    # Strip YAML frontmatter (the file may or may not have one).
+    # 剥离 YAML frontmatter（文件可能有也可能没有）。
     try:
         body = frontmatter.loads(content).content
     except Exception as exc:
@@ -78,12 +74,12 @@ async def load_integration_catalog(context: ToolContext) -> dict[str, dict[str, 
         if not isinstance(block, dict):
             continue
         if isinstance(block.get("integrations"), dict):
-            # Wrapper form: {integrations: {key: {...}, ...}}
+            # 包装形式：{integrations: {key: {...}, ...}}
             for key, entry in block["integrations"].items():
                 if isinstance(entry, dict):
                     catalog[str(key)] = entry
         elif isinstance(block.get("integrations"), list):
-            # Wrapper form: {integrations: [{integration_key: ..., ...}, ...]}
+            # 包装形式：{integrations: [{integration_key: ..., ...}, ...]}
             for entry in block["integrations"]:
                 if isinstance(entry, dict) and entry.get("integration_key"):
                     catalog[str(entry["integration_key"])] = entry
@@ -102,18 +98,16 @@ def resolve_catalog_endpoint(
     endpoint_key: str,
     environment: str | None,
 ) -> dict[str, Any] | None:
-    """Look up an endpoint in the indexed catalog.
+    """在已索引目录中查找端点。
 
-    Returns a merged view {endpoint, environments, auth, defaults, env_name}
-    or None when the integration or endpoint is absent. Field-level
-    resolution (environment selection, precedence) is left to the caller.
+    返回合并视图 {endpoint, environments, auth, defaults, env_name}，集成或端点
+    缺失时返回 None。字段级解析（环境选择、优先级）留给调用方。
     """
     config = catalog.get(integration_key)
     if not config or not isinstance(config, dict):
         return None
-    # Every field is coerced: the catalog is hand-written YAML, and a
-    # list/string where an object is expected must yield "not found" rather
-    # than an AttributeError on the caller's .get().
+    # 每个字段都做强制类型转换：目录是手写 YAML，期望对象处出现列表/字符串必须产生
+    # “未找到”，而非在调用方 .get() 上抛 AttributeError。
     endpoints = config.get("endpoints")
     if not isinstance(endpoints, dict):
         return None

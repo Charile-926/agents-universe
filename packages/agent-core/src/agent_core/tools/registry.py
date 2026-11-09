@@ -1,12 +1,12 @@
-"""Tool registry — builds tool instances on demand.
+"""工具注册表——按需构建工具实例。
 
-Tools with optional heavy dependencies (playwright, Pillow) are imported lazily.
+带可选重型依赖（playwright、Pillow）的工具采用惰性导入。
 """
 from __future__ import annotations
 
 from .base import Tool, ToolContext
 
-# Core tools — always available
+# 核心工具——始终可用
 from .deliver_file import DeliverFileTool
 from .filesystem import FilesystemTool
 from .knowledge_rw import KnowledgeRWTool
@@ -16,9 +16,8 @@ from .shell import ShellTool
 from .sql_query import SqlQueryTool
 from .web_fetch import WebFetchTool
 
-# plan_task is framework-level behavior (the loop intercepts it into task
-# mode), not an ordinary tool an agent definition may omit. Always injected,
-# but never inside _CORE_TOOLS — see build_tool_registry.
+# plan_task 是框架级行为（循环会把它拦截进任务模式），不是智能体定义可省略的普通
+# 工具。它始终被注入，但绝不放在 _CORE_TOOLS 里——见 build_tool_registry。
 _PLAN_TOOL = PlannerTool
 
 _CORE_TOOLS: list[type[Tool]] = [
@@ -32,7 +31,7 @@ _CORE_TOOLS: list[type[Tool]] = [
     DeliverFileTool,
 ]
 
-# Optional tools — imported lazily to avoid breaking on missing packages
+# 可选工具——惰性导入，以免缺包时报错。
 _OPTIONAL_TOOL_MODULES = {
     "browser_playwright": ("agent_core.tools.browser_playwright", "BrowserPlaywrightTool"),
     "chart_renderer":     ("agent_core.tools.chart_renderer",     "ChartRendererTool"),
@@ -58,15 +57,12 @@ _OPTIONAL_TOOL_MODULES = {
 
 
 def known_static_tool_names() -> frozenset[str]:
-    """Tool names the registry can resolve, without importing optional modules.
+    """注册表可解析的工具名，无需导入可选模块。
 
-    Used to flag agent frontmatter declaring capabilities that do not exist.
-    Optional tools contribute their catalog keys — importing them just to read
-    ``name`` would drag playwright in for nothing, and the keys are what
-    ``build_tool_registry`` matches a declaration against anyway. Core tools
-    are instantiated because ``name`` is a property on some of them, and
-    reading it off the class would yield the property object instead of the
-    string — making a real tool look unknown.
+    用于标记前置元数据声明了不存在能力的智能体。可选工具贡献其目录键——仅为读取
+    ``name`` 而导入它们会白白拉入 playwright，而 ``build_tool_registry`` 本来就是
+    拿这些键去匹配声明。核心工具需实例化，因为其中一些的 ``name`` 是属性，从类上
+    读取会得到属性对象而非字符串——使真实工具看起来未知。
     """
     return frozenset(cls().name for cls in _CORE_TOOLS) | frozenset(_OPTIONAL_TOOL_MODULES)
 
@@ -84,7 +80,7 @@ def _load_optional(name: str) -> type[Tool] | None:
 
 
 def build_tool_registry(tool_names: list[str] | None = None) -> dict[str, Tool]:
-    """Instantiate the requested tools (or all available built-ins)."""
+    """实例化所请求的工具（未指定时实例化所有可用内置工具）。"""
     import logging
     _log = logging.getLogger("agent_core.tools.registry")
 
@@ -97,11 +93,9 @@ def build_tool_registry(tool_names: list[str] | None = None) -> dict[str, Tool]:
                 raise ValueError(f"Duplicate tool name: {instance.name!r}")
             registry[instance.name] = instance
 
-    # plan_task is framework-level behavior (the loop intercepts it into task
-    # mode), not an ordinary tool an agent definition may omit — an explicit
-    # tools: list that forgets it must not silently strip the agent's ability
-    # to plan. It is injected AFTER the allowlist so it can never leak the
-    # other core tools in: only plan_task itself is exempt from the list.
+    # plan_task 是框架级行为（循环把它拦截进任务模式），不是智能体定义可省略的普通
+    # 工具——显式 tools 列表若忘了它，不能静默剥夺智能体的规划能力。它在白名单之后
+    # 注入，因此绝不会让其他核心工具泄漏进来：只有 plan_task 本身豁免该列表。
     if tool_names is not None and "plan_task" not in registry:
         registry["plan_task"] = _PLAN_TOOL()
 

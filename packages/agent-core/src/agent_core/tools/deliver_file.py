@@ -1,8 +1,7 @@
-"""deliver_file tool — hand a project workspace file to the user.
+"""deliver_file 工具——把项目工作区文件交付给用户。
 
-Copies the file into the conversation's media directory, which /api/media
-serves with per-user auth (only the conversation owner can download). Files
-already inside the media directory are returned as-is without a copy.
+把文件复制到会话的媒体目录，/api/media 以按用户鉴权方式对外提供（仅会话所有者
+可下载）。已在媒体目录内的文件原样返回，不复制。
 """
 from __future__ import annotations
 
@@ -15,9 +14,8 @@ from typing import Any
 from ._media import media_type_for, media_url, sanitize_suffix
 from .base import Tool, ToolContext
 
-# Mirror of routers/media.py's whitelist (plus its separate ".." rejection):
-# a file already in the media directory must still be SERVABLE, or the URL
-# handed to the model is guaranteed to 400.
+# 与 routers/media.py 白名单（及其单独的 ".." 拒绝）保持一致：已在媒体目录里的
+# 文件仍必须可被服务，否则交给模型的 URL 必然 400。
 _SERVABLE_NAME_RE = re.compile(r"^[A-Za-z0-9_\-][A-Za-z0-9_\-.]*$")
 
 
@@ -65,12 +63,11 @@ class DeliverFileTool(Tool):
 
         media_dir = Path(context.conversation_media_dir)
         if src.parent == media_dir.resolve() and _servable_media_name(src.name):
-            dest = src  # already in the served media directory — no copy
+            dest = src  # 已在被服务的媒体目录——不复制
         else:
-            # A file the agent wrote into the media dir under an unservable
-            # name (spaces, leading dot, non-ASCII) still needs a copy under a
-            # generated name — returning its own name produced a URL that
-            # every /api/media request rejects.
+            # 智能体以不可服务的名（空格、前导点、非 ASCII）写进媒体目录的文件，
+            # 仍需在生成的名下复制——返回它自己的名会产生每个 /api/media 请求都
+            # 拒绝的 URL。
             media_dir.mkdir(parents=True, exist_ok=True)
             dest = media_dir / f"{uuid.uuid4().hex[:8]}{sanitize_suffix(src.name)}"
             try:

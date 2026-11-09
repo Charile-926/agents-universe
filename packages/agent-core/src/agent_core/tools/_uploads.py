@@ -1,22 +1,19 @@
-"""Shared resolver for upload payloads — one spec in, in-memory bytes out.
+"""上传载荷的共享解析器——一份规格进，内存字节出。
 
-Several tools now need to send a file somewhere: the browser tool pushes it
-into an ``<input type=file>`` (or a native file chooser), ``api_request`` sends
-it as a multipart part. Three byte sources are supported, and all three
-collapse to the same in-memory representation:
+现在有几个工具需要把文件发到某处：浏览器工具把它推入 ``<input type=file>``
+（或原生文件选择器），``api_request`` 把它作为 multipart 部件发送。支持三种
+字节来源，三者都折叠为相同的内存表示：
 
-* ``path`` — a file inside the project workspace (``tests/fixtures/orders.csv``,
-  a screenshot under ``.tmp/media/...``);
-* ``attachment`` — a file the user attached to the conversation, which lives in
-  the API's in-memory upload store and is *never* written to disk;
-* ``inline`` — content the caller generated on the spot (text or base64), so a
-  test can synthesize its payload without touching the filesystem at all.
+* ``path``——项目工作区内的文件（``tests/fixtures/orders.csv``、``.tmp/media/
+  ...`` 下的截图）；
+* ``attachment``——用户附加到会话的文件，位于 API 的内存上传存储中，*从不*写入
+  磁盘；
+* ``inline``——调用方当场生成的内容（文本或 base64），使测试完全不碰文件系统
+  即可合成其载荷。
 
-The destination is not a trust boundary: ``page.route`` cannot inspect an
-upload body, and ``api_request`` posts to customer-configured hosts by design.
-The whole exfiltration guard therefore lives here, on the source side — project
-root confinement, a hidden-file block, and byte caps — and every consumer gets
-it for free by going through :func:`resolve_upload_specs`.
+目的地不是信任边界：``page.route`` 无法检查上传正文，``api_request`` 按设计向
+客户配置的主机 POST。因此整个外泄守卫位于这里的来源侧——项目根限制、隐藏文件
+拦截和字节上限——每个消费者经由 :func:`resolve_upload_specs` 即可免费获得。
 """
 from __future__ import annotations
 
@@ -30,20 +27,18 @@ from typing import Any
 from ..paths import PathEscapeError, canonical, resolve_within
 from ._media import media_type_for
 
-# A single uploaded file. Chat attachments are capped at max_upload_size_mb
-# (10MB) by the API, so a path-sourced upload of the same ceiling keeps one
-# consistent number in the agent's head.
+# 单个上传文件。会话附件被 API 限制在 max_upload_size_mb（10MB），因此相同
+# 上限的路径来源上传在智能体脑中保持一个一致数字。
 MAX_UPLOAD_FILE_BYTES = 10 * 1024 * 1024
-# Inline content travels through the LLM context (it is generated in a tool
-# call), so it gets a much tighter cap — 1MB of base64 is already ~350k tokens
-# of payload the model had to produce.
+# 内联内容经 LLM 上下文传输（在工具调用中生成），因此给紧得多的上限——1MB 的
+# base64 已是模型不得不产出的约 35 万 token 载荷。
 MAX_INLINE_BYTES = 1 * 1024 * 1024
 MAX_UPLOAD_FILES = 10
 
 _MIME_RE = re.compile(r"^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$")
 _BASE64_RE = re.compile(r"^[A-Za-z0-9+/=\s]*$")
-# Filenames ride in multipart Content-Disposition headers and become the
-# browser File.name — control characters (CR/LF especially) must not survive.
+# 文件名随 multipart 的 Content-Disposition 头传输并成为浏览器 File.name——
+# 控制字符（尤其 CR/LF）绝不能存活。
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _MAX_NAME_CHARS = 255
 
@@ -51,24 +46,24 @@ _SOURCES = ("attachment", "path", "inline")
 
 
 class UploadSourceError(ValueError):
-    """An upload spec could not be resolved to bytes."""
+    """上传规格无法解析为字节。"""
 
 
 @dataclass(frozen=True)
 class UploadPayload:
-    """Resolved upload bytes plus the metadata destinations need."""
+    """已解析的上传字节，加上目的地所需的元数据。"""
 
     name: str
     data: bytes
     mime_type: str
     source: str
     origin: str
-    # Multipart form field name (api_request). Ignored by the browser tool.
+    # multipart 表单字段名（api_request）。浏览器工具忽略。
     field: str = "file"
 
 
 def _clean_name(raw: Any, *, fallback: str = "") -> str:
-    """Sanitize a caller-supplied filename for headers and ``File.name``."""
+    """清洗调用方提供的文件名，用于请求头和 ``File.name``。"""
     text = str(raw or "").replace("\\", "/")
     name = text.rsplit("/", 1)[-1]
     name = _CONTROL_RE.sub("", name).strip()
@@ -78,13 +73,11 @@ def _clean_name(raw: Any, *, fallback: str = "") -> str:
 
 
 def normalize_mime_type(raw: Any, name: str, *, text_default: bool = False) -> str:
-    """A caller-supplied MIME when it looks like one, else inferred from *name*.
+    """调用方提供的 MIME 看起来合法时用它，否则从 *name* 推断。
 
-    Unvalidated text would ride into a multipart Content-Type header (and a
-    browser ``File.type``), where a stray CR/LF is a header-injection vector —
-    anything not shaped like ``type/subtype`` falls back to the name-based
-    guess. Shared with test_generator, which embeds the same value into a
-    generated spec.
+    未校验的文本会进入 multipart 的 Content-Type 头（和浏览器 ``File.type``），
+    那里残留的 CR/LF 是头注入向量——任何不像 ``type/subtype`` 的内容都回退到
+    基于名称的猜测。与 test_generator 共享，后者把同样的值嵌入生成的规格。
     """
     if isinstance(raw, str) and _MIME_RE.match(raw.strip()):
         return raw.strip()
@@ -99,7 +92,7 @@ def _mime_for(spec: dict[str, Any], name: str, *, text_default: bool = False) ->
 
 
 def _media_parts(rel: str) -> list[str] | None:
-    """Split a ``.tmp/media/{conversation}/{file}`` path into segments."""
+    """把 ``.tmp/media/{会话}/{文件}`` 路径拆分为各段。"""
     parts = rel.replace("\\", "/").split("/")
     if len(parts) != 4 or parts[:2] != [".tmp", "media"]:
         return None
@@ -107,13 +100,11 @@ def _media_parts(rel: str) -> list[str] | None:
 
 
 def _hidden_part(rel: str) -> str | None:
-    """First hidden path component, or None when the path is acceptable.
+    """第一个隐藏路径组件，路径可接受时返回 None。
 
-    Reading arbitrary dotfiles out of a project workspace would hand an agent
-    ``.env``/``.git/config`` as an upload payload, which is exactly what an
-    injected instruction would ask for. ``.tmp`` is exempt in the leading
-    position because the platform's own scratch tree lives there — screenshots,
-    downloads and recordings all reach consumer tools through it.
+    从项目工作区读取任意点文件会把 ``.env``/``.git/config`` 作为上传载荷交给
+    智能体，这正是注入指令会索要的东西。``.tmp`` 在首位时豁免，因为平台自己的
+    临时树在那里——截图、下载和录像都通过它到达消费工具。
     """
     for i, part in enumerate(p for p in rel.replace("\\", "/").split("/") if p not in ("", ".")):
         if part == ".." or not part.startswith("."):
@@ -129,18 +120,17 @@ def _resolve_path(context, spec: dict[str, Any], max_bytes: int) -> UploadPayloa
     if not rel:
         raise UploadSourceError("source='path' requires 'path' (workspace-relative)")
 
-    # A virtual media path is offered to the upload store first: the filesystem
-    # tool exposes the user's attachments at exactly this path, so the agent can
-    # re-use a file it just read by quoting the same location (same
-    # store-before-disk order as the media router's GET).
+    # 虚拟媒体路径先交给上传存储：文件系统工具恰好在这个路径暴露用户附件，因此
+    # 智能体可引用同一位置来复用刚读过的文件（与媒体路由 GET 相同的先存储后
+    # 磁盘顺序）。
     parts = _media_parts(rel)
     if parts:
         lookup = getattr(context, "upload_file_lookup", None)
         if lookup is not None:
             data = lookup(parts[3])
             if data is not None:
-                # Same byte ceiling as the disk path: the same bytes must not
-                # be accepted or rejected depending on which alias names them.
+                # 与磁盘路径相同的字节上限：同样的字节绝不能因哪个别名命名它们而
+                # 被接受或拒绝。
                 if len(data) > max_bytes:
                     raise UploadSourceError(
                         f"Upload {rel!r} is {_mb(len(data))}, above the {_mb(max_bytes)} limit"
@@ -163,9 +153,8 @@ def _resolve_path(context, spec: dict[str, Any], max_bytes: int) -> UploadPayloa
         full = resolve_within(context.project_fs_path, rel)
     except PathEscapeError as exc:
         raise UploadSourceError(f"Access denied: path is outside the project workspace ({rel!r})") from exc
-    # Re-check the CANONICAL path: a symlink (or hardlink) named `innocuous`
-    # that points at `.env` has no hidden component in the request string, but
-    # the read returns the dotfile's bytes.
+    # 复检规范路径：名为 `innocuous`、指向 `.env` 的符号链接（或硬链接）在请求
+    # 字符串里没有隐藏组件，但读取返回点文件的字节。
     resolved_rel = full.relative_to(canonical(context.project_fs_path)).as_posix()
     hidden = _hidden_part(resolved_rel)
     if hidden is not None:
@@ -204,9 +193,8 @@ def _resolve_attachment(context, spec: dict[str, Any], max_bytes: int) -> Upload
         raise UploadSourceError(
             "Conversation attachments are not available here; use source='path' or source='inline'"
         )
-    # Look the name up verbatim first (the store is keyed by the server-stored
-    # name), then by the sanitized form, so a name that only differs by path
-    # decoration still resolves.
+    # 先逐字查名（存储以服务端保存的名为键），再按清洗形式查，使仅路径装饰不同的
+    # 名仍能解析。
     cleaned = _clean_name(raw_name)
     data = None
     for candidate in dict.fromkeys([raw_name, cleaned]):
@@ -241,13 +229,11 @@ def _resolve_inline(context, spec: dict[str, Any], inline_max: int) -> UploadPay
         if not isinstance(content_b64, str) or not _BASE64_RE.match(content_b64):
             raise UploadSourceError("content_base64 is not valid base64")
         try:
-            # Wrapped base64 (what CLI encoders emit) passes the character gate
-            # above, but validate=True rejects the whitespace it was allowed to
-            # carry — strip it before the strict decode.
+            # 带换行的 base64（CLI 编码器输出）通过上方字符门，但 validate=True
+            # 拒绝它被允许携带的空白——严格解码前先去掉。
             data = base64.b64decode("".join(content_b64.split()), validate=True)
         except (binascii.Error, ValueError) as exc:
-            # Never echo the payload — it is caller content, not a credential,
-            # but a decode error message must still stay value-free.
+            # 绝不回显载荷——它是调用方内容而非凭证，但解码错误消息仍须保持无值。
             raise UploadSourceError("content_base64 is not valid base64") from exc
         text_default = False
     elif content is not None:
@@ -292,7 +278,7 @@ def resolve_upload_spec(
     max_bytes: int = MAX_UPLOAD_FILE_BYTES,
     inline_max_bytes: int = MAX_INLINE_BYTES,
 ) -> UploadPayload:
-    """Resolve one upload spec to bytes, or raise :class:`UploadSourceError`."""
+    """把一份上传规格解析为字节，失败抛 :class:`UploadSourceError`。"""
     if not isinstance(spec, dict):
         raise UploadSourceError(f"Each file must be an object, got {type(spec).__name__}")
     source = _infer_source(spec)
@@ -325,10 +311,10 @@ def resolve_upload_specs(
     inline_max_bytes: int = MAX_INLINE_BYTES,
     max_files: int = MAX_UPLOAD_FILES,
 ) -> list[UploadPayload]:
-    """Resolve a list of upload specs (schema-declared array, LLM reality included)."""
+    """解析上传规格列表（含模式声明的数组与 LLM 的实际输出）。"""
     if not isinstance(specs, list):
-        # Mirrors the stringified-dict coercion contract elsewhere in the tool
-        # layer: a JSON string is a model mistake worth naming precisely.
+        # 对应工具层其他地方的字符串化字典强制转换约定：JSON 字符串是值得精确指出
+        # 的模型错误。
         if isinstance(specs, str):
             raise UploadSourceError("files must be an array, not a stringified JSON value")
         raise UploadSourceError(f"files must be an array, got {type(specs).__name__}")
@@ -345,7 +331,7 @@ def resolve_upload_specs(
 
 
 def _mb(num_bytes: int) -> str:
-    """Human-readable size for error messages."""
+    """供错误消息使用的人类可读大小。"""
     if num_bytes >= 1024 * 1024:
         return f"{num_bytes / (1024 * 1024):.1f}MB"
     if num_bytes >= 1024:

@@ -1,12 +1,12 @@
-"""Provider registry — lazy imports so missing optional SDKs don't break startup."""
+"""供应方注册表——惰性导入，使缺失的可选 SDK 不会导致启动失败。"""
 from __future__ import annotations
 
 from typing import Any
 
 from .base import LLMProvider
 
-# Lazy import callables: only load the SDK when a provider is actually used.
-# This lets other packages import agent_core without installing all LLM SDKs.
+# 惰性导入可调用对象：只在实际使用某供应方时才加载其 SDK。这样其他包无需安装
+# 所有 LLM SDK 即可导入 agent_core。
 _PROVIDER_LOADERS: dict[str, Any] = {
     "anthropic": lambda: __import__(
         "agent_core.providers.anthropic_claude", fromlist=["AnthropicClaudeProvider"]
@@ -24,22 +24,20 @@ _PROVIDER_LOADERS: dict[str, Any] = {
 
 
 def get_provider(provider_key: str, credentials: dict[str, Any]) -> LLMProvider:
-    """Instantiate a provider from its key and credential dict.
+    """根据供应方键和凭证字典实例化供应方。
 
-    Credential keys per provider:
-      anthropic:     api_key, model, base_url (opt), url_mode (opt: base_url|full_url)
-      openai:        api_key, model, base_url (opt), url_mode (opt: base_url|full_url)
-      azure_openai:  api_key, endpoint, api_version (opt), model (opt — also the
-                     Azure deployment name; there is no separate deployment key,
-                     and a stray one in credentials is silently ignored)
-      google_gemini: api_key, model, base_url (opt), url_mode (opt: base_url|full_url)
-    All providers additionally accept context_window (opt: per-config override
-    for the name-matched default; None = auto-match by model name),
-    thinking_enabled (opt: extended-thinking override; None = env default
-    AGENT_EXTENDED_THINKING — honored by anthropic/google_gemini, accepted
-    and ignored by openai/azure_openai whose CoT is parse-only) and
-    reasoning_effort (opt: "minimal"|"low"|"medium"|"high"; sent only to
-    OpenAI-family reasoning models, ignored elsewhere).
+    各供应方的凭证键：
+      anthropic:     api_key、model、base_url（可选）、url_mode（可选：base_url|full_url）
+      openai:        api_key、model、base_url（可选）、url_mode（可选：base_url|full_url）
+      azure_openai:  api_key、endpoint、api_version（可选）、model（可选——同时也是
+                     Azure 部署名；没有独立的部署键，凭证里多余的部署键会被静默忽略）
+      google_gemini: api_key、model、base_url（可选）、url_mode（可选：base_url|full_url）
+    所有供应方还接受 context_window（可选：对名称匹配默认值的逐配置覆盖；
+    None = 按模型名自动匹配）、thinking_enabled（可选：扩展思考覆盖；
+    None = 环境默认值 AGENT_EXTENDED_THINKING——anthropic/google_gemini 会采用，
+    openai/azure_openai 接受但忽略，其思维链只解析）以及 reasoning_effort
+    （可选："minimal"|"low"|"medium"|"high"；只发给 OpenAI 家族的推理模型，
+    其他地方忽略）。
     """
     loader = _PROVIDER_LOADERS.get(provider_key)
     if loader is None:
@@ -48,11 +46,10 @@ def get_provider(provider_key: str, credentials: dict[str, Any]) -> LLMProvider:
         )
     api_key = credentials.get("api_key")
     if isinstance(api_key, str) and api_key:
-        # The key goes into an HTTP header verbatim (x-api-key / Bearer /
-        # api-key). h11 rejects an illegal value by echoing it back
-        # ("Illegal header value b'...'") — that echo IS the credential, and
-        # it would surface in stream error messages, logs and task_failed
-        # rows. Refuse construction; the message names no secret.
+        # 密钥会原样进入 HTTP 头（x-api-key / Bearer / api-key）。h11 遇到非法
+        # 值会把它回显出来拒绝（"Illegal header value b'...'"）——该回显本身就是
+        # 凭证，会出现在流式错误消息、日志和 task_failed 行里。拒绝构造；消息中
+        # 不点名任何秘密。
         from ..tools._http import _header_value_problem
         problem = _header_value_problem(api_key)
         if problem:
@@ -71,18 +68,17 @@ def get_provider(provider_key: str, credentials: dict[str, Any]) -> LLMProvider:
 
 
 def default_context_window(provider_key: str, model: str) -> int:
-    """Name-matched context window (tokens) a provider would use without an override.
+    """供应方在无覆盖时按名称匹配使用的上下文窗口（token 数）。
 
-    This is the value shown as the prefill/default in Settings → AI Models and
-    what the runtime falls back to when a config leaves context_window unset.
-    Lazy imports mirror _PROVIDER_LOADERS so merely calling this never pulls
-    in an LLM SDK.
+    这是“设置 → AI 模型”里显示为预填/默认值的数字，也是配置未设置 context_window
+    时运行时回退采用的值。惰性导入与 _PROVIDER_LOADERS 对应，因此仅调用本函数
+    绝不会拉入 LLM SDK。
     """
     if provider_key == "anthropic":
         from .anthropic_claude import _context_window
     elif provider_key == "google_gemini":
         from .google_gemini import _context_window
     else:
-        # openai + azure_openai share the OpenAI name table.
+        # openai 与 azure_openai 共用 OpenAI 名称表。
         from .openai import _context_window
     return _context_window(model)

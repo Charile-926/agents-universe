@@ -1,6 +1,6 @@
-"""Shared HTTP client factory for agent tools.
+"""智能体工具共用的 HTTP 客户端工厂。
 
-Configures proxy, SSL, timeout, and SSRF protection from environment.
+根据环境配置代理、SSL、超时与 SSRF 防护。
 """
 from __future__ import annotations
 
@@ -16,35 +16,31 @@ _DEFAULT_TIMEOUT = 60.0
 
 
 def _header_value_problem(value: str) -> str | None:
-    """Why *value* cannot be sent as an HTTP header value, or None if it can.
+    """*value* 为何不能作为 HTTP 头值发送，能发送则返回 None。
 
-    httpx/h11 reject an illegal value by echoing it back ("Illegal header
-    value b'...'") — for a rendered secret that message IS the credential,
-    and it would reach connection warnings, tool error results, and test
-    endpoint responses (format_exc-style chains carry it too). Validate
-    before the transport ever sees the value; the caller's error names only
-    the header. Non-ASCII fails anyway (httpx encodes str values as ascii)
-    and its UnicodeEncodeError quotes the offending character.
+    httpx/h11 拒绝非法值时会把它原样回显（"Illegal header value b'...'"）——对
+    渲染出的密钥而言，该消息本身就是凭证，会进入连接警告、工具错误结果和测试端点
+    响应（format_exc 风格的链也会携带它）。在传输层看到该值之前先校验；调用方的
+    错误只点名头字段。非 ASCII 本来就会失败（httpx 把 str 值按 ascii 编码），其
+    UnicodeEncodeError 会引用出错字符。
     """
     if not value.isascii():
         return "contains a non-ASCII character"
     if any(ch != "\t" and ord(ch) < 0x20 for ch in value):
         return "contains a control character (a pasted trailing newline, perhaps)"
-    # h11 rejects leading/trailing OWS and echoes the whole value in the
-    # error — for a rendered secret that message IS the credential. Interior
-    # spaces/tabs between non-space runs are legal.
+    # h11 拒绝首尾 OWS 并在错误中回显整个值——对渲染出的密钥，该消息本身就是
+    # 凭证。非空白段之间的内部空格/制表符合法。
     if value != value.strip(" \t"):
         return "has leading or trailing whitespace (a pasted trailing space, perhaps)"
     return None
 
 
 def redact_secret(text: str, secret: str | None) -> str:
-    """Replace *secret* in *text* with ``[REDACTED]``.
+    """把 *text* 中的 *secret* 替换为 ``[REDACTED]``。
 
-    Both the raw value and its bytes-repr escaped form are matched: h11 and
-    tracebacks quote values via repr, so a pasted trailing newline appears
-    there as a literal backslash-n that a raw substring replace would miss.
-    Same rule as the ``_redact_key`` helpers in the token/api-key routers.
+    同时匹配原始值及其字节 repr 的转义形式：h11 和回溯通过 repr 引用值，因此粘贴
+    带来的尾随换行在那里以字面反斜杠-n 出现，原始子串替换会漏掉。规则与
+    token/api-key 路由中的 ``_redact_key`` 辅助函数相同。
     """
     if not text or not secret:
         return text
@@ -59,7 +55,7 @@ def redact_secret(text: str, secret: str | None) -> str:
 
 
 def _should_bypass_proxy(target_url: str, no_proxy: str) -> bool:
-    """Check if target_url matches any entry in the NO_PROXY list."""
+    """检查 target_url 是否匹配 NO_PROXY 列表中的任意条目。"""
     if not no_proxy or not target_url:
         return False
     host = urlparse(target_url).hostname or ""
@@ -77,18 +73,17 @@ def _should_bypass_proxy(target_url: str, no_proxy: str) -> bool:
 
 
 def _is_ssrf_enabled() -> bool:
-    """SSRF protection is OFF by default. Set SSRF_ENABLED=true to enable."""
+    """SSRF 防护默认关闭。设置 SSRF_ENABLED=true 开启。"""
     return os.environ.get("SSRF_ENABLED", "").lower() in ("1", "true", "yes")
 
 
 def validate_outbound_url(url: str) -> None:
-    """Validate a URL for SSRF safety before making an outbound request.
+    """在发出出站请求前校验 URL 的 SSRF 安全性。
 
-    SSRF protection is disabled by default. Enable via SSRF_ENABLED=true env var.
-    When enabled, checks scheme, port, and resolves DNS to verify the target IP
-    is not in a blocked range (private, loopback, link-local, metadata, etc.).
+    SSRF 防护默认禁用，通过环境变量 SSRF_ENABLED=true 开启。开启后检查协议、端口，
+    并解析 DNS 以确认目标 IP 不在封禁段（私有、环回、链路本地、元数据等）。
 
-    Raises SSRFError if the URL is unsafe.
+    URL 不安全时抛出 SSRFError。
     """
     if not _is_ssrf_enabled():
         return
@@ -101,23 +96,20 @@ def validate_outbound_url(url: str) -> None:
 
 
 class _SSRFPinningTransport(httpx.AsyncBaseTransport):
-    """Close the DNS-rebinding TOCTOU window on agent-facing requests.
+    """消除面向智能体请求上的 DNS 重绑定 TOCTOU 时间窗。
 
-    The tools validate a URL (DNS included) BEFORE the request, but httpx
-    re-resolves the hostname at connect time - a rebinding DNS server can
-    answer the validation lookup with a public IP and the connect lookup
-    with 127.0.0.1. This transport re-resolves at request time and pins the
-    connection to a validated IP: the URL host is rewritten to the IP, while
-    the Host header and TLS SNI (httpcore's sni_hostname extension) keep the
-    original name so vhosts and certificate validation behave normally.
+    工具在请求“之前”校验 URL（含 DNS），但 httpx 在连接时会重新解析主机名——重绑定
+    DNS 服务器可对校验查询回答公网 IP，对连接查询回答 127.0.0.1。该传输在请求时
+    重新解析并把连接固定到已校验的 IP：URL 主机改写为 IP，同时 Host 头和 TLS SNI
+    （httpcore 的 sni_hostname 扩展）保留原名，使虚拟主机和证书校验行为正常。
     """
 
     def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
         self._inner = inner
 
     async def aclose(self) -> None:
-        # AsyncBaseTransport.aclose is a no-op; without this override closing
-        # the client leaves the inner transport's connection pool open.
+        # AsyncBaseTransport.aclose 是空操作；不重写它，关闭客户端会让内部传输的
+        # 连接池一直开着。
         await self._inner.aclose()
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
@@ -133,42 +125,36 @@ class _SSRFPinningTransport(httpx.AsyncBaseTransport):
         host = url.host
         if not host:
             return
-        # Literal IPs were already validated by the call site's validate_url;
-        # port/scheme checks likewise happened pre-request (several call
-        # sites legitimately use non-allowlisted ports, so no re-check here).
+        # 字面 IP 已由调用处的 validate_url 校验过；端口/协议检查同样在请求前完成
+        # （多个调用处合法使用非白名单端口，因此这里不重复检查）。
         try:
             ipaddress.ip_address(host)
             return
         except ValueError:
             pass
         port = url.port or (443 if url.scheme == "https" else 80)
-        # getaddrinfo is blocking - keep it off the event loop.
+        # getaddrinfo 是阻塞的——让它远离事件循环。
         safe_ips = await asyncio.to_thread(resolve_and_validate, host, port)
         ip = safe_ips[0]
-        # Request.url is a plain attribute - reassigning it before the inner
-        # transport sees the request redirects the connection; the proxy
-        # CONNECT target and Host header derive from what we set here.
-        # copy_with(host=...) brackets IPv6 and preserves the URL's own port;
-        # copy_with(netloc=...) cannot parse bracketed IPv6.
+        # Request.url 是普通属性——在内部传输看到请求前重赋它即可重定向连接；代理
+        # CONNECT 目标和 Host 头都派生自这里的设置。
+        # copy_with(host=...) 会给 IPv6 加括号并保留 URL 自身端口；
+        # copy_with(netloc=...) 无法解析带括号的 IPv6。
         request.url = url.copy_with(host=ip)
         request.headers["Host"] = host if (port == 80 or port == 443) else f"{host}:{port}"
         request.extensions["sni_hostname"] = host
-        # Never reuse the pinned connection: httpcore pools by the REWRITTEN
-        # origin (scheme, IP, port), so a later request to a different
-        # hostname that resolves to the same IP would ride this connection —
-        # its TLS session was only ever validated for the first hostname, and
-        # its headers (Authorization!) would reach whoever controls the IP.
-        # Closing after each response forces a fresh handshake whose
-        # certificate is validated for the current hostname.
+        # 绝不复用固定连接：httpcore 按改写后的源（协议、IP、端口）做池化，因此之后
+        # 对解析到同一 IP 的另一主机名的请求会复用这条连接——其 TLS 会话只针对第一
+        # 个主机名校验过，且其头（Authorization！）会到达控制该 IP 的人。每次响应后
+        # 关闭，强制重新握手并针对当前主机名校验证书。
         request.headers["Connection"] = "close"
 
 
 def _ssrf_transport_kwargs(ssl_verify: bool, proxy: str | None) -> dict:
-    """Transport kwargs for ensure_http_client's clients.
+    """ensure_http_client 各客户端的传输参数。
 
-    With SSRF enabled, wrap the real transport in the pinning layer and move
-    the proxy onto the inner transport (httpx ignores proxy= when a custom
-    transport is passed). Disabled -> proxy as a plain client kwarg.
+    SSRF 开启时，把真实传输包进固定层，并把代理移到内部传输上（传入自定义传输时
+    httpx 会忽略 proxy=）。关闭时——代理作为普通客户端参数。
     """
     if not _is_ssrf_enabled():
         return {"proxy": proxy} if proxy else {}
@@ -180,37 +166,32 @@ def _ssrf_transport_kwargs(ssl_verify: bool, proxy: str | None) -> dict:
 
 
 def ensure_http_client(context: ToolContext, target_url: str = "") -> httpx.AsyncClient:
-    """Return the shared httpx client from context, creating one if needed.
+    """返回上下文中共享的 httpx 客户端，需要时创建一个。
 
-    Uses a generous default timeout since various tools (Kong, Confluence)
-    may need longer than 30s. Individual requests can override with
-    httpx per-request timeout if needed.
+    采用宽裕的默认超时，因为各类工具（Kong、Confluence）可能需要超过 30 秒。需要时
+    单个请求可用 httpx 的逐请求超时覆盖。
 
-    If target_url matches NO_PROXY, a separate non-proxied client is used.
+    若 target_url 匹配 NO_PROXY，使用独立的非代理客户端。
 
-    NOTE: This returns the shared client. Callers should use
-    validate_outbound_url() BEFORE making requests to untrusted URLs.
-    Internal/trusted URLs (LLM providers, configured integrations) may
-    skip SSRF validation.
+    注意：这里返回共享客户端。调用方在对不可信 URL 发请求“之前”应使用
+    validate_outbound_url()。内部/可信 URL（LLM 供应方、已配置的集成）可跳过 SSRF
+    校验。
     """
     no_proxy = context.cfg("NO_PROXY") or os.environ.get("no_proxy", "")
     bypass = _should_bypass_proxy(target_url, no_proxy)
 
     ssl_verify = context.ssl_verify
 
-    # Lazy resources live on the SHARED context (copy_for_task's owner
-    # reference): a task clone must reuse the session's client, or every
-    # parallel task opens its own connection pool that cleanup() never sees.
+    # 惰性资源位于共享上下文（copy_for_task 的属主引用）：任务克隆必须复用会话的
+    # 客户端，否则每个并行任务都会打开自己的、cleanup() 永远看不到的连接池。
     owner = getattr(context, "_shared", None) or context
 
     if bypass:
         if owner.http_client_no_proxy is not None:
             context.http_client_no_proxy = owner.http_client_no_proxy
             return owner.http_client_no_proxy
-        # When SSRF is enabled the pinning transport wraps the real one -
-        # httpx ignores proxy= alongside a custom transport, so the proxy
-        # must live on the INNER transport (none here - this client is
-        # explicitly non-proxied).
+        # SSRF 开启时固定传输包裹真实传输——自定义传输旁 httpx 忽略 proxy=，因此
+        # 代理必须放在内部传输上（这里没有——该客户端明确不走代理）。
         owner.http_client_no_proxy = httpx.AsyncClient(
             verify=ssl_verify,
             timeout=_DEFAULT_TIMEOUT,

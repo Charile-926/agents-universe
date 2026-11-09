@@ -1,4 +1,4 @@
-"""Abstract LLM provider interface."""
+"""LLM 供应方抽象接口。"""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -8,11 +8,11 @@ from typing import AsyncIterator
 
 
 class StopReason(str, Enum):
-    """Normalized stop reasons across all providers.
+    """所有供应方统一规范化后的停止原因。
 
-    Anthropic: end_turn, tool_use, max_tokens, pause_turn, refusal,
-    stop_sequence, model_context_window_exceeded
-    OpenAI: stop, tool_calls, length, content_filter
+    Anthropic：end_turn、tool_use、max_tokens、pause_turn、refusal、
+    stop_sequence、model_context_window_exceeded
+    OpenAI：stop、tool_calls、length、content_filter
     """
     END_TURN = "end_turn"
     TOOL_USE = "tool_use"
@@ -34,10 +34,9 @@ class StopReason(str, Enum):
             "max_tokens": cls.MAX_TOKENS,
             "pause_turn": cls.PAUSE_TURN,
             "refusal": cls.REFUSAL,
-            # Anthropic's stop reason when the REQUEST exceeds the model's
-            # context window. Unmapped it became UNKNOWN, which the agent
-            # treats as a normal end_turn — the context_exceeded event (and
-            # the UI's compress-and-retry affordance) never fired.
+            # 当请求超出模型上下文窗口时 Anthropic 的停止原因。未映射时会变成
+            # UNKNOWN，Agent 把它当作普通 end_turn——context_exceeded 事件（以及
+            # 界面的“压缩后重试”功能）永远不会触发。
             "model_context_window_exceeded": cls.CONTEXT_EXCEEDED,
         }
         return mapping.get(raw, cls.UNKNOWN)
@@ -55,40 +54,37 @@ class StopReason(str, Enum):
         return mapping.get(raw, cls.UNKNOWN)
 
 
-# Substrings that identify a context-window overflow across the major
-# provider SDKs and common OpenAI-compatible gateways. Matched against the
-# lowercased exception text only when the HTTP status is 400 — a 400 without
-# any of these stays UNKNOWN so schema/auth errors keep the api_error path.
+# 在主流供应方 SDK 和常见 OpenAI 兼容网关中识别上下文窗口溢出的子串。仅当 HTTP
+# 状态码为 400 时才与小写化的异常文本匹配——不含这些标记的 400 仍为 UNKNOWN，
+# 使模式/鉴权错误保持走 api_error 路径。
 _CONTEXT_OVERFLOW_MARKERS = (
-    # OpenAI SDK / Azure OpenAI / OpenAI-compatible gateways
+    # OpenAI SDK / Azure OpenAI / OpenAI 兼容网关
     "maximum context length",
     "context_length_exceeded",
     "context length exceeded",
-    # Anthropic SDK (raised as BadRequestError, distinct from the streamed
-    # model_context_window_exceeded stop reason)
+    # Anthropic SDK（作为 BadRequestError 抛出，区别于流式的
+    # model_context_window_exceeded 停止原因）
     "prompt is too long",
     "model_context_window_exceeded",
-    # Google Gemini SDK
+    # 谷歌 Gemini SDK
     "input token count exceeds",
     "reduce the length of the input",
     "input length and",
-    # Generic gateway phrasings ("context window exceeded", "too long for
-    # the model's context window")
+    # 通用网关措辞（"context window exceeded"、"too long for the model's
+    # context window"）
     "too long for",
 )
 
 
 def classify_api_error(exc: BaseException) -> StopReason:
-    """Map a provider/SDK exception to CONTEXT_EXCEEDED on context-window overflow.
+    """在上下文窗口溢出时把供应方/SDK 异常映射为 CONTEXT_EXCEEDED。
 
-    Duck-typed on purpose: the SDKs (openai/anthropic/google-genai) are
-    optional dependencies loaded only via the registry, so their exception
-    classes must not be imported here. Status code is read from whichever
-    attribute the raising layer carries; the text sweep covers the differing
-    error-body shapes (str(exc), .message, .body, .details, HTTP response).
+    刻意采用鸭子类型：SDK（openai/anthropic/google-genai）是只经注册表加载的
+    可选依赖，因此这里不能导入它们的异常类。状态码从抛出层携带的任意属性读取；
+    文本扫描覆盖不同的错误体形态（str(exc)、.message、.body、.details、HTTP
+    响应）。
 
-    Classification only picks a branch — the caller never forwards the
-    exception text to the UI, so no credential scrubbing is needed here.
+    分类只负责选择分支——调用方从不把异常文本转发给界面，因此这里无需凭证脱敏。
     """
     status = getattr(exc, "status_code", None)  # openai/anthropic APIStatusError
     if not isinstance(status, int):
@@ -97,8 +93,7 @@ def classify_api_error(exc: BaseException) -> StopReason:
         response = getattr(exc, "response", None)  # httpx.HTTPStatusError
         status = getattr(response, "status_code", None)
     if status == 413:
-        # Payload too large on a chat request ≈ overflow — no text match
-        # needed (gateways phrase this one every possible way).
+        # 聊天请求的负载过大 ≈ 溢出——无需文本匹配（网关对此的措辞千奇百怪）。
         return StopReason.CONTEXT_EXCEEDED
     if status != 400:
         return StopReason.UNKNOWN
@@ -116,8 +111,8 @@ def classify_api_error(exc: BaseException) -> StopReason:
 
     if any(marker in text for marker in _CONTEXT_OVERFLOW_MARKERS):
         return StopReason.CONTEXT_EXCEEDED
-    # "context window" alone is too broad (config errors mention it too) —
-    # require an overflow verb next to it.
+    # 单独的 "context window" 太宽泛（配置错误也会提到它）——要求它旁边出现溢出
+    # 动词。
     if "context window" in text and any(
         verb in text for verb in ("exceed", "exceeded", "overflow", "too large")
     ):
@@ -126,10 +121,10 @@ def classify_api_error(exc: BaseException) -> StopReason:
 
 
 def thinking_enabled_by_env() -> bool:
-    """Shared extended-thinking switch (AGENT_EXTENDED_THINKING, default on).
+    """共享的扩展思考开关（AGENT_EXTENDED_THINKING，默认开启）。
 
-    Providers that must REQUEST thinking (Anthropic, Gemini) consult this;
-    providers that only PARSE an existing reasoning channel ignore it.
+    必须主动请求思考的供应方（Anthropic、Gemini）会查询它；只解析已有推理通道
+    的供应方则忽略它。
     """
     import os
     return os.environ.get("AGENT_EXTENDED_THINKING", "1").strip().lower() not in ("0", "false", "no")
@@ -138,14 +133,13 @@ def thinking_enabled_by_env() -> bool:
 @dataclass
 class Message:
     role: str  # "system" | "user" | "assistant" | "tool"
-    content: str | list  # str for text; list for multimodal (vision)
+    content: str | list  # 文本用 str；多模态（视觉）用 list
     tool_calls: list[dict] | None = None
     tool_call_id: str | None = None
-    name: str | None = None  # for tool role messages
-    # Anthropic extended-thinking blocks for same-turn tool-loop replay only
-    # (the API requires signed thinking blocks back on the next request when
-    # the assistant turn carries tool_use). Never persisted to the DB —
-    # history compression would invalidate the signatures.
+    name: str | None = None  # 用于 tool 角色消息
+    # Anthropic 扩展思考块，仅用于同轮工具循环回放（当助手轮携带 tool_use 时，
+    # API 要求在下一次请求中回传带签名的思考块）。绝不持久化到数据库——历史
+    # 压缩会使签名失效。
     thinking_blocks: list[dict] | None = None
 
 
@@ -153,21 +147,20 @@ class Message:
 class ToolDefinition:
     name: str
     description: str
-    parameters: dict  # JSON Schema object
+    parameters: dict  # JSON Schema 对象
 
 
 @dataclass
 class StreamChunk:
     delta: str = ""
     tool_call_delta: dict | None = None
-    finish_reason: str | None = None  # raw provider string
-    stop_reason: StopReason | None = None  # normalized
+    finish_reason: str | None = None  # 供应方原始字符串
+    stop_reason: StopReason | None = None  # 规范化后的值
     usage: dict | None = None  # {"prompt_tokens": int, "completion_tokens": int}
-    # Extended thinking / reasoning output (mutually exclusive with delta in
-    # practice: a provider yields either visible text or thinking per event).
+    # 扩展思考/推理输出（实践中与 delta 互斥：供应方每个事件要么产出可见文本，
+    # 要么产出思考）。
     thinking: str = ""
-    # Anthropic signature closing a thinking block — required to replay the
-    # block back on the next tool-loop request.
+    # 闭合思考块的 Anthropic 签名——在下一次工具循环请求中回放该块时必需。
     thinking_signature: str | None = None
 
 
@@ -176,12 +169,12 @@ class CompletionResult:
     message: Message
     usage: dict  # {"prompt_tokens": int, "completion_tokens": int}
     model: str
-    finish_reason: str  # raw provider string
+    finish_reason: str  # 供应方原始字符串
     stop_reason: StopReason = StopReason.UNKNOWN
 
 
 class LLMProvider(ABC):
-    """Abstract base for all LLM providers."""
+    """所有 LLM 供应方的抽象基类。"""
 
     @abstractmethod
     async def complete(
@@ -191,7 +184,7 @@ class LLMProvider(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.0,
     ) -> CompletionResult:
-        """Non-streaming completion."""
+        """非流式补全。"""
         ...
 
     @abstractmethod
@@ -202,56 +195,55 @@ class LLMProvider(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.0,
     ) -> AsyncIterator[StreamChunk]:
-        """Streaming completion. Yields StreamChunk objects."""
+        """流式补全，逐个产出 StreamChunk 对象。"""
         ...
 
     async def embed(self, text: str) -> list[float]:
-        """Generate embedding vector for text. Optional — not used by framework."""
+        """为文本生成嵌入向量。可选能力——框架不使用。"""
         raise NotImplementedError(f"{type(self).__name__} does not support embeddings")
 
     @property
     @abstractmethod
     def context_window(self) -> int:
-        """Maximum context tokens this provider/model supports."""
+        """本供应方/模型支持的最大上下文 token 数。"""
         ...
 
     @property
     @abstractmethod
     def supports_tool_calls(self) -> bool:
-        """Whether this provider supports tool/function calling."""
+        """本供应方是否支持工具/函数调用。"""
         ...
 
     @property
     @abstractmethod
     def supports_vision(self) -> bool:
-        """Whether this provider supports image inputs."""
+        """本供应方是否支持图像输入。"""
         ...
 
     @property
     @abstractmethod
     def model_name(self) -> str:
-        """The model identifier string."""
+        """模型标识符字符串。"""
         ...
 
     async def close(self) -> None:
-        """Release any held resources (HTTP clients, connections). Safe to call multiple times."""
+        """释放持有的资源（HTTP 客户端、连接）。可安全重复调用。"""
 
     def secret_values(self) -> list[str]:
-        """Credential values this provider puts on the wire.
+        """本供应方实际发送到网络上的凭证值。
 
-        Every concrete provider stores its key as ``_api_key``. Provider
-        exceptions (SDK auth errors, h11's header rejection) can embed the
-        key, so callers that log exception text run it through :meth:`scrub`
-        first — tokens are never logged (CLAUDE.md token-security rule).
+        每个具体供应方都把密钥存为 ``_api_key``。供应方异常（SDK 鉴权错误、
+        h11 的头拒绝）可能内嵌密钥，因此记录异常文本的调用方要先经
+        :meth:`scrub` 处理——token 绝不入日志（CLAUDE.md 的 token 安全规则）。
         """
         key = getattr(self, "_api_key", None)
         return [key] if isinstance(key, str) and key else []
 
     def scrub(self, text: str) -> str:
-        """Replace every :meth:`secret_values` entry in *text* with ``[REDACTED]``.
+        """把 *text* 中 :meth:`secret_values` 的每个条目替换为 ``[REDACTED]``。
 
-        Matches the raw value and the bytes-repr escaped form h11/tracebacks
-        quote — see :func:`agent_core.tools._http.redact_secret`.
+        同时匹配原始值和 h11/回溯所引用的字节 repr 转义形式——参见
+        :func:`agent_core.tools._http.redact_secret`。
         """
         from ..tools._http import redact_secret
         for value in self.secret_values():

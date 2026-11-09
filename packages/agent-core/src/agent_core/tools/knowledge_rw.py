@@ -1,14 +1,14 @@
-"""Knowledge read/write tool — manages Markdown knowledge files in the project.
+"""知识读写工具——管理项目中的 Markdown 知识文件。
 
-Supports hierarchical knowledge with dynamic loading/unloading:
-- read: one-time file access (content in tool result only); `slugs` reads several at once
-- write: persist changes to disk
-- load: bring a detail file into persistent dynamic context
-- unload: release a dynamically loaded file
-- refresh: re-read a file already in context (static or dynamic)
-- status: show context state (static, dynamic, deferred, overflow)
-- list: list files with status badges
-- search_by_slug: partial slug matching
+支持带动态加载/卸载的分层知识：
+- read：一次性文件访问（内容仅在工具结果中）；`slugs` 一次读取多个
+- write：把变更持久化到磁盘
+- load：把详情文件带入持久动态上下文
+- unload：释放动态加载的文件
+- refresh：重读已在上下文中的文件（静态或动态）
+- status：显示上下文状态（静态、动态、延迟、溢出）
+- list：列出带状态标记的文件
+- search_by_slug：slug 部分匹配
 """
 from __future__ import annotations
 
@@ -34,26 +34,24 @@ _log = logging.getLogger("agent_core.knowledge_rw")
 
 _SLUG_RE = KNOWLEDGE_SLUG_RE
 
-# Appended to every "invalid slug" error: the slug regex is ASCII-only by
-# design (path-traversal defense), and CJK-named files are the common mistake.
+# 追加到每个“非法 slug”错误之后：slug 正则按设计只接受 ASCII（路径穿越防御），
+# 而 CJK 命名文件是常见错误。
 _SLUG_HINT = (
     " Slugs must be ASCII path segments; for a Chinese name keep the ASCII "
     'slug/filename and put the name in frontmatter `title` (e.g. title: "API 详情").'
 )
 
-# Writes are capped in UTF-8 BYTES just under loader.MAX_FILE_SIZE (512 KB) so
-# a written file always loads back into context. A character-based cap would
-# overrun the loader's byte limit on CJK-heavy content (3 bytes/char) and the
-# file would silently fall out of context as "overflow".
+# 写入以 UTF-8 字节计，上限略低于 loader.MAX_FILE_SIZE（512 KB），使写入的文件
+# 总能加载回上下文。基于字符的上限会在 CJK 密集内容（每字符 3 字节）上超出加载器
+# 字节限制，文件会以“overflow”静默掉出上下文。
 _MAX_WRITE_BYTES = 500 * 1024
 
 
 async def _read_knowledge_file(path: Path) -> str:
-    """Read a knowledge file, enforcing the loader's 512 KB cap.
+    """读取知识文件，执行加载器 512 KB 上限。
 
-    loader.py indexes only files up to MAX_FILE_SIZE; reading a bigger file
-    whole into the LLM context here would blow the context budget where the
-    loader would have refused it.
+    loader.py 只索引不超过 MAX_FILE_SIZE 的文件；在这里把更大的文件整体读进 LLM
+    上下文，会在加载器本会拒绝它的地方撑爆上下文预算。
     """
     stat = path.stat()
     if stat.st_size > MAX_FILE_SIZE:
@@ -62,13 +60,12 @@ async def _read_knowledge_file(path: Path) -> str:
             f"{MAX_FILE_SIZE} byte load limit. Split the file or lower its "
             f"knowledge_level."
         )
-    # A UTF-8 BOM would stick to the content start and skew hash/parse.
+    # UTF-8 BOM 会粘在内容开头并使哈希/解析偏移。
     return (await asyncio.to_thread(path.read_text, "utf-8")).lstrip("\ufeff")
 
 
 def _safe_resolve(slug: str, knowledge_dir: Path) -> Path | None:
-    """Resolve slug to a path within knowledge_dir. Returns None on invalid
-    slug format or traversal."""
+    """把 slug 解析为 knowledge_dir 内的路径。slug 格式非法或穿越时返回 None。"""
     if not slug or not _SLUG_RE.match(slug):
         return None
     try:
@@ -142,10 +139,9 @@ class KnowledgeRWTool(Tool):
 
     async def execute(self, params: dict[str, Any], context: ToolContext) -> dict[str, Any]:
         operation = params["operation"]
-        # Resolved once: every operation pairs this path with paths produced by
-        # rglob/resolve (which are fully resolved), and a knowledge_dir holding
-        # a symlink or `..` segment made relative_to() raise ValueError — the
-        # whole `list`/`read`/`write` call failed instead of returning files.
+        # 只解析一次：每个操作都把该路径与 rglob/resolve 产出的路径（已完全解析）
+        # 配对，而含符号链接或 `..` 段的 knowledge_dir 会让 relative_to() 抛
+        # ValueError——整个 `list`/`read`/`write` 调用失败而非返回文件。
         knowledge_dir = Path(context.knowledge_dir()).resolve()
 
         if operation == "list":
@@ -186,7 +182,7 @@ class KnowledgeRWTool(Tool):
         return {"error": f"Unknown operation: {operation}"}
 
     # ------------------------------------------------------------------
-    # Operations
+    # 各操作实现
     # ------------------------------------------------------------------
 
     async def _op_list(self, params: dict, knowledge_dir: Path, context: ToolContext) -> dict:
@@ -228,8 +224,8 @@ class KnowledgeRWTool(Tool):
                     "summary": summary,
                     "parent_slug": parent,
                     "children_count": len(normalize_children(children)),
-                    # A CJK/invalid slug cannot be read/written through this
-                    # tool — flag it so the agent renames instead of retrying.
+                    # CJK/非法 slug 无法通过本工具读写——标记它，使智能体重命名
+                    # 而非重试。
                     **({} if _SLUG_RE.match(slug) else {"status": "invalid_slug"}),
                 })
             return files
@@ -268,7 +264,7 @@ class KnowledgeRWTool(Tool):
             return {"error": f"Invalid slug: {slug!r}.{_SLUG_HINT}"}
         import logging
         _log = logging.getLogger("agent_core.knowledge_rw")
-        # Log the slug only — avoid leaking host filesystem structure into logs
+        # 只记录 slug——避免把主机文件系统结构泄漏进日志
         _log.info("knowledge_rw read: slug=%s", slug)
         if not await asyncio.to_thread(file_path.exists):
             kdir_exists = await asyncio.to_thread(knowledge_dir.exists)
@@ -308,18 +304,16 @@ class KnowledgeRWTool(Tool):
         }
 
     async def _op_read_many(self, params: dict, knowledge_dir: Path) -> dict:
-        """Read several slugs in one call.
+        """一次调用读取多个 slug。
 
-        Answers keep the caller's order and carry per-file errors (a missing
-        slug reports itself, it does not sink the batch) — the same contract as
-        the confluence batch read.
+        答案保持调用方顺序并携带逐文件错误（缺失 slug 报告自身，不拖垮整批）——
+        与 confluence 批量读取相同的约定。
         """
         slugs = params.get("slugs") or []
-        # LLM-stringified param: a bare string would iterate character by character.
+        # LLM 字符串化的参数：裸字符串会逐字符迭代。
         if isinstance(slugs, str):
             slugs = slugs.split(",")
-        # Stripped in both branches — a whitespace-only entry is a slug the
-        # caller never meant to ask for.
+        # 两个分支都做 strip——纯空白条目是调用方本无意索要的 slug。
         slugs = [s.strip() for s in slugs if isinstance(s, str) and s.strip()]
         if not slugs:
             return {"error": "slugs must be a non-empty array of slugs"}
@@ -345,9 +339,8 @@ class KnowledgeRWTool(Tool):
             return {"error": "slug is required for write operation"}
         if not _SLUG_RE.match(slug):
             return {"error": f"Invalid slug format: {slug!r}. Use ASCII path-safe segments (letters, digits, '-', '_', '.') joined by slashes." + _SLUG_HINT}
-        # loader.MAX_FILE_SIZE (512 KB) silently drops oversized
-        # files from context — cap writes (in UTF-8 bytes) below that so what
-        # the agent writes is always loadable again.
+        # loader.MAX_FILE_SIZE（512 KB）会把超大文件静默移出上下文——把写入
+        # （以 UTF-8 字节计）限制在其下，使智能体写入的内容总能再次加载。
         content_bytes = len(content.encode("utf-8"))
         if content_bytes > _MAX_WRITE_BYTES:
             return {"error": (
@@ -358,14 +351,12 @@ class KnowledgeRWTool(Tool):
 
         file_path = _safe_resolve(slug, knowledge_dir)
         if file_path is None:
-            # _safe_resolve also rejects a slug whose file already exists as
-            # a symlink pointing outside the knowledge dir (resolve_within
-            # realpaths) — writing there would overwrite an external file.
+            # _safe_resolve 也拒绝其文件已作为指向知识目录之外符号链接存在的
+            # slug（resolve_within 走真实路径）——写那里会覆盖外部文件。
             return {"error": f"Invalid or escaping slug: {slug!r}"}
 
-        # A slug is "new" if its file does not exist on disk yet — the DB index
-        # row is only created by reindex_one after this write, so the disk is
-        # the authoritative check for "did the project already have this file".
+        # slug 的文件在磁盘上尚不存在时为“新”——DB 索引行只在本次写入后由
+        # reindex_one 创建，因此磁盘是“项目是否已有此文件”的权威检查。
         is_new_file = not await asyncio.to_thread(file_path.exists)
 
         def _do_write() -> dict:
@@ -390,9 +381,8 @@ class KnowledgeRWTool(Tool):
         result = await asyncio.to_thread(_do_write)
         result["indexed"] = False
         if result.get("changed"):
-            # Hierarchy closure FIRST: the child's frontmatter `parent` must
-            # land in the parent's `children` before the child reindex runs,
-            # so a single-write flow leaves both rows consistent.
+            # 先做层级闭合：子文件 frontmatter 的 `parent` 必须在子文件 reindex
+            # 运行之前落入父文件的 `children`，使单次写入流程让两行保持一致。
             try:
                 meta = frontmatter.loads(content).metadata
             except Exception:
@@ -409,8 +399,8 @@ class KnowledgeRWTool(Tool):
                         knowledge_dir=knowledge_dir,
                     )
                     if synced and context.project_context is not None:
-                        # Keep the in-memory parent entry's children list in
-                        # step so children/status answer without a reload.
+                        # 让内存中父条目的 children 列表同步，使 children/status
+                        # 无需重载即可回答。
                         pctx = context.project_context
                         pentry = pctx.deferred_entries.get(str(parent_slug)) or next(
                             (e for e in pctx.loaded_entries if e.slug == str(parent_slug)),
@@ -427,11 +417,9 @@ class KnowledgeRWTool(Tool):
                         "warnings", [],
                     ).append(f"Could not add {slug} to parent {parent_slug}'s children list.")
 
-        # Reindex on every write, including one whose content is unchanged: an
-        # on-disk hash match only proves the file is current, not that the
-        # knowledge row exists or matches it (an earlier reindex may have
-        # failed, or the DB may have been rebuilt). indexed=True must mean the
-        # row really was refreshed, so an idempotent write repairs the index.
+        # 每次写入都 reindex，包括内容未变的写入：磁盘哈希匹配只证明文件当前，不
+        # 证明知识行存在或与其匹配（之前的 reindex 可能失败，或数据库已重建）。
+        # indexed=True 必须意味着行确实被刷新，因此幂等写入会修复索引。
         if context.db_session is not None:
             try:
                 from agent_core.knowledge.index import reindex_one
@@ -448,8 +436,7 @@ class KnowledgeRWTool(Tool):
                     result.setdefault("warnings", []).append(w)
             except Exception:
                 _log.warning("Knowledge reindex failed for slug=%s project=%s", slug, context.project_id, exc_info=True)
-                # A detail file without an index row is invisible to the
-                # deferred list — the failure must be visible, not silent.
+                # 无索引行的详情文件对延迟列表不可见——失败必须可见，不能静默。
                 result.setdefault("warnings", []).append(
                     f"File written but knowledge index NOT updated for {slug} "
                     "(reindex failed). Detail files missing an index row are "
@@ -462,16 +449,13 @@ class KnowledgeRWTool(Tool):
                 "(no database session). Detail files missing an index row "
                 "are invisible to the deferred list."
             )
-        # Full invalidate: the cached entries list is what feeds
-        # deferred_entries/status on the next conversation (cached
-        # per-file content is never populated) — a reindexed file would
-        # otherwise keep serving stale metadata (title/summary/word_count)
-        # until process restart. Mirrors _op_delete.
+        # 完全失效：缓存的条目列表是下一次会话喂给 deferred_entries/status 的
+        # 内容（缓存的逐文件内容从不填充）——否则 reindex 的文件会持续提供陈旧
+        # 元数据（title/summary/word_count）直到进程重启。对应 _op_delete。
         if result["indexed"] and context.knowledge_cache is not None:
             context.knowledge_cache.invalidate(context.project_id)
-        # Notify the frontend so the knowledge progress bar updates in real time.
-        # An unchanged write that repaired a missing/stale row also changed
-        # the index, so it emits as well.
+        # 通知前端，使知识进度条实时更新。修复了缺失/陈旧行的未变写入也改变了
+        # 索引，因此同样发出事件。
         if context.session is not None and (result.get("changed") or result["indexed"]):
             try:
                 await context.session.emit("knowledge_updated", slug=slug)
@@ -479,11 +463,11 @@ class KnowledgeRWTool(Tool):
                 _log.debug("knowledge_updated emit failed for slug=%s", slug, exc_info=True)
 
         if result.get("changed"):
-            # Warn if a primary API file is too large without detail children
+            # 主 API 文件过大且无详情子文件时给出警告
             result = self._check_split_warning(slug, content, knowledge_dir, result)
 
-            # Soft-nudge "fill existing files first" when the write created a
-            # brand-new slug. Advisory only — the file stays written and indexed.
+            # 写入创建全新 slug 时软性推动“先填现有文件”。仅建议——文件仍保持
+            # 已写入并已索引。
             if is_new_file:
                 result = self._check_placement_note(slug, content, knowledge_dir, result, context)
 
@@ -500,8 +484,7 @@ class KnowledgeRWTool(Tool):
         if file_path is None:
             return {"error": f"Invalid slug: {slug!r}.{_SLUG_HINT}"}
 
-        # Read the parent BEFORE unlinking so the parent's children list can
-        # be cleaned up symmetrically with the write-side sync.
+        # 解除链接之前先读父级，使父级的 children 列表能与写入侧同步对称地清理。
         parent_slug: str | None = None
         if await asyncio.to_thread(file_path.exists):
             try:
@@ -511,14 +494,12 @@ class KnowledgeRWTool(Tool):
             except Exception:
                 parent_slug = None
 
-        # Remove the file; a missing file is not an error — the DB row may
-        # still be stale and needs cleaning up below.
+        # 删除文件；文件缺失不是错误——DB 行可能仍陈旧，需要在下方清理。
         file_existed = await asyncio.to_thread(file_path.exists)
         if file_existed:
             await asyncio.to_thread(file_path.unlink)
 
-        # Symmetric hierarchy cleanup: drop this slug from the parent's
-        # children list (best-effort, never blocks the delete).
+        # 对称层级清理：从父级 children 列表移除该 slug（尽力而为，绝不阻塞删除）。
         if parent_slug:
             try:
                 from agent_core.knowledge.index import sync_parent_children
@@ -536,7 +517,7 @@ class KnowledgeRWTool(Tool):
                     slug, parent_slug, context.project_id, exc_info=True,
                 )
 
-        # Best-effort DB row deletion (never blocks success of the file delete).
+        # 尽力而为的 DB 行删除（绝不阻塞文件删除的成功）。
         db_action = "skipped"
         if context.db_session is not None:
             try:
@@ -547,8 +528,7 @@ class KnowledgeRWTool(Tool):
             except Exception:
                 _log.warning("Knowledge delete failed for slug=%s project=%s", slug, context.project_id, exc_info=True)
 
-        # Drop the entry from the in-memory conversation context so
-        # status/children/deferred reflect the removal immediately.
+        # 从内存会话上下文移除条目，使 status/children/deferred 立即反映删除。
         ctx = context.project_context
         if ctx is not None:
             ctx.deferred_entries.pop(slug, None)
@@ -559,9 +539,8 @@ class KnowledgeRWTool(Tool):
 
             unload_dynamic_entry(ctx, slug)
 
-        # Full invalidate: the stale entries list is what feeds
-        # deferred_entries next time (cached per-file content is never
-        # populated, so per-slug eviction would be a no-op).
+        # 完全失效：陈旧条目列表是下次喂给 deferred_entries 的内容（缓存的逐文件
+        # 内容从不填充，因此逐 slug 驱逐会是空操作）。
         if context.knowledge_cache is not None:
             context.knowledge_cache.invalidate(context.project_id)
 
@@ -574,11 +553,10 @@ class KnowledgeRWTool(Tool):
         return {"success": True, "slug": slug, "file_deleted": file_existed, "db_row": db_action}
 
     async def _op_purge(self, params: dict, context: ToolContext) -> dict:
-        """Delete stale knowledge_metadata rows only (no file changes).
+        """只删除陈旧的 knowledge_metadata 行（不改文件）。
 
-        With slug: delete that single DB row (file state irrelevant). Without
-        slug: purge every row in the project whose file no longer exists on
-        disk — cleans up residue from earlier file deletions.
+        带 slug：删除那一行 DB 行（文件状态无关）。不带 slug：清除项目中文件在
+        磁盘上已不存在的每一行——清理早期文件删除留下的残留。
         """
         if context.project_id is None:
             return {"error": "No project context — refusing to purge knowledge"}
@@ -617,13 +595,11 @@ class KnowledgeRWTool(Tool):
     async def _record_load_event(
         self, context: ToolContext, slug: str, event_type: str, reason: str
     ) -> bool:
-        """Persist a load/unload event so the load survives context rebuilds.
+        """持久化加载/卸载事件，使加载在上下文重建后仍存活。
 
-        Returns True when the event row was written. Failure is non-fatal —
-        the in-memory load still works this turn; it just won't rehydrate on
-        the next one. The FK requires an existing knowledge_metadata row, so a
-        slug with no index row logs a warning and skips (self-consistency: an
-        unindexed slug cannot be discovered via deferred anyway).
+        事件行写入时返回 True。失败不致命——内存加载本轮仍工作；只是下一轮不会
+        重新水合。外键要求已存在 knowledge_metadata 行，因此无索引行的 slug 记录
+        警告并跳过（自洽：未索引 slug 本就无法经 deferred 发现）。
         """
         if context.db_session is None or not context.conversation_id:
             return False
@@ -632,10 +608,9 @@ class KnowledgeRWTool(Tool):
 
             row = (await context.db_session.execute(
                 text(
-                    # Project row wins when a global row shadows the same slug
-                    # (project-first; .first() takes the FIRST row — the loader's
-                    # identical CASE there folds into a dict where the LAST, i.e.
-                    # project, entry wins).
+                    # 全局行遮蔽同一 slug 时项目行优先（项目优先；.first() 取
+                    # 第一行——加载器那里相同的 CASE 折叠进字典，最后即项目的条目
+                    # 优先）。
                     "SELECT knowledge_id FROM knowledge_metadata "
                     "WHERE slug = :slug AND (project_id = :pid OR project_id IS NULL) "
                     "ORDER BY CASE WHEN project_id IS NULL THEN 1 ELSE 0 END"
@@ -679,17 +654,16 @@ class KnowledgeRWTool(Tool):
         if ctx is None:
             return {"error": "No project context available"}
 
-        # Already in static context
+        # 已在静态上下文
         if slug in ctx.loaded_content:
             return {"status": "already_loaded", "slug": slug, "source": "static"}
 
-        # Already dynamically loaded
+        # 已动态加载
         if slug in ctx.dynamically_loaded:
             return {"status": "already_loaded", "slug": slug, "source": "dynamic"}
         if not await asyncio.to_thread(file_path.exists):
-            # Global (project_id NULL) detail entries live in the framework
-            # knowledge dir, not the project dir — the deferred list promises
-            # them via load, so fall back there before giving up.
+            # 全局（project_id 为 NULL）详情条目位于框架知识目录而非项目目录——
+            # 延迟列表经 load 承诺它们，因此放弃前先回退到那里。
             fallback = None
             if context.framework_root and ctx.deferred_entries.get(slug) is not None:
                 entry = ctx.deferred_entries[slug]
@@ -716,25 +690,23 @@ class KnowledgeRWTool(Tool):
         except ValueError as e:
             return {"error": str(e)}
 
-        # Budget gate at entry: the dynamic region has no demote loop, so an
-        # unbounded series of loads would blow the request size.
+        # 入口处的预算闸门：动态区域没有降级循环，因此无界的加载序列会撑爆请求
+        # 大小。
         budget = dynamic_budget_error(ctx, len(content.encode("utf-8")))
         if budget:
             return {"error": budget, "slug": slug}
 
-        # Capture the deferred entry BEFORE loading — load_dynamic_entry pops
-        # it out of deferred_entries, and the model wants the summary in the
-        # load result (otherwise it loaded blind).
+        # 加载之前先捕获延迟条目——load_dynamic_entry 会把它从 deferred_entries
+        # 弹出，而模型希望加载结果里带摘要（否则它是盲加载）。
         entry = ctx.deferred_entries.get(slug)
 
-        # Load into dynamic context. NOT bound to the current task: a load
-        # must survive plan_task pipelines and turn boundaries until an
-        # explicit unload (events are rehydrated every turn).
+        # 加载进动态上下文。不绑定当前任务：加载必须在显式 unload 之前挺过
+        # plan_task 管道和轮次边界（事件每轮重新水合）。
         load_dynamic_entry(ctx, slug, content, context.current_turn, task_id=None)
 
         await self._record_load_event(context, slug, "load", "agent_request")
 
-        # The web UI listens for this to populate the dynamic-knowledge panel.
+        # Web 界面监听该事件以填充动态知识面板。
         if context.session is not None:
             try:
                 await context.session.emit("knowledge_dynamic_load", slug=slug)
@@ -775,7 +747,7 @@ class KnowledgeRWTool(Tool):
         return {"status": "unloaded", "slug": slug}
 
     async def _op_refresh(self, params: dict, knowledge_dir: Path, context: ToolContext) -> dict:
-        """Re-read a file already in context (static or dynamic) to pick up changes."""
+        """重读已在上下文（静态或动态）中的文件以获取变更。"""
         from agent_core.knowledge.loader import refresh_dynamic_entry, update_context_file
 
         slug = params.get("slug")
@@ -857,22 +829,21 @@ class KnowledgeRWTool(Tool):
                 "has_children": bool(entry.children_slugs),
             })
 
-        # Tier 1: in-memory conversation context (deferred + static).
+        # 第一层：内存会话上下文（延迟 + 静态）。
         if ctx is not None:
             for entry in list(ctx.deferred_entries.values()) + ctx.loaded_entries:
                 if entry.parent_slug == slug:
                     _add(entry)
 
-        # Tier 2: DB — catches children loaded in other conversations or
-        # files whose entries never entered this context.
+        # 第二层：数据库——捕获在其他会话加载的子文件，或条目从未进入本上下文的
+        # 文件。
         if context.db_session is not None:
             try:
                 from sqlalchemy import text
 
-                # Project rows first: _add() is first-wins, and a project
-                # file shadows a global one with the same slug (matching the
-                # loader's collapse). Without the order the winner was
-                # whatever the database returned first.
+                # 项目行优先：_add() 先到先得，项目文件遮蔽同 slug 的全局文件
+                # （对应加载器的折叠）。没有这个顺序，胜者是数据库先返回的任意
+                # 条目。
                 rows = (await context.db_session.execute(
                     text(
                         "SELECT slug, title, summary, depth, children_slugs, fs_path "
@@ -905,8 +876,8 @@ class KnowledgeRWTool(Tool):
             except Exception:
                 _log.warning("children DB lookup failed for slug=%s", slug, exc_info=True)
 
-        # Tier 3: disk — frontmatter `parent` is the source of truth when the
-        # index row is missing (reindex failure must not hide a child).
+        # 第三层：磁盘——索引行缺失时 frontmatter 的 `parent` 是事实来源
+        # （reindex 失败绝不能隐藏子文件）。
         knowledge_dir = Path(context.knowledge_dir()).resolve()
 
         def _disk_scan() -> list:
@@ -943,7 +914,7 @@ class KnowledgeRWTool(Tool):
         return {"parent_slug": slug, "children": children, "count": len(children)}
 
     # ------------------------------------------------------------------
-    # Helpers
+    # 辅助方法
     # ------------------------------------------------------------------
 
     _SPLIT_REQUIRED_SLUGS = ("technical/api-map", "technical/kong-map")
@@ -954,7 +925,7 @@ class KnowledgeRWTool(Tool):
     }
 
     def _check_split_warning(self, slug: str, content: str, knowledge_dir: Path, result: dict) -> dict:
-        """Append a warning if a primary API file exceeds word threshold without detail children."""
+        """主 API 文件超过词数阈值且无详情子文件时追加警告。"""
         if slug not in self._SPLIT_REQUIRED_SLUGS:
             return result
         word_count = len(content.split())
@@ -981,11 +952,10 @@ class KnowledgeRWTool(Tool):
     def _check_placement_note(
         self, slug: str, content: str, knowledge_dir: Path, result: dict, context: ToolContext
     ) -> dict:
-        """Append an advisory note when the write created a brand-new slug.
+        """写入创建了全新 slug 时追加建议性提示。
 
-        Soft-nudges "fill existing files first" without blocking legitimate new
-        files: the mandatory two-level API/Kong detail files and hierarchy
-        children (frontmatter `parent`) are exempt.
+        软性推动“先填现有文件”，但不阻塞合法新文件：强制两级 API/Kong 详情文件和
+        层级子文件（frontmatter `parent`）豁免。
         """
         if slug.startswith(self._PLACEMENT_NOTE_EXEMPT_PREFIXES):
             return result
@@ -993,7 +963,7 @@ class KnowledgeRWTool(Tool):
             meta = frontmatter.loads(content).metadata
         except Exception:
             meta = {}
-        if meta.get("parent"):  # legitimate hierarchy child of an existing index
+        if meta.get("parent"):  # 现有索引的合法层级子文件
             return result
         existing = self._existing_slugs(slug, knowledge_dir, context)
         if not existing:
@@ -1009,11 +979,10 @@ class KnowledgeRWTool(Tool):
         return result
 
     def _existing_slugs(self, written_slug: str, knowledge_dir: Path, context: ToolContext) -> list[str]:
-        """Slugs the agent should have considered before creating a new file.
+        """智能体在创建新文件前本应考虑的 slug。
 
-        Prefers in-context entries (exactly what the prompt shows under
-        '## Project Knowledge'/'Additional Knowledge'), falls back to a disk
-        scan. Excludes the file just written.
+        优先用上下文内条目（即提示词在 '## Project Knowledge'/'Additional
+        Knowledge' 下显示的内容），回退到磁盘扫描。排除刚写入的文件。
         """
         ctx = context.project_context
         if ctx is not None:
@@ -1039,8 +1008,8 @@ class KnowledgeRWTool(Tool):
         if slug in ctx.dynamically_loaded:
             return "dynamic"
         if _is_log_slug(slug):
-            # Excluded from deferred_entries by the loader — say why instead
-            # of reporting "unindexed" (the index row exists).
+            # 加载器把它排除在 deferred_entries 之外——说明原因而非报告
+            # "unindexed"（索引行存在）。
             return "log"
         if slug in ctx.deferred_entries:
             return "deferred"

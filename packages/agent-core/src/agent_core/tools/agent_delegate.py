@@ -1,15 +1,12 @@
-"""Delegation tools — hand a subtask to another agent and get its result back.
+"""委派工具——把子任务交给另一个智能体并取回其结果。
 
-``list_agents`` shows who this project can delegate to; ``delegate_agent`` runs
-one of them as a nested turn of the current conversation and returns a summary
-of what it did. The heavy lifting (the nested turn, its event isolation, the
-concurrency gate) lives in ``api.services.delegation``, reached through a lazy
-import — the same seam ``tools/scheduler.py`` uses, so agent-core keeps no
-import-time dependency on the API package.
+``list_agents`` 显示本项目可委派给谁；``delegate_agent`` 把其中一个作为当前会话的
+嵌套轮次运行，并返回它做了什么的摘要。重活（嵌套轮次、事件隔离、并发闸门）位于
+``api.services.delegation``，经惰性导入到达——与 ``tools/scheduler.py`` 使用的
+接缝相同，因此 agent-core 对 API 包不保留导入期依赖。
 
-Both tools are optional modules: an agent that does not declare them cannot see
-them, and an agent that declares ``delegates_to`` in its frontmatter can only
-reach the slugs on that list.
+两个工具都是可选模块：未声明它们的智能体看不到它们，而在 frontmatter 里声明
+``delegates_to`` 的智能体只能到达该名单上的 slug。
 """
 from __future__ import annotations
 
@@ -21,7 +18,7 @@ from .base import Tool, ToolContext
 
 
 def _policy(context: ToolContext) -> tuple[str, ...]:
-    """The calling agent's ``delegates_to`` allowlist (empty = unrestricted)."""
+    """调用方智能体的 ``delegates_to`` 白名单（空 = 不受限）。"""
     delegation = getattr(context, "delegation", None)
     return tuple(getattr(delegation, "policy", ()) or ())
 
@@ -32,7 +29,7 @@ def _chain(context: ToolContext) -> tuple[str, ...]:
 
 
 class ListAgentsTool(Tool):
-    """Who can I hand work to?"""
+    """我可以把工作交给谁？"""
 
     name = "list_agents"
     prompt_hint = (
@@ -65,8 +62,8 @@ class ListAgentsTool(Tool):
         candidates = list_delegation_candidates(
             context.project_fs_path,
             context.framework_root,
-            # The agent itself, and every agent already further up the chain:
-            # handing the subtask back up would loop.
+            # 智能体自身，以及链条上已在更上游的每个智能体：把子任务往回交入会
+            # 循环。
             exclude=_chain(context),
             allow=policy or None,
         )
@@ -103,7 +100,7 @@ class ListAgentsTool(Tool):
 
 
 class AgentDelegateTool(Tool):
-    """Hand a subtask to another agent."""
+    """把子任务交给另一个智能体。"""
 
     name = "delegate_agent"
     prompt_hint = (
@@ -169,9 +166,8 @@ class AgentDelegateTool(Tool):
             return await run_delegated_turn(
                 context, agent_slug=agent_slug, brief=brief, reason=reason,
             )
-        except Exception as exc:  # noqa: BLE001 - surfaced to the model as text
-            # The tool must never raise into the agent loop: a delegation that
-            # blew up is a failed subtask, not a failed turn.
+        except Exception as exc:  # noqa: BLE001 - 以文本形式呈现给模型
+            # 工具绝不能抛进智能体循环：炸掉的委派是失败的子任务，而非失败的轮次。
             return {
                 "status": "error",
                 "agent": agent_slug,

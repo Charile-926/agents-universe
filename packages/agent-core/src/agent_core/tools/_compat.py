@@ -1,4 +1,4 @@
-"""Shared utilities for tools (UUID generation, timestamps)."""
+"""工具共享的通用函数（UUID 生成、时间戳）。"""
 import uuid
 from datetime import datetime, timezone
 

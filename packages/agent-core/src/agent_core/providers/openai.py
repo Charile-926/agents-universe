@@ -1,4 +1,4 @@
-"""OpenAI provider (also used for Azure OpenAI)."""
+"""OpenAI 供应方（Azure OpenAI 也复用本模块）。"""
 from __future__ import annotations
 
 import json
@@ -25,9 +25,9 @@ def _context_window(model: str) -> int:
         return 1_000_000
     if any(m.startswith(p) for p in ("o1", "o2", "o3", "o4")):
         return 200_000
-    # GLM-5.3 is the flagship (1M context); earlier GLM lines get the fallback.
-    # Version-tuple compare, not float(): "5.3.1" is not a float at all (and
-    # would raise), while float() would rank 5.10 below 5.3.
+    # GLM-5.3 是旗舰（100 万上下文）；更早的 GLM 系列走回退值。用版本元组比较，
+    # 而非 float()："5.3.1" 根本不是浮点数（会抛错），而 float() 会让 5.10 排在
+    # 5.3 之下。
     glm_ver = re.match(r"^glm[-_]?(\d+(?:\.\d+)*)", m)
     if glm_ver:
         version = tuple(int(part) for part in glm_ver.group(1).split("."))
@@ -35,63 +35,59 @@ def _context_window(model: str) -> int:
             return 1_000_000
     if "gemini" in m:
         return 1_000_000
-    # gpt-4o, gpt-4-turbo, gpt-4o-mini, etc.
+    # gpt-4o、gpt-4-turbo、gpt-4o-mini 等。
     return 128_000
 
 
 def _http_timeout() -> httpx.Timeout:
-    """Phased request timeout for provider HTTP clients.
+    """供应方 HTTP 客户端的分阶段请求超时。
 
-    A 60s scalar applied to every phase made READ 60s: a large-prompt
-    stream (100k+ token histories) routinely needs over a minute for the
-    first chunk, so turns died with "Request timed out" after the SDK's
-    retries. The openai SDK adopts a custom http_client's timeout as its
-    per-request timeout (overriding its own 600s default), so the phases
-    must be right here: read generous, connect tight, write sized for
-    multi-MB uploads.
+    对每个阶段套用 60 秒标量会使读取阶段也只有 60 秒：大提示词的流式（10 万
+    token 以上历史）首个数据块通常需要一分多钟，因此轮次在 SDK 重试后以
+    “Request timed out” 失败。openai SDK 会采用自定义 http_client 的超时作为
+    逐请求超时（覆盖其自身 600 秒默认值），因此各阶段必须在这里设对：读取宽松、
+    连接收紧、写入按多 MB 上传量设定。
     """
     return httpx.Timeout(300.0, connect=10.0, write=120.0, pool=60.0)
 
 
 class OpenAIProvider(LLMProvider):
-    """OpenAI via the openai SDK."""
+    """通过 openai SDK 调用 OpenAI。"""
 
     def __init__(self, api_key: str, model: str = "gpt-4o", base_url: str | None = None, ssl_verify: bool = False, url_mode: str = "base_url", context_window: int | None = None, thinking_enabled: bool | None = None, reasoning_effort: str | None = None) -> None:
-        # Kept for secret_values()/scrub() — the SDK holds its own copy but
-        # exposes no accessor, and exception text must be redactable.
+        # 为 secret_values()/scrub() 保留——SDK 自己持有一份副本但不提供访问器，
+        # 而异常文本必须可脱敏。
         self._api_key = api_key
         kwargs: dict = {"api_key": api_key}
         if base_url:
             b = base_url.rstrip("/")
             if url_mode == "full_url":
-                # User provided the complete endpoint URL.
-                # Strip /chat/completions suffix if present (SDK re-appends it).
+                # 用户提供了完整的端点 URL。
+                # 若带 /chat/completions 后缀则剥离（SDK 会重新追加）。
                 if b.endswith("/chat/completions"):
                     b = b[: -len("/chat/completions")]
                 kwargs["base_url"] = b
             else:
-                # Base URL mode: auto-append /v1 if no version segment detected.
+                # 基础 URL 模式：未检测到版本段时自动追加 /v1。
                 kwargs["base_url"] = b if re.search(r"/v\d+$", b) else f"{b}/v1"
         kwargs["http_client"] = httpx.AsyncClient(verify=ssl_verify, timeout=_http_timeout())
-        # One retry still covers transient 429/5xx; the SDK default (2) would
-        # stretch a dead endpoint to 3 x 300s reads before surfacing.
+        # 保留一次重试仍能应对偶发的 429/5xx；SDK 默认值（2）会让一个已死端点
+        # 在报错前拖到 3 次 300 秒读取。
         kwargs["max_retries"] = 1
         self._client = AsyncOpenAI(**kwargs)
         self._model = model
-        # Per-config override from Settings → AI Models; None = name-matched default.
+        # 来自“设置 → AI 模型”的逐配置覆盖；None = 名称匹配默认值。
         self._context_window_override = context_window
-        # OpenAI CoT arrives from compatible gateways parse-only — there is no
-        # request-side thinking switch, so thinking_enabled is accepted and
-        # ignored. reasoning_effort IS request-side: sent to reasoning models
-        # only (see _reasoning_kwargs).
+        # OpenAI 的思维链从兼容网关以只解析方式到达——没有请求侧的思考开关，因此
+        # thinking_enabled 接受但忽略。reasoning_effort 则是请求侧的：只发给推理
+        # 模型（见 _reasoning_kwargs）。
         self._reasoning_effort = reasoning_effort
 
     async def close(self) -> None:
-        """Close the SDK's httpx client (connection pool).
+        """关闭 SDK 的 httpx 客户端（连接池）。
 
-        Agent.close() iterates _provider_cache and calls provider.close() on
-        every provider; without this override each message leaks a keep-alive
-        connection pool for the process lifetime.
+        Agent.close() 会遍历 _provider_cache 对每个供应方调用 close()；没有这个
+        重写，每条消息都会泄漏一个保活连接池，伴随整个进程生命周期。
         """
         try:
             await self._client.close()
@@ -161,24 +157,22 @@ class OpenAIProvider(LLMProvider):
         ]
 
     def _is_reasoning_model(self) -> bool:
-        """o-series / gpt-5 reject max_tokens and temperature (HTTP 400).
+        """o 系列 / gpt-5 拒绝 max_tokens 和 temperature（HTTP 400）。
 
-        Mirrors the AzureOpenAIProvider override; kept on the base class so
-        plain "openai"-type configs of reasoning models work too.
+        与 AzureOpenAIProvider 的重写对应；保留在基类上，使推理模型的普通
+        “openai” 类型配置也能工作。
         """
         m = self._model.lower()
         return any(m.startswith(p) for p in ("o1", "o2", "o3", "o4")) or "gpt-5" in m
 
     def _clamp_max_tokens(self, max_tokens: int) -> int:
-        """Cap output tokens at the non-reasoning ceiling.
+        """把输出 token 限制在非推理模型的上限内。
 
-        Agent configs default max_tokens to 128000; gpt-4o-class models cap
-        output at 16384 and reject the raw value with a 400. Reasoning
-        models accept large max_completion_tokens and are left untouched.
-        GLM is exempt too: thinking there is server-side and cannot be
-        disabled, so the gpt-4o ceiling left no budget for reasoning plus
-        content and truncated agentic turns before any output (the endpoint
-        accepts 128000 — verified against the system-default deployment).
+        Agent 配置默认 max_tokens 为 128000；gpt-4o 类模型把输出上限设为 16384，
+        并以 400 拒绝原始值。推理模型接受较大的 max_completion_tokens，原样保留。
+        GLM 也豁免：其思考在服务端进行且无法关闭，因此 gpt-4o 的上限会让推理加
+        内容没有预算，在任何输出之前就截断智能体轮次（该端点接受 128000——已对
+        系统默认部署验证）。
         """
         if self._is_reasoning_model():
             return max_tokens
@@ -187,11 +181,10 @@ class OpenAIProvider(LLMProvider):
         return min(max_tokens, MAX_OUTPUT_RESERVE)
 
     def _reasoning_kwargs(self) -> dict:
-        """Request kwargs that only reasoning models may receive.
+        """只有推理模型可以接收的请求关键字参数。
 
-        `reasoning_effort` outside the reasoning branch 400s on gpt-4o-class
-        models and on OpenAI-compatible gateways (vLLM/Ollama model names) —
-        gate on _is_reasoning_model() unconditionally.
+        在推理分支之外，`reasoning_effort` 会在 gpt-4o 类模型和 OpenAI 兼容网关
+        （vLLM/Ollama 模型名）上报 400——一律以 _is_reasoning_model() 为门槛。
         """
         if self._is_reasoning_model() and self._reasoning_effort:
             return {"reasoning_effort": self._reasoning_effort}
@@ -233,9 +226,8 @@ class OpenAIProvider(LLMProvider):
             ] or None,
         )
         raw_stop = choice.finish_reason
-        # Some OpenAI-compatible gateways (vLLM/LM Studio/Ollama) omit usage —
-        # guard against AttributeError or compression silently fails forever
-        # on that gateway .
+        # 某些 OpenAI 兼容网关（vLLM/LM Studio/Ollama）不返回 usage——需防范
+        # AttributeError，否则该网关上的压缩会永远静默失败。
         usage = response.usage
         return CompletionResult(
             message=msg,
@@ -277,9 +269,8 @@ class OpenAIProvider(LLMProvider):
                 choice = chunk.choices[0] if chunk.choices else None
                 if choice:
                     delta = choice.delta
-                    # OpenAI-compatible reasoning gateways (DeepSeek/GLM/vLLM)
-                    # put the chain-of-thought here — parse-only, never
-                    # requested. Official OpenAI leaves it unset (fine).
+                    # OpenAI 兼容的推理网关（DeepSeek/GLM/vLLM）把思维链放在
+                    # 这里——只解析，从不主动请求。官方 OpenAI 不设置它（无妨）。
                     reasoning = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
                     if reasoning:
                         yield StreamChunk(thinking=reasoning)
@@ -312,10 +303,9 @@ class OpenAIProvider(LLMProvider):
                             finish_reason=finish,
                             stop_reason=normalized,
                         )
-                # Usage is independent of choices: LiteLLM attaches the final
-                # usage object to a chunk that still carries an empty choice,
-                # and vLLM reports running stats on ordinary chunks. Gating it
-                # on an empty choices list dropped those counts entirely.
+                # 用量独立于 choices：LiteLLM 把最终用量对象挂在仍带空 choice 的
+                # 数据块上，vLLM 在普通数据块上报告运行统计。以空 choices 列表为
+                # 门槛会把这些计数全部丢弃。
                 if chunk.usage:
                     yield StreamChunk(
                         usage={
@@ -324,8 +314,8 @@ class OpenAIProvider(LLMProvider):
                         },
                     )
         finally:
-            # Task cancellation mid-stream otherwise leaves the httpx
-            # connection open until Agent.close(); close it here.
+            # 否则流式中途的任务取消会让 httpx 连接一直开到 Agent.close()；
+            # 在这里关闭。
             await stream.close()
 
     async def embed(self, text: str) -> list[float]:
@@ -337,7 +327,7 @@ class OpenAIProvider(LLMProvider):
 
 
 class AzureOpenAIProvider(OpenAIProvider):
-    """Azure OpenAI — uses AsyncAzureOpenAI SDK for proper deployment URL routing."""
+    """Azure OpenAI——使用 AsyncAzureOpenAI SDK 以正确路由部署 URL。"""
 
     def __init__(
         self,
@@ -358,7 +348,7 @@ class AzureOpenAIProvider(OpenAIProvider):
             raise ValueError("Azure OpenAI requires an endpoint")
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("Azure OpenAI endpoint must be an HTTP or HTTPS URL with a hostname")
-        # Same _api_key contract as OpenAIProvider (no super().__init__ here).
+        # 与 OpenAIProvider 相同的 _api_key 契约（这里不调用 super().__init__）。
         self._api_key = api_key
         self._client = AsyncAzureOpenAI(
             api_key=api_key,
@@ -370,12 +360,11 @@ class AzureOpenAIProvider(OpenAIProvider):
         )
         self._model = model
         self._display_model = model
-        # Per-config override from Settings → AI Models; None = name-matched default.
+        # 来自“设置 → AI 模型”的逐配置覆盖；None = 名称匹配默认值。
         self._context_window_override = context_window
-        # Explicit params (not swallowed by **_kwargs): Azure configs must
-        # honor the same thinking/effort overrides as plain openai configs —
-        # silently dropping them would leave Azure env-only with no error.
-        # thinking_enabled itself is still ignored: OpenAI CoT is parse-only.
+        # 显式参数（不被 **_kwargs 吞掉）：Azure 配置必须与普通 openai 配置一样
+        # 采用相同的思考/努力覆盖——静默丢弃会让仅 Azure 的环境毫无报错。
+        # thinking_enabled 本身仍被忽略：OpenAI 思维链只解析。
         self._reasoning_effort = reasoning_effort
 
     def _is_reasoning_model(self) -> bool:
@@ -394,9 +383,8 @@ class AzureOpenAIProvider(OpenAIProvider):
             model=self._model,
             messages=self._to_openai_messages(messages),
         )
-        # Azure rejects max_completion_tokens for non-reasoning
-        # models (gpt-4o and earlier API versions error with 400). Base class
-        # splits by reasoning model — Azure must too.
+        # Azure 对非推理模型拒绝 max_completion_tokens（gpt-4o 和更早的 API 版本
+        # 会报 400）。基类按推理模型分流——Azure 也必须如此。
         if self._is_reasoning_model():
             kwargs["max_completion_tokens"] = max_tokens
             kwargs.update(self._reasoning_kwargs())
@@ -421,9 +409,8 @@ class AzureOpenAIProvider(OpenAIProvider):
             ] or None,
         )
         raw_stop = choice.finish_reason
-        # Some OpenAI-compatible gateways (vLLM/LM Studio/Ollama) omit usage —
-        # guard against AttributeError or compression silently fails forever
-        # on that gateway .
+        # 某些 OpenAI 兼容网关（vLLM/LM Studio/Ollama）不返回 usage——需防范
+        # AttributeError，否则该网关上的压缩会永远静默失败。
         usage = response.usage
         return CompletionResult(
             message=msg,
@@ -465,8 +452,8 @@ class AzureOpenAIProvider(OpenAIProvider):
                 choice = chunk.choices[0] if chunk.choices else None
                 if choice:
                     delta = choice.delta
-                    # Same reasoning-channel parse as the OpenAI path above —
-                    # Azure-fronted gateways (DeepSeek via Azure) emit it too.
+                    # 与上面 OpenAI 路径相同的推理通道解析——Azure 前置的网关
+                    # （经 Azure 的 DeepSeek）也会发出它。
                     reasoning = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
                     if reasoning:
                         yield StreamChunk(thinking=reasoning)
@@ -499,8 +486,8 @@ class AzureOpenAIProvider(OpenAIProvider):
                             finish_reason=finish,
                             stop_reason=normalized,
                         )
-                # Same independent usage capture as the OpenAI path: gateways
-                # may attach usage to a chunk that still carries a choice.
+                # 与 OpenAI 路径相同的独立用量捕获：网关可能把用量挂在仍带 choice
+                # 的数据块上。
                 if chunk.usage:
                     yield StreamChunk(
                         usage={
@@ -509,6 +496,6 @@ class AzureOpenAIProvider(OpenAIProvider):
                         },
                     )
         finally:
-            # Task cancellation mid-stream otherwise leaves the httpx
-            # connection open until Agent.close(); close it here.
+            # 否则流式中途的任务取消会让 httpx 连接一直开到 Agent.close()；
+            # 在这里关闭。
             await stream.close()

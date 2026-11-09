@@ -1,4 +1,10 @@
-"""Conversation session — token tracking and event emission."""
+"""会话（session）—— Token 用量跟踪与事件发出。
+
+本模块定义一次对话轮次（或智能体循环运行）所需的全部会话状态：Token 用量
+台账、上下文占用、事件队列、中止信号、交互式提问（prompt）管理，以及运行
+中用户消息的注入队列。Agent 通过 emit() 把事件放入队列，由 WebSocket 处理
+器转发给前端。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -6,59 +12,57 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
-# How long emit() waits for the consumer before declaring it dead and
-# aborting the session. Constant so tests can shrink it.
+# emit() 等待消费方的最长时间，超时即判定消费方死亡并中止会话。设为常量
+# 便于测试调小。
 _EMIT_PUT_TIMEOUT_S = 10.0
 
 
 @dataclass
 class SessionEvent:
-    """An event emitted by the agent session for the WS handler to forward."""
+    """会话发出的一个事件，供 WebSocket 处理器转发。"""
     type: str
     data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class PromptOutcome:
-    """How one interactive prompt ended, keyed by its caller-supplied signature.
+    """一次交互式提问的结束结果，按调用方提供的签名区分。
 
-    ``status`` is ``"answered"`` | ``"timed_out"`` | ``"dismissed"``.
+    ``status`` 取值为 ``"answered"``（已回答）| ``"timed_out"``（超时）|
+    ``"dismissed"``（已忽略）。
     """
     status: str
     value: str | None = None
 
 
 class UserSelectionTimeoutError(RuntimeError):
-    """A prompt expired unanswered.
+    """提问过期且无人回答。
 
-    Subclasses RuntimeError so safety gates that catch RuntimeError around
-    request_user_selection keep their behavior unchanged.
+    继承 RuntimeError，使 request_user_selection 周围捕获 RuntimeError 的
+    安全闸门保持原有行为不变。
     """
 
 
 class UserSelectionAbortedError(RuntimeError):
-    """The run was aborted while a prompt was pending."""
+    """提问等待期间运行被中止。"""
 
 
 class UserSelectionUnavailableError(RuntimeError):
-    """The run is non-interactive, so nobody could ever answer a prompt.
+    """运行是非交互式的，永远不可能有人回答提问。
 
-    Subclasses RuntimeError for the same reason as UserSelectionTimeoutError:
-    every safety gate that catches RuntimeError around request_user_selection
-    degrades to its deny/error path unchanged.
+    与 UserSelectionTimeoutError 同样继承 RuntimeError：request_user_selection
+    周围每个捕获 RuntimeError 的安全闸门，都会照常降级到其拒绝/错误路径。
     """
 
 
 @dataclass
 class UserInputEntry:
-    """A user message queued for in-flight injection at the next step boundary.
+    """排队等待在下一个步骤边界注入的用户消息。
 
-    The API handler creates one per message received while the agent is
-    running, pre-generating ``message_id`` (which doubles as the future DB
-    row's primary key). The agent consumes it at a step boundary; the handler
-    persists it via the ``user_message_injected`` event and resolves
-    ``persisted`` so the agent can continue only once the message is durably
-    stored.
+    API 处理器在 Agent 运行期间每收到一条消息就创建一个条目，预先生成
+    ``message_id``（同时充当未来数据库行的主键）。Agent 在步骤边界消费它；
+    处理器通过 ``user_message_injected`` 事件持久化，并 resolve
+    ``persisted``，使 Agent 只有在消息被可靠存储后才继续。
     """
 
     message_id: str
@@ -72,7 +76,7 @@ class UserInputEntry:
 
 
 class ConversationSession:
-    """Tracks state for one conversation turn (or agentic loop run)."""
+    """跟踪一次对话轮次（或智能体循环运行）的状态。"""
 
     def __init__(
         self,
@@ -89,59 +93,53 @@ class ConversationSession:
         self.user_id = user_id
         self.token_budget = token_budget
         self.tokens_used = tokens_used
-        # Occupancy of the LATEST provider request (prompt+completion of the
-        # last usage chunk) — what the context meter displays. Distinct from
-        # the lifetime billing ledger `tokens_used`.
+        # 最近一次供应方请求的占用（最后一个用量块的提示+补全），即上下文
+        # 计量表显示的内容。与生命周期计费台账 `tokens_used` 相区分。
         self.context_tokens: int = 0
-        # Window of the model that last reported usage (None until first call).
+        # 最近一次上报用量的模型窗口（首次调用前为 None）。
         self.context_window: int | None = None
 
         self._event_queue: asyncio.Queue[SessionEvent | None] = asyncio.Queue(maxsize=1000)
         self._closed = False
         self.abort_event = asyncio.Event()
-        # First-cause token for the abort ("event_queue_blocked", "abort",
-        # ...) so downstream settlement can record WHY the run stopped
-        # instead of guessing Stop-vs-crash. First abort() wins.
+        # 中止的首因标记（"event_queue_blocked"、"abort" 等），让下游结算
+        # 能记录运行为何停止，而不是猜测是停止还是崩溃。以第一次 abort()
+        # 为准。
         self.abort_reason: str | None = None
         self._current_message_id: str = str(uuid.uuid4())
         self._pending_prompts: dict[str, asyncio.Future[str]] = {}
-        # The emitted payload of each in-flight prompt, keyed by prompt_id.
-        # A prompt exists only here and in the client's memory — it is never
-        # part of the message history — so the transport layer replays these
-        # when a client reconnects (conversation switch, page reload).
+        # 每个在途提问的已发出载荷，按 prompt_id 区分。提问只存在于这里和
+        # 客户端记忆中——它从不属于消息历史——因此客户端重连（切换会话、
+        # 页面刷新）时，传输层会重放这些内容。
         self._pending_prompt_events: dict[str, dict[str, Any]] = {}
-        # A delegated (nested) turn runs its own session — it needs its own
-        # event queue — but a user's answer is routed by the WS handler through
-        # the conversation's *registered* session. Prompts therefore register
-        # on the sink (the top-level session) and record their owning session,
-        # so answering one also lifts that session's prompt pause.
-        # Whether a client is attached that can answer prompts. False for
-        # headless runs (scheduled tasks, published agents): the session is
-        # still built and registered, but no user_selection_response can
-        # ever arrive.
+        # 被委派（嵌套）的轮次运行自己的会话，需要自己的事件队列；但用户的
+        # 回答由 WebSocket 处理器通过会话中*已注册*的会话路由。因此提问注册
+        # 在 sink（顶层会话）上，并记录其所属会话，使回答一个提问也能解除
+        # 该会话的提问暂停。
+        # 是否有能回答提问的客户端连接。无头运行（定时任务、已发布 Agent）
+        # 为 False：会话仍会构建并注册，但永远不会有 user_selection_response
+        # 到达。
         self.interactive = interactive
         self._prompt_sink: ConversationSession | None = prompt_sink
         self._prompt_owners: dict[str, ConversationSession] = {}
-        # Interactive-prompt ledger, keyed by a caller-supplied signature
-        # (field key + question). Tool-level callers use it to hand back a
-        # repeated question's recorded outcome instead of showing the dialog
-        # a second time, and to remember a prompt that already failed.
+        # 交互式提问台账，按调用方提供的签名（字段键 + 问题）区分。工具层
+        # 调用方用它直接返回重复问题已记录的结果，而不是再次弹出对话框，
+        # 同时记住已经失败过的提问。
         self._prompt_outcomes: dict[tuple[str, str], PromptOutcome] = {}
         self._prompt_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._prompts_paused = False
         self._user_input_queue: asyncio.Queue[UserInputEntry] = asyncio.Queue(maxsize=20)
-        # message_id → entry, kept in sync with the queue for O(1) resolution
+        # message_id → 条目，与队列保持同步，以便 O(1) 解析
         self._pending_input_by_id: dict[str, UserInputEntry] = {}
 
-        # Live streaming snapshot for WS reconnect sync.
-        # Updated by forward_events; read by the WS handler when a new
-        # client connects mid-stream.
+        # 用于 WebSocket 重连同步的实时流式快照。由 forward_events 更新；
+        # 新客户端在流式中途连接时，由 WebSocket 处理器读取。
         self.current_streaming_text: str = ""
-        # Thinking accumulated this turn (same lifecycle as the text buffer).
+        # 本轮累积的思考内容（与文本缓冲区生命周期相同）。
         self.current_streaming_thinking: str = ""
-        # Coarse turn phase for the status line / reconnect sync
-        # ("waiting_model" | "thinking" | "responding" | "running_tool" |
-        # "compressing" | "degrading"). Updated by the API's forward_events.
+        # 用于状态栏/重连同步的粗略轮次阶段
+        # （"waiting_model" | "thinking" | "responding" | "running_tool" |
+        # "compressing" | "degrading"）。由 API 的 forward_events 更新。
         self.current_turn_phase: str = "waiting_model"
         self.current_tool_calls: list[dict] = []
 
@@ -155,32 +153,30 @@ class ConversationSession:
 
     @property
     def budget_exceeded(self) -> bool:
-        """Whether accumulated usage has passed the display budget.
+        """累计用量是否已超过展示预算。
 
-        This is observational only. The agent loop must not stop work because
-        a conversation has consumed its configured budget.
+        仅作观察用途。Agent 循环不能因为会话已消耗其配置预算就停止工作。
         """
         return self.tokens_used > self.token_budget
 
     def add_tokens(self, count: int) -> bool:
-        """Add tokens to the usage counter and return the budget observation."""
+        """把 Token 数加到用量计数器，并返回预算观察结果。"""
         if count > 0:
             self.tokens_used += count
         return not self.budget_exceeded
 
     def add_usage(self, prompt_tokens: int = 0, completion_tokens: int = 0) -> bool:
-        """Add provider usage and return the budget observation."""
+        """累加模型供应方用量，并返回预算观察结果。"""
         total = prompt_tokens + completion_tokens
         if total > 0:
             self.tokens_used += total
         return not self.budget_exceeded
 
     async def emit(self, event_type: str, **data: Any) -> None:
-        """Enqueue an event to be forwarded by the WS handler.
+        """把事件入队，由 WebSocket 处理器转发。
 
-        Blocks until the consumer drains the queue. If the consumer stalls for
-        longer than ``_EMIT_PUT_TIMEOUT_S`` the session is aborted so the
-        agent doesn't run forever while no client is listening.
+        会阻塞直到消费方排空队列。若消费方停滞超过 ``_EMIT_PUT_TIMEOUT_S``，
+        则中止会话，避免没有客户端监听时 Agent 仍永远运行。
         """
         if self._closed:
             return
@@ -204,7 +200,7 @@ class ConversationSession:
             raise
 
     async def events(self) -> AsyncIterator[SessionEvent]:
-        """Async generator that yields events until None sentinel is received."""
+        """异步生成器，持续产出事件，直到收到 None 哨兵为止。"""
         while True:
             event = await self._event_queue.get()
             if event is None:
@@ -212,33 +208,25 @@ class ConversationSession:
             yield event
 
     async def close(self) -> None:
-        """Signal end of event stream. Safe to call multiple times."""
+        """发出事件流结束信号，可安全重复调用。"""
         if self._closed:
-            return  # sentinel already in queue from first call
+            return  # 第一次调用已把哨兵放入队列
         self._closed = True
-        # Use put_nowait for the sentinel — if the queue is full at this point
-        # the consumer is stuck; force-clear the queue and push the sentinel so
-        # forward_events() can exit cleanly. The stream content is kept: the
-        # final stream_end tells the handler to persist the assistant message
-        # and the stream_delta events carry its text — dropping either would
-        # silently lose the whole reply from history. Terminal task events
-        # (task_completed/task_failed/task_skipped) are kept too: they are the
-        # only source of a task row's final status, and dropping them would
-        # leave the row at pending/running for the handler's stale-task
-        # reconcile to mark failed. user_message_injected is the ONLY writer of
-        # an injected user message's DB row (the handler consumes the input and
-        # waits for this event to persist it) — dropping it would erase the
-        # user's words from history and the LLM context. image_output/
-        # file_output are kept as well: the handler accumulates them into its
-        # buffers and persists them at stream_end, so dropping them loses the
-        # reply's attachments. user_selection_cancelled is kept too: a prompt
-        # that timed out / was aborted must still reach the client so it can
-        # dismiss the dialog — dropping it would leave a zombie prompt pinned
-        # in the UI forever. thinking_delta is kept too: the handler
-        # accumulates it into the assistant row's persisted `thinking`
-        # column, so dropping it would silently truncate stored reasoning.
-        # Other event types (progress/tool updates) are dropped; they are
-        # UI-only.
+        # 用 put_nowait 放哨兵——若此时队列已满，说明消费方卡住了；强制
+        # 清空队列并推入哨兵，让 forward_events() 能干净退出。流式内容会
+        # 保留：最终 stream_end 告诉处理器持久化助手消息，stream_delta 事件
+        # 携带其文本——丢掉任何一个都会让整条回复从历史中静默消失。终止性
+        # 任务事件（task_completed/task_failed/task_skipped）也保留：它们是
+        # 任务行最终状态的唯一来源，丢掉会让该行停在 pending/running，等
+        # 处理器的陈旧任务对账标记为失败。user_message_injected 是注入用户
+        # 消息数据库行的唯一写入方（处理器消费输入并等待该事件来持久化）
+        # ——丢掉它会把用户的话从历史和 LLM 上下文中抹去。image_output/
+        # file_output 同样保留：处理器把它们累积进缓冲区并在 stream_end 时
+        # 持久化，丢掉会失去回复的附件。user_selection_cancelled 也保留：
+        # 超时/被中止的提问仍须到达客户端以便关闭对话框——丢掉会让一个
+        # 僵尸提问永远钉在界面上。thinking_delta 也保留：处理器把它累积进
+        # 助手行持久化的 `thinking` 列，丢掉会静默截断存储的推理。其他事件
+        # 类型（进度/工具更新）则丢弃，它们仅用于界面。
         if self._event_queue.full():
             kept: list[SessionEvent] = []
             while not self._event_queue.empty():
@@ -259,9 +247,8 @@ class ConversationSession:
                     "thinking_delta",
                 ):
                     kept.append(ev)
-            # Leave one slot for the sentinel below so forward_events() can
-            # still exit; the kept tail preserves the message text (newest
-            # deltas last, stream_end at the very end).
+            # 为下方哨兵留一个槽位，使 forward_events() 仍能退出；保留的
+            # 尾部保存消息文本（最新 delta 在最后，stream_end 在最末尾）。
             for ev in kept[-(self._event_queue.maxsize - 1):]:
                 try:
                     self._event_queue.put_nowait(ev)
@@ -272,14 +259,14 @@ class ConversationSession:
         except asyncio.QueueFull:
             pass
 
-    # --- Interactive-prompt ledger -----------------------------------------
+    # --- 交互式提问台账 ----------------------------------------------------
     #
-    # Prompt state lives for one turn (a session object is created per turn),
-    # so the ledger suppresses repeats within a turn. Letting an answer outlive
-    # the turn is the caller's job — persist it as a project setting.
+    # 提问状态只存活一轮（每轮创建一个会话对象），因此台账用于抑制一轮之内
+    # 的重复提问。让回答存活得比轮次更久是调用方的职责——应把它持久化为
+    # 项目设置。
 
     def get_prompt_outcome(self, signature: tuple[str, str] | None) -> PromptOutcome | None:
-        """Return the recorded outcome for a prompt signature, if any."""
+        """返回某个提问签名已记录的结果（若有）。"""
         if not signature:
             return None
         return self._prompt_outcomes.get(signature)
@@ -290,11 +277,10 @@ class ConversationSession:
         status: str,
         value: str | None = None,
     ) -> None:
-        """Record how an interactive prompt ended.
+        """记录一次交互式提问的结束方式。
 
-        An answered entry is never overwritten by a failure: two callers can
-        ask the same question concurrently, and the duplicate that times out
-        must not erase the answer the user actually gave.
+        已回答的条目绝不会被失败覆盖：两个调用方可能并发问同一个问题，
+        超时的那个副本不能抹掉用户实际给出的答案。
         """
         if not signature:
             return
@@ -304,7 +290,7 @@ class ConversationSession:
         self._prompt_outcomes[signature] = PromptOutcome(status=status, value=value)
 
     def prompt_lock(self, signature: tuple[str, str]) -> asyncio.Lock:
-        """Lock serializing callers that ask the same question concurrently."""
+        """用于串行化并发问同一问题的调用方的锁。"""
         lock = self._prompt_locks.get(signature)
         if lock is None:
             lock = asyncio.Lock()
@@ -312,19 +298,18 @@ class ConversationSession:
         return lock
 
     def note_prompt_timeout(self) -> None:
-        """A prompt expired unanswered — stop prompting for the rest of the turn."""
+        """提问过期且无人回答——本轮剩余时间不再发起提问。"""
         self._prompts_paused = True
 
     @property
     def interactive_prompts_paused(self) -> bool:
-        """Whether an unanswered prompt paused further interactive prompts."""
+        """是否因无人回答的提问而暂停了后续交互式提问。"""
         return self._prompts_paused
 
     def _note_user_present(self) -> None:
-        """Record that the user is present again (answered a prompt, or sent a
-        message mid-run): lift the timeout pause and let questions that failed
-        be asked once more. Answers already given stay recorded — re-asking
-        those is exactly the repeat this ledger exists to stop."""
+        """记录用户再次在场（回答了提问，或运行中发了消息）：解除超时暂停，
+        让失败过的问题能再问一次。已给出的回答仍保留——重复问那些问题，
+        正是本台账要阻止的事。"""
         self._prompts_paused = False
         self._prompt_outcomes = {
             sig: outcome
@@ -333,13 +318,11 @@ class ConversationSession:
         }
 
     def _prompt_store(self) -> "ConversationSession":
-        """The session that owns prompt bookkeeping: this one, or the sink.
+        """拥有提问记账的会话：本会话，或向上找到的 sink。
 
-        A delegated turn's session is deliberately not registered with the
-        connection manager (the top-level turn owns that registration), and the
-        WS handler resolves an answer through the conversation's registered
-        session. Registering prompts on the sink is what makes a question asked
-        by a delegated agent answerable at all.
+        被委派轮次的会话刻意不向连接管理器注册（顶层轮次拥有该注册），
+        WebSocket 处理器通过会话中已注册的会话解析回答。把提问注册到 sink
+        上，才让被委派 Agent 提出的问题有可能被回答。
         """
         store = self
         while store._prompt_sink is not None:
@@ -347,7 +330,7 @@ class ConversationSession:
         return store
 
     def _note_owner_present(self, prompt_id: str) -> None:
-        """Lift the pause on whoever asked, when this session holds the prompt."""
+        """当本会话持有该提问时，解除提问方的暂停。"""
         owner = self._prompt_owners.get(prompt_id)
         if owner is not None and owner is not self:
             owner._note_user_present()
@@ -371,47 +354,43 @@ class ConversationSession:
         save_to_project_secrets: bool = False,
         save_to_user_tokens: bool = False,
     ) -> str:
-        """Emit a selection/input prompt event and wait for the user to respond.
+        """发出选择/输入提问事件，并等待用户响应。
 
-        Blocks the agent until the UI sends back a user_selection_response message.
+        会阻塞 Agent，直到前端回传 user_selection_response 消息。
 
-        Parameters
+        参数
         ----------
         kind : "selection" | "text"
-            "selection" shows radio/dropdown options (legacy default).
-            "text" shows a free-text input field.
+            "selection" 显示单选/下拉选项（旧的默认方式）。
+            "text" 显示自由文本输入框。
         secret : bool
-            If True, the frontend shows a password input and the response is
-            handled server-side: the plaintext never reaches the LLM. The Future
-            resolves to an opaque confirmation string (e.g. "secret_saved"), not
-            the actual secret value.
+            为 True 时，前端显示密码输入框，响应在服务端处理：明文永远不会
+            到达 LLM。Future 解析为一个不透明的确认字符串（如
+            "secret_saved"），而非真实密钥值。
         save_to_project_secrets : bool
-            When secret=True, instructs the WS handler to persist the value as a
-            project-scoped secret before resolving the Future.
+            当 secret=True 时，指示 WebSocket 处理器在解析 Future 前，把值
+            持久化为项目级密钥。
         save_to_user_tokens : bool
-            When secret=True, instructs the WS handler to persist the value as a
-            user-scoped token (user_tokens table) before resolving the Future.
-            Mutually exclusive with save_to_project_secrets.
+            当 secret=True 时，指示 WebSocket 处理器在解析 Future 前，把值
+            持久化为用户级令牌（user_tokens 表）。与
+            save_to_project_secrets 互斥。
         service_key / environment : str | None
-            Used together with save_to_project_secrets / save_to_user_tokens to
-            identify the secret slot.
+            与 save_to_project_secrets / save_to_user_tokens 配合使用，用于
+            标识密钥槽位。
         task_id : str | None
-            Associates this prompt with a running task for UI display.
+            把该提问与运行中的任务关联，便于界面展示。
         title / message : str | None
-            Optional display overrides for the prompt dialog.
+            提问对话框的可选展示覆盖项。
 
-        Raises UserSelectionTimeoutError on timeout,
-        UserSelectionAbortedError when the run is aborted, and
-        UserSelectionUnavailableError when the run is non-interactive;
-        all subclass RuntimeError.
+        超时抛出 UserSelectionTimeoutError，运行被中止抛出
+        UserSelectionAbortedError，运行非交互式时抛出
+        UserSelectionUnavailableError；三者都继承 RuntimeError。
         """
         store = self._prompt_store()
-        # Headless runs (scheduled tasks, published agents) build and register
-        # a session, but no client is attached — nobody can ever answer, so
-        # waiting out the 120–300 s timeout only stalls the turn. The
-        # ANSWERER's interactivity decides: prompts register on the sink
-        # store, so a delegated turn under a headless parent is refused too,
-        # while an interactive parent still answers its delegates' prompts.
+        # 无头运行（定时任务、已发布 Agent）会构建并注册会话，但没有客户端
+        # 连接——永远无人能回答，因此干等 120–300 秒超时只会让本轮停滞。
+        # 由"回答方"的交互性决定：提问注册在 sink 存储上，所以无头父级下
+        # 的被委派轮次也会被拒绝，而交互式父级仍会回答其委派的提问。
         if not store.interactive:
             raise UserSelectionUnavailableError(
                 "interactive prompts are disabled in this run — the agent is "
@@ -450,27 +429,24 @@ class ConversationSession:
         if save_to_user_tokens:
             event_data["save_to_user_tokens"] = True
 
-        # Register the payload BEFORE emitting: a client connecting in the
-        # window between the emit and this line would get a sync event that
-        # replays nothing, and the dialog would be lost until the next prompt.
+        # 在 emit 之前先注册载荷：若客户端恰好在 emit 与此行之间的窗口连接，
+        # 会收到一个重放不出任何内容的同步事件，对话框会丢失直到下一次提问。
         store._pending_prompt_events[prompt_id] = event_data
         try:
             await self.emit("user_selection_required", **event_data)
         except BaseException:
-            # This emit is the only await before the finally below; a
-            # cancellation landing here would otherwise leave the prompt
-            # registered on the store. For a delegated child the store is the
-            # parent's session, which outlives the child — resolve_user_selection
-            # does not pop the payload (the requester's finally does), so the
-            # leak would replay an unanswerable dialog on every client reconnect.
+            # 这个 emit 是下方 finally 之前唯一的 await；取消若落在此处，会
+            # 让提问仍注册在 store 上。对被委派子级，store 是父级会话，其
+            # 寿命比子级长——resolve_user_selection 不会弹出载荷（由请求方的
+            # finally 处理），因此该泄漏会在每次客户端重连时重放一个无法回答
+            # 的对话框。
             store._pending_prompts.pop(prompt_id, None)
             store._pending_prompt_events.pop(prompt_id, None)
             store._prompt_owners.pop(prompt_id, None)
             raise
-        # Also wake on abort: once the session is aborted the UI has closed
-        # this prompt's path (emit can even fail with a full queue) and the
-        # tool would otherwise block the full 300 s timeout on a prompt
-        # nobody can ever answer.
+        # 同时在中止时唤醒：会话一旦中止，前端已关闭该提问的路径（emit 甚至
+        # 可能因队列满而失败），否则工具会在一个无人能回答的提问上阻塞满
+        # 300 秒超时。
         abort_waiter = asyncio.create_task(self.abort_event.wait())
         try:
             done, _ = await asyncio.wait(
@@ -479,10 +455,9 @@ class ConversationSession:
                 return_when=asyncio.FIRST_COMPLETED,
             )
         except asyncio.CancelledError:
-            # Torn down mid-question (a delegated turn hitting its timeout, or
-            # a Stop that cancelled the run outright). Neither the timeout nor
-            # the abort arm below runs on this path, so without this notice the
-            # client keeps a dialog nobody can ever answer.
+            # 提问中途被拆除（被委派轮次达到其超时，或一次停止直接取消了运行）。
+            # 此路径既不会运行超时逻辑，也不会运行下方中止分支，因此没有这个
+            # 通知，客户端会保留一个无人能回答的对话框。
             try:
                 await self.emit(
                     "user_selection_cancelled",
@@ -491,7 +466,7 @@ class ConversationSession:
                     reason="cancelled",
                 )
             except BaseException:
-                # Best effort — the notice must never mask the cancellation.
+                # 尽力而为——通知绝不能掩盖取消本身。
                 pass
             raise
         finally:
@@ -500,10 +475,9 @@ class ConversationSession:
             store._pending_prompt_events.pop(prompt_id, None)
             store._prompt_owners.pop(prompt_id, None)
         if not done:
-            # The client must dismiss the dialog it is still showing for this
-            # prompt — otherwise the UI keeps a zombie prompt that never
-            # resolves and every later user_confirm stacks another dialog on
-            # top (the "超时后再对话弹窗不出现/错乱" symptom).
+            # 客户端必须关闭它仍在为该提问显示的对话框——否则界面会保留一个
+            # 永不解析的僵尸提问，之后每次 user_confirm 都在上面再叠一个对话框
+            # （即"超时后再对话弹窗不出现/错乱"的症状）。
             await self.emit(
                 "user_selection_cancelled",
                 prompt_id=prompt_id,
@@ -524,11 +498,11 @@ class ConversationSession:
         return fut.result()
 
     def resolve_user_selection(self, prompt_id: str, value: str) -> bool:
-        """Resolve a pending user_confirm Future. Returns True if found.
+        """解析一个待处理的 user_confirm Future，找到则返回 True。
 
-        For non-secret prompts, *value* is the user's chosen option or text.
-        For secret prompts, the WS handler should call resolve_user_selection_secret()
-        instead so that the plaintext never reaches the agent.
+        对非密钥提问，*value* 是用户选择的选项或文本。对密钥提问，WebSocket
+        处理器应改为调用 resolve_user_selection_secret()，使明文永远不到达
+        Agent。
         """
         fut = self._pending_prompts.get(prompt_id)
         if fut is not None and not fut.done():
@@ -539,10 +513,10 @@ class ConversationSession:
         return False
 
     def resolve_user_selection_secret(self, prompt_id: str, *, saved: bool = True) -> bool:
-        """Resolve a secret prompt without forwarding the plaintext to the agent.
+        """解析密钥提问，不把明文转发给 Agent。
 
-        Called by the WS handler AFTER the secret has been encrypted and stored.
-        The agent receives an opaque confirmation string, never the raw value.
+        由 WebSocket 处理器在密钥已加密并存储之后调用。Agent 收到一个不透明
+        的确认字符串，永远拿不到原始值。
         """
         fut = self._pending_prompts.get(prompt_id)
         if fut is not None and not fut.done():
@@ -554,23 +528,21 @@ class ConversationSession:
         return False
 
     def pending_prompt_events(self) -> list[dict[str, Any]]:
-        """Snapshot of the prompts still awaiting user input.
+        """仍在等待用户输入的提问快照。
 
-        A client that (re)connects to the conversation gets these replayed so
-        it can restore the dialog: the prompt's Future lives only in this
-        session, and the message history holds no trace of it, so a client
-        that dropped the dialog (switched conversations and came back, or
-        reloaded the page) would otherwise show a conversation waiting on an
-        answer it cannot give.
+        （重新）连接到会话的客户端会收到这些重放，以便恢复对话框：提问的
+        Future 只存在于本会话，消息历史中没有它的痕迹，因此丢掉对话框（切换
+        会话又回来，或刷新页面）的客户端，否则会显示一个在等待它无法给出的
+        回答的会话。
         """
         return [dict(payload) for payload in self._pending_prompt_events.values()]
 
     def pending_prompt_payload(self, prompt_id: str) -> dict[str, Any] | None:
-        """Snapshot of one pending prompt's event payload, or None.
+        """一个待处理提问的事件载荷快照，或 None。
 
-        The WS handler needs the prompt's question *before* it resolves the
-        Future: the awaiting request_user_selection() pops the payload in its
-        finally block, so anything read after resolve_user_selection() is gone.
+        WebSocket 处理器需要在解析 Future *之前*拿到提问的问题：等待中的
+        request_user_selection() 会在其 finally 块弹出载荷，因此
+        resolve_user_selection() 之后读到的任何东西都已不存在。
         """
         payload = self._pending_prompt_events.get(prompt_id)
         return dict(payload) if payload is not None else None
@@ -579,7 +551,7 @@ class ConversationSession:
         return self.abort_event.is_set()
 
     def abort(self, reason: str = "abort") -> None:
-        """Set the abort event, recording the first cause."""
+        """设置中止事件，并记录首因。"""
         if self.abort_reason is None:
             self.abort_reason = reason
         self.abort_event.set()
@@ -592,20 +564,18 @@ class ConversationSession:
         try:
             self._user_input_queue.put_nowait(entry)
             self._pending_input_by_id[entry.message_id] = entry
-            # The user is back at the keyboard: unanswered prompts may be asked
-            # again (answers already given stay recorded).
+            # 用户回到键盘前：未回答的提问可以再问（已给出的回答仍保留）。
             self._note_user_present()
             return True
         except asyncio.QueueFull:
             return False
 
     def dequeue_user_input(self) -> UserInputEntry | None:
-        """Pop the next pending user message without blocking — the agent
-        polls at step boundaries, never blocks the main loop on this.
+        """非阻塞地弹出下一条待处理用户消息——Agent 在步骤边界轮询，绝不会
+        因这一步阻塞主循环。
 
-        The entry stays registered by message_id so the handler can still
-        resolve its persistence Future after the agent consumed it (the
-        user_message_injected event is processed asynchronously).
+        条目仍按 message_id 注册，以便 Agent 消费后处理器仍能解析其持久化
+        Future（user_message_injected 事件是异步处理的）。
         """
         try:
             return self._user_input_queue.get_nowait()
@@ -621,12 +591,11 @@ class ConversationSession:
         ok: bool,
         attachment_records: list[dict] | None = None,
     ) -> None:
-        """Resolve the persistence Future for an injected message.
+        """解析一条注入消息的持久化 Future。
 
-        Called by the WS handler after the message was written to the DB (or
-        rejected). ``attachment_records`` carries the prepared attachment
-        records (inline_text/image_data) the agent needs to build the LLM
-        user content.
+        由 WebSocket 处理器在消息写入数据库（或被拒绝）后调用。
+        ``attachment_records`` 携带 Agent 构建 LLM 用户内容所需的已准备附件
+        记录（inline_text/image_data）。
         """
         entry = self._pending_input_by_id.pop(message_id, None)
         if entry is not None:

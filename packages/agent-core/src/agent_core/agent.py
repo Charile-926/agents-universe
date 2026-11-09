@@ -1,4 +1,23 @@
-"""Agent orchestrator — the tool-call and agentic loop."""
+"""
+Agent 编排器（agent.py）—— 工具调用与智能体主循环。
+
+本模块是 agent-core 引擎的核心，负责把"用户消息 + 系统提示词 + 可用工具"
+组织成一次完整的大模型（LLM）对话，并驱动"模型思考 → 决定调用工具 →
+执行工具 → 把结果回灌模型"的智能体循环（agentic loop），直到模型给出最终
+答复，或触发迭代预算、上下文超限、任务超时等安全边界。
+
+主要由以下几部分组成：
+- 模块级辅助函数：JSON 安全序列化（_json_default/_dumps）、凭证脱敏
+  （_scrub_credentials）、单任务超时读取（_task_timeout_seconds）、工具
+  输出裁剪（_clip_tool_output）、Token 用量记账（_consume_usage）、多模态
+  用户消息组装（build_user_content）等；
+- AgentConfig：Agent 的运行配置数据类，负责从文件读取并解析各类开关、
+  模型/工具白名单、超时与预算等参数；
+- Agent：主编排器类，维护系统提示词、工具注册表与模型供应方，对外暴露
+  run() 入口；内部通过 _run_loop（普通对话循环）以及 _run_task_mode /
+  _execute_single_task / _run_task_loop（多任务规划模式）执行具体流程，
+  并统一处理上下文压缩、限流降级、任务进度事件推送等横切逻辑。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -26,9 +45,9 @@ def _json_default(obj: Any) -> Any:
         return sorted(obj)
     if isinstance(obj, Path):
         return str(obj)
-    # Last resort: MCP-injected tools may return arbitrary objects. Keep the
-    # turn alive with a text rendering instead of letting TypeError escape the
-    # tool-loop try/except (the _dumps call sits outside it).
+    # 兜底处理：MCP 注入的工具可能返回任意对象。这里用文本渲染保证本轮
+    # 不中断，避免 TypeError 逃逸到工具循环的 try/except 之外（_dumps 的
+    # 调用位于该 try/except 外）。
     return str(obj)
 
 
@@ -63,13 +82,13 @@ _log = logging.getLogger("agent_core.agent")
 
 
 def _scrub_credentials(text: str, credentials: dict[str, Any] | None) -> str:
-    """Mask every configured API key in *text* before it reaches a sink.
+    """在文本进入任何输出端之前，掩码掉其中所有已配置的 API Key。
 
-    Provider/SDK exceptions echo what they rejected — h11 quotes the whole
-    Authorization header ("Illegal header value b'...'"), auth errors quote
-    the key — and the error boundaries below send the string to the UI, the
-    log, and (via task_failed) the DB. Raw + escaped-bytes replacement, same
-    rule as the token/api-key routers' ``_redact_key``.
+    模型供应方/SDK 抛出的异常往往会回显被拒内容——h11 会把整个
+    Authorization 头原样引用（"Illegal header value b'...'"），鉴权错误会
+    引用密钥本身——而下方的错误边界会把该字符串发送到前端界面、日志以及
+    （通过 task_failed 事件）数据库。这里对原始字节与转义字节都做替换，
+    规则与 token/api-key 路由里的 ``_redact_key`` 保持一致。
     """
     if not text or not credentials:
         return text
@@ -80,11 +99,10 @@ def _scrub_credentials(text: str, credentials: dict[str, Any] | None) -> str:
 
 
 def _task_timeout_seconds() -> int:
-    """Per-task execution budget in seconds (AGENT_TASK_TIMEOUT_SECONDS).
+    """单个任务的执行时间预算（秒），由环境变量 AGENT_TASK_TIMEOUT_SECONDS 配置。
 
-    Read at call time so deployments can tune without a code change. The
-    previous hardcoded 300s cut slow-thinking models off mid-iteration and
-    cascade-skipped every dependent task.
+    在调用时才读取，便于部署侧不改代码即可调整。此前硬编码的 300 秒会在
+    慢思考模型迭代中途将其切断，并连带跳过所有依赖该任务的后续任务。
     """
     raw = os.environ.get("AGENT_TASK_TIMEOUT_SECONDS", "")
     try:
@@ -94,28 +112,24 @@ def _task_timeout_seconds() -> int:
         return 600
     return max(1, value)
 
-# Upper bound on accumulated streamed tool-call arguments (chars) to avoid
-# unbounded memory growth from a runaway stream.
+# 流式累积的工具调用参数（字符数）上限，防止失控的数据流导致内存无限增长。
 _MAX_TOOL_ARGS_CHARS = 2_000_000
 
-# WS-frame cap for tool_call_end payloads: the whole result travels as one
-# JSON frame, and manager.send evicts the connection after 5s — a multi-MB
-# tool result (repo graph blast radius, a big file read) would get the
-# client disconnected. The LLM-bound tool message keeps the full result;
-# this only bounds what the browser receives.
+# tool_call_end 事件 WebSocket 帧的载荷上限：整个结果会作为一个 JSON 帧
+# 发送，而 manager.send 在 5 秒后会回收连接——数 MB 的工具结果（如仓库
+# 图谱的大范围输出、读取大文件）会导致客户端被断开。回灌给 LLM 的工具
+# 消息仍保留完整结果，这里只限制浏览器实际收到的内容。
 _MAX_TOOL_OUTPUT_CHARS = 100_000
 
 
 def _clip_tool_output(result):
-    """Return a JSON-safe copy of a tool result, size-clipped when oversized.
+    """返回工具结果的 JSON 安全副本，超限时进行尺寸裁剪。
 
-    Foreign cell/object types (Decimal from SQL rows, bytes, Path, set …)
-    must be coerced here, at the single choke point every tool_call_end
-    emission passes through: the raw dict would otherwise reach the API's
-    json.dumps on both the WS forward and the tool_calls persistence, where
-    a TypeError evicts the live socket and drops the whole assistant
-    message. The LLM-bound tool message keeps the original object — this
-    only shapes what is emitted as an event.
+    外部的特殊单元/对象类型（SQL 结果行里的 Decimal、bytes、Path、set 等）
+    必须在此处统一强制转换——这是每次 tool_call_end 事件发出前都经过的唯一
+    咽喉点：否则原始 dict 会在 WebSocket 转发和 tool_calls 持久化两处进入
+    API 的 json.dumps，一旦抛出 TypeError 就会踢掉活动连接并丢失整条助手
+    消息。回灌给 LLM 的工具消息保留原始对象，本函数只塑造作为事件发出的内容。
     """
     if not isinstance(result, (dict, list)):
         return result
@@ -124,8 +138,8 @@ def _clip_tool_output(result):
     except (TypeError, ValueError):
         return result
     if len(text) <= _MAX_TOOL_OUTPUT_CHARS:
-        # json round-trip: coercions above become plain JSON types, so every
-        # downstream dumps (strict or date-only default) succeeds.
+        # JSON 往返：上面的强制转换都变成了普通 JSON 类型，因此下游的每次
+        # dumps（严格模式或仅日期的 default）都能成功。
         return json.loads(text)
     return {
         "truncated": True,
@@ -133,16 +147,15 @@ def _clip_tool_output(result):
         "preview": text[:50_000],
     }
 
-# Tool-call loop budgets (iterations = provider round-trips). The chat loop
-# refreshes its per-loop budget when the user injects a message mid-run;
-# total_budget (5x) is the never-refreshed safety valve. Long closed-loop
-# workflows (e.g. the QA Jira pipeline) need more than the old 20/15.
+# 工具调用循环预算（迭代次数 = 模型供应方往返次数）。对话循环在用户运行中
+# 插入消息时会刷新其单轮预算；total_budget（5 倍）是永不刷新的安全阀。
+# 长闭环工作流（如 QA 的 Jira 流水线）需要比旧的 20/15 更多的迭代次数。
 _MAX_CHAT_ITERATIONS = 60
 _MAX_TASK_ITERATIONS = 30
 
 
 def _attachment_ref(a: dict) -> str:
-    """Text representation of an attachment (name + relative path) for the LLM."""
+    """为 LLM 生成附件的文本表示（附件名 + 相对路径）。"""
     return (
         f"Attachment: {a.get('name', 'unknown')} ({a.get('media_type', '')}, "
         f"{a.get('size', 0)} bytes) — file path: {a.get('rel_path', '')}"
@@ -152,14 +165,13 @@ def _attachment_ref(a: dict) -> str:
 def _consume_usage(
     usage: dict[str, Any], prev: tuple[int, int]
 ) -> tuple[int, int, int, int]:
-    """Split a provider usage snapshot into ledger deltas plus totals.
+    """把模型供应方的一次用量快照拆分为台账增量与累计总量。
 
-    Usage chunks carry request-cumulative totals for the current provider
-    call, and OpenAI-compatible gateways repeat them on ordinary chunks
-    (vLLM running stats). Adding each snapshot would count the prompt once
-    per chunk; ``prev`` is the largest snapshot already recorded for this
-    call, so the delta is the growth since then. Returns
-    ``(delta_prompt, delta_completion, total_prompt, total_completion)``.
+    用量数据块携带的是本次供应方调用自请求开始的累计总量，OpenAI 兼容
+    网关会在普通数据块上重复携带这些值（如 vLLM 的运行统计）。若把每个
+    快照直接相加，会导致每个数据块都重复计算一次提示词；``prev`` 记录本次
+    调用已入账的最大快照，因此增量取此后的增长部分。返回
+    ``(提示词增量, 补全增量, 提示词总量, 补全总量)``。
     """
     prompt = int(usage.get("prompt_tokens", 0) or 0)
     completion = int(usage.get("completion_tokens", 0) or 0)
@@ -172,14 +184,12 @@ def _consume_usage(
 
 
 def build_user_content(user_message: str, attachments: list[dict] | None, supports_vision: bool) -> str | list:
-    """Build the user message content for the LLM.
+    """构建发送给 LLM 的用户消息内容。
 
-    Without attachments the raw string is returned unchanged. With attachments
-    content becomes a multimodal part list: text parts (original message,
-    inline-text attachments, path references) followed by image parts — the
-    convention all three provider adapters accept. Images are only sent as
-    vision blocks when the provider supports it; binary files and oversized
-    images degrade to path references so the agent can read them with tools.
+    无附件时原样返回字符串。有附件时，内容变为多模态分片列表：先是文本
+    分片（原始消息、内联文本附件、路径引用），随后是图片分片——这是三个
+    供应方适配器都接受的约定。图片仅在供应方支持视觉时作为图像块发送；
+    二进制文件和超大图片会降级为路径引用，以便 Agent 用工具去读取它们。
     """
     if not attachments:
         return user_message
@@ -198,6 +208,13 @@ def build_user_content(user_message: str, attachments: list[dict] | None, suppor
 
 @dataclass
 class AgentConfig:
+    """Agent 运行配置数据类。
+
+    封装一个 Agent 定义文件（Markdown 正文 + frontmatter 元数据）解析后的
+    全部参数：标识与描述、系统提示词正文，以及工具/技能/工作流/知识库
+    白名单、Token 上限与预算、api_request 是否免确认等开关。通过
+    from_file() 从磁盘上的 Agent 定义文件构造。
+    """
     slug: str
     description: str
     system_prompt: str
@@ -207,19 +224,18 @@ class AgentConfig:
     knowledge: list[str] = field(default_factory=list)
     max_tokens: int = 128000
     token_budget: int = 100000
-    # Opt-out of api_request's write/prod confirmation gate for this agent
-    # (used by autonomous automation agents like QA that do data-setup calls).
+    # 为本 Agent 关闭 api_request 的写操作/生产环境确认闸门（用于 QA 等
+    # 需要执行数据准备类调用的自动化 Agent）。
     api_request_no_confirm: bool = False
 
     @staticmethod
     def _list_field(value: object) -> list[str]:
-        """Normalize a frontmatter list field to a list of strings.
+        """把 frontmatter 中的列表字段归一化为字符串列表。
 
-        LLM-written agent files often spell a list as a scalar:
-        `tools: "shell, filesystem"`. A raw scalar must not be returned as-is
-        — ``Agent.__init__`` iterates ``config.tools`` per item, so a string
-        would be iterated per character and silently drop every tool. Same
-        defense as ``memory_rw._coerce_tags``: strip and split on comma.
+        由 LLM 编写的 Agent 文件常把列表写成标量，例如 `tools: "shell,
+        filesystem"`。标量不能原样返回——``Agent.__init__`` 会逐项遍历
+        ``config.tools``，若传入字符串就会按字符遍历，从而静默丢掉所有工具。
+        这里与 ``memory_rw._coerce_tags`` 采用相同防御：去除空白后按逗号切分。
         """
         if isinstance(value, str):
             return [v.strip() for v in value.split(",") if v.strip()]
@@ -229,12 +245,11 @@ class AgentConfig:
 
     @staticmethod
     def _as_bool(value: object) -> bool:
-        """Normalize a frontmatter boolean.
+        """归一化 frontmatter 中的布尔值。
 
-        YAML authors quote scalars, and ``bool("false")`` is True — a quoted
-        ``api_request_no_confirm: "false"`` would silently disable
-        api_request's write-confirmation gate. Same semantics as
-        ``scheduler._as_bool``.
+        YAML 作者常会给标量加引号，而 ``bool("false")`` 结果为 True——带引号
+        的 ``api_request_no_confirm: "false"`` 会静默关闭 api_request 的写操作
+        确认闸门。语义与 ``scheduler._as_bool`` 保持一致。
         """
         if isinstance(value, bool):
             return value
@@ -244,11 +259,11 @@ class AgentConfig:
 
     @staticmethod
     def _as_int(value: object, default: int) -> int:
-        """Coerce a frontmatter integer; blank or malformed falls back.
+        """强制转换 frontmatter 中的整数；空白或格式错误时回退到默认值。
 
-        ``max_tokens: "64000"`` is a string and ``max_tokens:`` is None;
-        either reaching ``min(max_tokens, MAX_OUTPUT_RESERVE)`` raises
-        TypeError and ends every turn as an api_error.
+        ``max_tokens: "64000"`` 是字符串，而 ``max_tokens:`` 为空时是 None；
+        二者若进入 ``min(max_tokens, MAX_OUTPUT_RESERVE)`` 都会抛出
+        TypeError，使每一轮都以 api_error 结束。
         """
         if isinstance(value, bool):
             return default
@@ -262,9 +277,8 @@ class AgentConfig:
     def from_file(cls, path: str) -> "AgentConfig":
         post = frontmatter.load(path)
         meta = post.metadata
-        # zh-first canonical: agent descriptions are Chinese in every current
-        # definition; a locale map must collapse to that same text so the
-        # delegation roster / history prefix see no change.
+        # 中文优先的规范：当前所有 Agent 定义的描述都是中文；多语言映射
+        # 必须折叠为同一文本，使委派名单/历史前缀看不到任何变化。
         description, _ = normalize_i18n_field(
             meta.get("description", ""), canonical_order=("zh-CN", "en-US")
         )
@@ -283,15 +297,15 @@ class AgentConfig:
 
 
 class Agent:
-    """The main agent orchestrator.
+    """主编排器（Agent）。
 
-    Runs in two modes:
-    - Chat mode: single LLM call + tool loop
-    - Task mode: plan_task → execute each task sequentially
+    支持两种运行模式：
+    - 对话模式（Chat）：单次 LLM 调用 + 工具调用循环；
+    - 任务模式（Task）：先由 plan_task 规划任务，再依次执行每个任务。
     """
 
-    # Bound for awaiting the API handler's persistence ack of an injected
-    # user message. A timeout degrades to success (durability vs. progress).
+    # 等待 API 处理器对"注入的用户消息"返回持久化确认的时间上限。超时会
+    # 降级为成功处理（在数据持久性与流程推进之间取平衡）。
     _INJECT_PERSIST_TIMEOUT = 30.0
 
     def __init__(
@@ -321,38 +335,35 @@ class Agent:
         self._pending_task_context = pending_task_context
         self._personal_memory_context = personal_memory_context
         self._active_plan_context = active_plan_context
-        # Filter out MCP markers (mcp / mcp:<slug>) - they are resolved into
-        # dynamic tool instances by attach_mcp_tools() before run().
+        # 过滤掉 MCP 标记（mcp / mcp:<slug>）——它们会在 run() 之前由
+        # attach_mcp_tools() 解析为动态工具实例。
         static_tool_names = [t for t in config.tools if not t.startswith("mcp")]
         self._tools = build_tool_registry(static_tool_names)
         self._turn = 0
         self._current_task_id: str | None = None
         self._prompt_dirty = False
-        # _prompt_dirty is a shared boolean — with parallel tasks
-        # task A's change marks it, task B's next iteration consumes and
-        # clears it, so A's prompt never rebuilds. _prompt_revision makes
-        # each loop rebuild independently (see _mark_prompt_dirty).
+        # _prompt_dirty 是一个共享布尔值——在并行任务下，任务 A 的改动会
+        # 标记它，任务 B 的下一次迭代会消费并清除它，导致 A 的提示词无法
+        # 重建。_prompt_revision 让每个循环都能独立重建（见 _mark_prompt_dirty）。
         self._prompt_revision = 0
         self._static_prompt_cache: str | None = None
-        # Skills whose triggers matched this turn's user message. Stored on the
-        # instance (not appended to a local prompt string) so prompt rebuilds
-        # inside plan_task pipelines keep the skill body — a local append was
-        # dropped the moment _mark_prompt_dirty forced a rebuild.
+        # 本轮用户消息命中触发条件的技能。保存在实例上（而非追加到局部
+        # 提示词字符串），使 plan_task 流水线内的提示词重建仍能保留技能
+        # 正文——一旦 _mark_prompt_dirty 强制重建，局部追加的内容就会丢失。
         self._active_skills: list = []
         self._provider_cache: dict[str, LLMProvider] = {}
-        self._task_plan: list[dict] | None = None  # Live task status tracking
+        self._task_plan: list[dict] | None = None  # 实时任务状态跟踪
         for tool in self._tools.values():
             self._tool_ctx.register_tool(tool)
-        # Link project context to tool context
+        # 把项目上下文关联到工具上下文
         if project_context is not None:
             self._tool_ctx.project_context = project_context
 
     def add_tools(self, tools: dict[str, Tool]) -> None:
-        """Inject dynamic tool instances after construction.
+        """在构造完成后注入动态工具实例。
 
-        Called by the WebSocket handler to attach MCP-discovered tools before
-        ``run()`` snapshots ``tool_defs``.  Existing tool names take precedence
-        (built-in tools are never shadowed by MCP tools).
+        由 WebSocket 处理器调用，在 ``run()`` 快照 ``tool_defs`` 之前挂上
+        MCP 发现的工具。已存在的工具名优先（内置工具绝不会被 MCP 工具覆盖）。
         """
         import logging as _logging
         _log_a = _logging.getLogger("agent_core.agent")
@@ -364,10 +375,10 @@ class Agent:
             self._tool_ctx.register_tool(tool)
 
     async def close(self) -> None:
-        """Release provider HTTP clients and cached connections.
+        """释放模型供应方的 HTTP 客户端与缓存连接。
 
-        Safe to call multiple times. Must be awaited after run() completes so
-        per-message Agent instances don't leak httpx.AsyncClient connections.
+        可安全重复调用。run() 结束后必须 await 本方法，避免每条消息新建的
+        Agent 实例泄漏 httpx.AsyncClient 连接。
         """
         for provider in self._provider_cache.values():
             try:
@@ -377,7 +388,7 @@ class Agent:
         self._provider_cache.clear()
 
     def _get_provider(self, config_id: str) -> LLMProvider:
-        """Instantiate (or retrieve cached) LLM provider for a given config_id."""
+        """为指定 config_id 实例化（或取回缓存的）LLM 模型供应方。"""
         model_cfg = self._tier_models.get(config_id)
         if not model_cfg:
             if not self._tier_models:
@@ -399,16 +410,14 @@ class Agent:
 
     @staticmethod
     def _merge_tool_args(existing: str, delta: str) -> str:
-        """Merge streaming tool-call argument fragments.
+        """合并流式工具调用的参数片段。
 
-        OpenAI-style providers split one JSON document across chunks (plain
-        string concatenation is correct); Gemini sends per-chunk incremental
-        field dicts, so naive concatenation yields invalid JSON like
-        ``{"a":1}{"b":2}``. Concatenation wins whenever the combined text is
-        already a single valid JSON document — the dict merge is tried only
-        when concatenation does not parse (so a fragment split that happens to
-        land on a JSON boundary never changes the argument semantics). The
-        result is capped at _MAX_TOOL_ARGS_CHARS.
+        OpenAI 风格的供应方把一个 JSON 文档拆到多个数据块（直接字符串拼接
+        即可）；Gemini 则按数据块发送增量字段 dict，朴素拼接会产生
+        ``{"a":1}{"b":2}`` 这样的非法 JSON。只要拼接文本本身已是一个合法
+        JSON 文档，就优先采用拼接；仅在拼接无法解析时才尝试 dict 合并
+        （因此恰好落在 JSON 边界上的分片切分不会改变参数语义）。结果长度
+        以 _MAX_TOOL_ARGS_CHARS 为上限。
         """
         if not delta:
             return existing
@@ -437,19 +446,16 @@ class Agent:
 
     @staticmethod
     def _parse_tool_arguments(tc: dict):
-        """Parse one tool call's streamed arguments, blank meaning no args.
+        """解析一次工具调用的流式参数，空白表示无参数。
 
-        Anthropic and Gemini stream a zero-argument call as an empty
-        arguments string — there is no JSON fragment to delimit — so a blank
-        value must mean ``{}`` rather than malformed JSON. The stored call is
-        normalized so the next provider request carries valid JSON too.
-        Raises ``JSONDecodeError``/``TypeError`` for genuinely bad values:
-        the parsed payload must be a JSON object. A well-formed array/null/
-        string would otherwise reach ``args.get(...)`` in the
-        knowledge_rw/memory_rw post-execution hooks, which sit outside the
-        tool try/except — a non-dict there crashes the whole turn with
-        AttributeError instead of surfacing as a tool error the model can
-        correct.
+        Anthropic 与 Gemini 会把零参数调用以空参数字符串流式返回——没有
+        任何 JSON 分片需要界定——因此空白值必须解释为 ``{}``，而非非法
+        JSON。同时归一化存储的调用，使下一次供应方请求也携带合法 JSON。
+        对真正错误的值抛出 ``JSONDecodeError``/``TypeError``：解析出的载荷
+        必须是 JSON 对象。否则格式良好的数组/null/字符串会进入
+        knowledge_rw/memory_rw 执行后钩子中的 ``args.get(...)``，而这些钩子
+        位于工具 try/except 之外——非 dict 值会以 AttributeError 让整轮
+        崩溃，而不是作为模型可自行纠正的工具错误暴露出来。
         """
         raw = tc["function"].get("arguments")
         if raw is None or (isinstance(raw, str) and not raw.strip()):
@@ -464,7 +470,7 @@ class Agent:
 
     @staticmethod
     def _accumulate_tool_delta(buffer: dict, delta: dict) -> None:
-        """Accumulate a streaming tool-call delta chunk into the buffer keyed by index."""
+        """把一个流式工具调用增量数据块累积进按索引（index）区分的缓冲区。"""
         idx = delta.get("index", 0)
         if idx not in buffer:
             buffer[idx] = {"id": delta.get("id", ""), "type": "function", "function": {"name": "", "arguments": ""}}
@@ -481,14 +487,13 @@ class Agent:
 
     @staticmethod
     def _drop_orphan_tool_messages(messages: list[Message]) -> list[Message]:
-        """Remove tool messages whose assistant tool_calls partner is missing.
+        """移除缺少对应助手 tool_calls 配对的工具消息。
 
-        Interrupted runs or history slicing can leave a tool result without its
-        preceding assistant tool_calls message; OpenAI-compatible providers
-        reject that combination with a 400. A dangling assistant tool_calls at
-        the tail (its tool results never arrived) is equally rejected, so it
-        is dropped too. Mid-history pairs are kept — the loop always appends a
-        tool result immediately after the assistant message that requested it.
+        运行中断或历史切片可能导致工具结果丢失了前置的助手 tool_calls
+        消息；OpenAI 兼容供应方会以 400 拒绝这种组合。尾部悬空的助手
+        tool_calls（其工具结果始终未到达）同样会被拒绝，因此一并丢弃。
+        历史中间的配对予以保留——循环总是在发起调用的助手消息之后立即
+        追加工具结果。
         """
         pending: set[str] = set()
         cleaned: list[Message] = []
@@ -516,7 +521,7 @@ class Agent:
 
     @staticmethod
     def _history_tool_call_summary(messages: list[Message]) -> tuple[str, list[str]]:
-        """Return a compact, secret-safe summary of tool-call history."""
+        """返回工具调用历史的紧凑、密钥安全摘要。"""
         pending: set[str] = set()
         roles: list[str] = []
         for message in messages:
@@ -546,15 +551,14 @@ class Agent:
         task_title: str,
         dependency_results: list[tuple[str, str]] | None = None,
     ) -> list[Message]:
-        """Fork a valid tool-result history for execution of one planned task.
+        """为执行单个规划任务，分叉出一份合法的工具结果历史。
 
-        The outer loop cannot append its final plan summary until every task has
-        finished. The nested task request must nevertheless acknowledge the
-        enclosing plan_task call before adding its task-specific user message.
+        外层循环在所有任务完成之前无法追加其最终计划摘要，但嵌套的任务
+        请求在加入其任务专属用户消息之前，仍必须先确认外层的 plan_task 调用。
 
-        `dependency_results` carries (title, summary) for each completed
-        dependency — without it a dependent task re-derives facts its
-        predecessor already proved (e.g. re-probing an API that answered 201).
+        `dependency_results` 携带每个已完成依赖的（标题, 摘要）——缺少它，
+        依赖任务会重新推导前置任务已经证明的事实（例如再次探测一个已返回
+        201 的 API）。
         """
         task_content = f"Execute this task: {task_title}"
         if dependency_results:
@@ -581,11 +585,10 @@ class Agent:
 
     @staticmethod
     def _normalize_task_plan(tasks: list[dict]) -> list[dict]:
-        """Rewrite planner-local task IDs to globally unique IDs for persistence."""
-        # The schema declares an array of objects, but models also emit a bare
-        # string or a list of strings; .get()/dict() on those raises
-        # AttributeError/ValueError, which surfaces as the opaque "plan_task
-        # failed" instead of a message the model can act on.
+        """把规划器本地的任务 ID 改写为全局唯一 ID，以便持久化。"""
+        # 模式（schema）声明的是对象数组，但模型也可能输出裸字符串或字符串
+        # 列表；对这些值调用 .get()/dict() 会抛出 AttributeError/ValueError，
+        # 表现为含义不明的 "plan_task failed"，而非模型可据此行动的提示。
         if not isinstance(tasks, list):
             raise ValueError("tasks must be a list of objects")
         for task in tasks:
@@ -609,17 +612,15 @@ class Agent:
                     id_map.get(str(dep), str(dep)) for dep in depends_on
                 ]
             elif isinstance(depends_on, str):
-                # LLM stringified the dependency list — split it, or the DAG
-                # below would iterate character-by-character and silently
-                # drop every dependency (task runs too early).
+                # LLM 把依赖列表字符串化了——需要切分，否则下方构建 DAG 时
+                # 会按字符逐个遍历，静默丢掉所有依赖（导致任务过早执行）。
                 normalized_task["depends_on"] = [
                     id_map.get(str(dep), str(dep))
                     for dep in depends_on.split(",") if dep.strip()
                 ]
             else:
-                # null / missing / malformed: the schema says array but models
-                # emit null, and the key then survives with a None value —
-                # every consumer iterates it.
+                # null / 缺失 / 格式错误：模式要求是数组，但模型会输出 null，
+                # 该键随后以 None 值保留下来——而每个消费方都会遍历它。
                 normalized_task["depends_on"] = []
             normalized.append(normalized_task)
 
@@ -629,14 +630,14 @@ class Agent:
     def _build_dependency_graph(
         tasks: list[dict],
     ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-        """Build forward and reverse dependency maps from a normalized task list.
+        """基于归一化任务列表构建正向与反向依赖映射。
 
-        Returns:
-            deps:       {task_id -> set(dep_ids still pending)}
-            dependents: {dep_id -> set(task_ids that depend on it)}
+        返回：
+            deps：       {任务 ID -> 仍待满足的依赖 ID 集合}
+            dependents： {依赖 ID -> 依赖它的任务 ID 集合}
 
-        Unknown dep IDs (not in task list) are silently dropped.
-        Raises ``ValueError`` if a dependency cycle is detected.
+        未知的依赖 ID（不在任务列表中）会被静默丢弃。
+        若检测到依赖环，则抛出 ``ValueError``。
         """
         task_ids = {str(t["id"]) for t in tasks}
         deps: dict[str, set[str]] = {}
@@ -646,15 +647,15 @@ class Agent:
             tid = str(t["id"])
             raw_deps = t.get("depends_on") or []
             if isinstance(raw_deps, str):
-                # Same defense as _normalize_task_plan: a stringified list
-                # would be iterated character-by-character below.
+                # 与 _normalize_task_plan 相同的防御：字符串化的列表会在
+                # 下方被按字符逐个遍历。
                 raw_deps = [d.strip() for d in raw_deps.split(",") if d.strip()]
             valid = {str(d) for d in raw_deps if str(d) in task_ids}
             deps[tid] = set(valid)
             for dep_id in valid:
                 dependents[dep_id].add(tid)
 
-        # Cycle detection via Kahn's algorithm
+        # 用 Kahn 算法（拓扑排序）检测依赖环
         in_degree = {tid: len(d) for tid, d in deps.items()}
         queue = [tid for tid, deg in in_degree.items() if deg == 0]
         visited = 0
@@ -673,23 +674,20 @@ class Agent:
     _TASK_SOURCE_PRIORITY_SKILL = "integration/task-source-priority"
 
     def _task_source_priority(self, user_message: str) -> str | None:
-        """Return a short routing directive when the message references a known
-        entity anchor (Jira key / pull request).
+        """当消息命中已知实体锚点（Jira 编号 / 拉取请求）时，返回简短路由指令。
 
-        Table-driven: entries come from the `routing` frontmatter of the
-        task-source-priority skill, so new integrations (e.g. GitLab issues)
-        extend behavior by editing that file — no code change. The directive
-        is gated on the agent actually declaring the mapped tool; agents
-        without it (office-assistant, data-analyst) get nothing.
+        表驱动：条目来自 task-source-priority 技能的 `routing` frontmatter，
+        因此新的集成（如 GitLab 议题）只需编辑该文件即可扩展行为，无需改
+        代码。该指令还以 Agent 确实声明了被映射工具为前提；未声明该工具的
+        Agent（office-assistant、data-analyst）不会得到任何指令。
         """
         prio_skill = self._skill_registry.get(self._TASK_SOURCE_PRIORITY_SKILL)
         if not prio_skill or not prio_skill.routing:
             return None
 
-        # Frontmatter is an agent-editable surface: a non-numeric priority or a
-        # malformed regex anchor must degrade to a skipped entry, never raise —
-        # this runs unconditionally in run() before the tool loop, so an
-        # exception here would kill every subsequent user turn.
+        # frontmatter 是 Agent 可编辑的界面：非数字优先级或格式错误的正则
+        # 锚点都必须降级为跳过该条目，绝不抛出异常——这段逻辑在 run() 中
+        # 工具循环之前无条件执行，此处异常会导致后续每一轮用户消息都失败。
         def _priority(entry: object) -> int:
             if not isinstance(entry, dict):
                 return 0
@@ -773,22 +771,22 @@ class Agent:
         attachments: list[dict] | None = None,
         auto_tier: str | None = None,
     ) -> None:
-        """Entry point for a single user turn. Emits events to session.
+        """单个用户轮次的入口；通过 session 向外发出事件。
 
-        attachments: prepared attachment records ({name, media_type, size,
-        rel_path, inline_text?, image_data?, image_media_type?}) — the API
-        handler validates them and derives file content from disk.
+        attachments：已准备好的附件记录（{name, media_type, size, rel_path,
+        inline_text?, image_data?, image_media_type?}）——由 API 处理器校验，
+        并从磁盘读取文件内容。
 
-        auto_tier: the complexity tier ("low"/"mid"/"high") the caller's
-        pre-classifier assigned to this turn in auto-route mode; surfaced on
-        the model_selected event for the UI. None for explicit selection.
+        auto_tier：自动路由模式下，调用方预分类器为本轮分配的复杂度层级
+        （"low"/"mid"/"high"）；在 model_selected 事件上暴露给前端。显式
+        选择模型时为 None。
         """
-        # Advance turn counter and sync to tool context
+        # 递增轮次计数器，并同步到工具上下文
         self._turn += 1
         self._tool_ctx.current_turn = self._turn
         self._tool_ctx.current_task_id = self._current_task_id
 
-        # 1. Select model config via override or first available
+        # 1. 通过 override 或第一个可用配置来选定模型
         config_id = provider_override if (provider_override and provider_override in self._tier_models) else None
         if not config_id:
             if not self._tier_models:
@@ -798,28 +796,27 @@ class Agent:
         provider_key = model_cfg.get("provider", "openai")
         await session.emit("model_selected", provider=provider_key, model=model_cfg.get("model", ""), tier=auto_tier)
 
-        # 2. Emit context usage info
+        # 2. 发出上下文（知识库）占用信息
         if self._project_context and self._project_context.loaded_entries:
             await session.emit(
                 "knowledge_loaded",
                 files=[e.slug for e in self._project_context.loaded_entries],
             )
 
-        # 3. Match skills for this turn (per-turn only, reset every run) then
-        # build the system prompt — _build_dynamic_prompt injects the bodies,
-        # so a prompt rebuild mid-turn (task loop) keeps them.
+        # 3. 匹配本轮技能（仅对当前轮有效，每次 run 都重置），然后构建系统
+        # 提示词——_build_dynamic_prompt 会注入技能正文，因此任务循环中途
+        # 重建提示词时仍能保留这些内容。
         self._active_skills = self._skill_registry.matching_triggers(user_message)[:3]
         system = self._build_system_prompt()
 
-        # 4b. Task-source-priority directive: when the message references a
-        # Jira key / PR anchor, tell the model which tool is the authoritative
-        # first call (table-driven from the task-source-priority skill).
+        # 4b. 任务来源优先级指令：当消息引用 Jira 编号/PR 锚点时，告诉模型
+        # 哪个工具是权威的首个调用（由 task-source-priority 技能表驱动）。
         priority = self._task_source_priority(user_message)
         if priority:
             system += f"\n\n## Task Source Priority\n{priority}"
 
-        # 5. Compress history only against the provider context window. The
-        # conversation budget is a usage display value, not a runtime limit.
+        # 5. 仅依据模型供应方的上下文窗口压缩历史。会话预算只是用量展示值，
+        # 并非运行时限制。
         _log.info("agent.run: step5 compress_history start, provider=%s", provider_key)
         try:
             import asyncio as _asyncio
@@ -833,21 +830,18 @@ class Agent:
                 comp_provider.context_window, reserved_input, self._config.max_tokens
             )
             if available_budget <= 0:
-                # The input alone (system + user + tools) already overflows
-                # the window — compression has no room to help (its summary +
-                # recent tail would also overflow) and `max(budget, 1)` would
-                # force-compress on every turn with a threshold of 0, failing
-                # pointlessly. Skip it; the provider's context_exceeded
-                # handling takes over.
+                # 仅输入部分（系统提示 + 用户消息 + 工具定义）就已超出窗口
+                # ——压缩没有可用空间（其摘要 + 近期尾部同样会超限），而
+                # `max(budget, 1)` 会在阈值为 0 时每轮都强制压缩，无谓失败。
+                # 跳过压缩，交由供应方的 context_exceeded 处理接管。
                 _log.warning(
                     "agent.run: skip compression — reserved context (%d) exceeds window (%d)",
                     reserved_input + min(self._config.max_tokens, MAX_OUTPUT_RESERVE), comp_provider.context_window,
                 )
             else:
-                # Byte-aware: the token threshold can miss byte-heavy history
-                # (CJK JSON escaping, base64 images). If the assembled request
-                # would exceed the gateway byte cap, force-summarize the early
-                # history even when tokens are under threshold.
+                # 字节感知：Token 阈值可能漏掉字节密集型历史（中日韩字符的
+                # JSON 转义、base64 图片）。若组装后的请求会超过网关字节
+                # 上限，即使 Token 未达阈值，也强制摘要早期历史。
                 _probe_messages = (
                     [Message(role="system", content=system)]
                     + history
@@ -857,8 +851,8 @@ class Agent:
                     estimate_request_bytes(_probe_messages, tool_defs) > MAX_REQUEST_BYTES
                 )
                 async with _asyncio.timeout(60):
-                    # Phase notice: compression can silently hold the turn
-                    # for up to 60s — without it the UI sees a dead socket.
+                    # 阶段通知：压缩可能静默占用长达 60 秒——没有它，前端
+                    # 会看到一个无响应的连接。
                     await session.emit("turn_status", phase="compressing")
                     history = await compress_history(
                         history, available_budget, comp_provider, force=byte_over
@@ -870,9 +864,9 @@ class Agent:
             if len(history) > RECENT_TURNS_KEEP:
                 system_msgs = [m for m in history if m.role == "system"]
                 trimmed = history[-RECENT_TURNS_KEEP:]
-                # Same pair-wise pop as compressor.split_early_recent: a tool
-                # message must not lead the request, and an assistant tool_calls
-                # must not dangle without its tool results (provider 400).
+                # 与 compressor.split_early_recent 相同的成对弹出：工具消息
+                # 不能位于请求开头，助手 tool_calls 也不能在没有工具结果的
+                # 情况下悬空（否则供应方返回 400）。
                 while trimmed and (
                     trimmed[0].role == "tool"
                     or (trimmed[0].role == "assistant" and trimmed[0].tool_calls)
@@ -890,52 +884,49 @@ class Agent:
                         f"{_scrub_credentials(str(e), self._credentials)}",
             )
 
-        # 6. Build messages (attachments make user content a multimodal part list)
+        # 6. 构建消息（附件会使用户内容变为多模态分片列表）
         provider = self._get_provider(config_id)
         messages = [Message(role="system", content=system)] + history + [
             Message(role="user", content=build_user_content(user_message, attachments, provider.supports_vision))
         ]
 
-        # 7. Build tool definitions
+        # 7. 构建工具定义
         tool_defs = [t.to_definition() for t in self._tools.values()]
 
-        # 8. Run the appropriate loop
+        # 8. 运行对应的循环
         _log.info("agent.run: step8 _run_loop start, provider=%s", provider_key)
         await self._run_loop(messages, tool_defs, provider, session, config_id)
         _log.info("agent.run: step8 _run_loop done")
 
     def _mark_prompt_dirty(self) -> None:
-        """Record that the system prompt must be rebuilt before the next turn.
+        """记录系统提示词在下一轮之前必须重建。
 
-        _prompt_dirty alone was a shared boolean — with parallel
-        tasks, task A's knowledge change set it, task B's next iteration saw
-        the flag, rebuilt B's prompt and cleared it, so A's prompt never
-        refreshed (random, schedule-dependent staleness). The monotonic
-        revision lets every loop rebuild independently.
+        仅靠 _prompt_dirty 时它是共享布尔值——并行任务下，任务 A 的知识库
+        改动设置了它，任务 B 的下一次迭代看到标志、重建 B 的提示词并清除
+        标志，导致 A 的提示词始终得不到刷新（随机、取决于调度的陈旧问题）。
+        单调递增的版本号让每个循环都能独立重建。
         """
         self._prompt_dirty = True
         self._prompt_revision += 1
 
     def _build_system_prompt(self) -> str:
-        """Build the full system prompt with cached static portion + dynamic parts."""
+        """构建完整系统提示词：缓存的静态部分 + 动态部分。"""
         static = self._get_static_prompt()
         dynamic = self._build_dynamic_prompt()
         return static + dynamic if dynamic else static
 
     def _get_static_prompt(self) -> str:
-        """Return cached static portion (agent prompt + static knowledge + memory/plan/tasks)."""
+        """返回缓存的静态部分（Agent 提示词 + 静态知识 + 记忆/计划/任务上下文）。"""
         if self._static_prompt_cache is not None:
             return self._static_prompt_cache
 
         parts = [self._config.system_prompt]
 
         workspace = self._tool_ctx.project_fs_path
-        # The workspace directory name IS the project slug — the naming rule for
-        # project-scoped definitions depends on it, and "the last path segment"
-        # is easy to overlook when the requirement is spelled out elsewhere.
-        # Same helper the write-time definition check uses, so the rule stated
-        # here and the rule enforced there cannot disagree. Imported here to
-        # stay clear of this module's code-before-imports block.
+        # 工作区目录名即项目 slug——项目级定义的命名规则依赖于此，而当需求
+        # 在别处说明时，"路径最后一段"很容易被忽略。这里复用写入时定义
+        # 检查所用的同一个辅助函数，使此处声明的规则与彼处强制的规则不会
+        # 不一致。在此处导入是为了避开本模块"导入前即写代码"的代码块。
         from .definition_check import project_slug_from_workspace
 
         project_slug = project_slug_from_workspace(workspace) or ""
@@ -1038,7 +1029,7 @@ class Agent:
         return self._static_prompt_cache
 
     def _build_tools_prompt(self) -> str:
-        """Build the '## Available Tools & Behaviors' section from self._tools."""
+        """基于 self._tools 构建"## Available Tools & Behaviors（可用工具与行为）"章节。"""
         lines = [
             "\n## Available Tools & Behaviors",
             "You have exactly the tools listed below. Do not attempt operations none of "
@@ -1060,16 +1051,16 @@ class Agent:
         return "\n".join(lines)
 
     def _build_dynamic_prompt(self) -> str:
-        """Build the dynamic portion (active skills + task plan + dynamically loaded knowledge + deferred table)."""
+        """构建动态部分（活跃技能 + 任务计划 + 动态加载知识 + 待加载明细表）。"""
         parts: list[str] = []
 
-        # Skills whose triggers matched this turn — in the dynamic section so
-        # prompt rebuilds (plan_task loops, knowledge writes) never drop them.
+        # 本轮命中触发条件的技能——放在动态章节，使提示词重建（plan_task
+        # 循环、知识写入）时绝不会丢失它们。
         if self._active_skills:
             for skill in self._active_skills:
                 parts.append(f"\n## Active Skill: {skill.slug}\n{skill.body}")
 
-        # Live task plan (updated as tasks complete)
+        # 实时任务计划（随任务完成而更新）
         if self._task_plan:
             status_icon = {"completed": "✓", "running": "→", "failed": "✗", "skipped": "-"}
             parts.append("\n## Current Task Plan")
@@ -1102,7 +1093,7 @@ class Agent:
         return "\n".join(parts) if parts else ""
 
     def _invalidate_static_cache(self) -> None:
-        """Call when static knowledge changes (write to static file)."""
+        """当静态知识发生变化（写入静态文件）时调用，清空静态提示词缓存。"""
         self._static_prompt_cache = None
 
     async def _consume_injected_input(
@@ -1112,13 +1103,11 @@ class Agent:
         provider: LLMProvider,
         message_id: str,
     ) -> str | None:
-        """Consume every queued user message at a step boundary.
+        """在步骤边界消费所有排队中的用户消息。
 
-        The current step's partial output is finalized as an "interrupted"
-        snapshot, the user messages are persisted by the API handler
-        (user_message_injected events), and the loop continues with the new
-        instructions appended to the message history. Returns the new message
-        id, or None when nothing was queued.
+        当前步骤的部分输出会被定稿为"interrupted（已中断）"快照，用户消息
+        由 API 处理器持久化（user_message_injected 事件），随后循环把新指令
+        追加到消息历史并继续。返回新的消息 ID；若无排队消息则返回 None。
         """
         entries: list[UserInputEntry] = []
         while True:
@@ -1129,14 +1118,12 @@ class Agent:
         if not entries:
             return None
 
-        # Snapshot the current partial output as an interrupted message
-        # (persisted by forward_events). emitted_end stays False — the turn
-        # continues and must not be double-finalized by the finally block.
-        # injection=True marks this as a STEP boundary, not a terminal
-        # interruption: the API must not settle the conversation run here, or
-        # its status would stay "interrupted" forever (the real terminal
-        # stream_end loses the race to finish_run's running-only guard) and
-        # the UI would keep showing "last run was interrupted".
+        # 把当前部分输出快照为一条"已中断"消息（由 forward_events 持久化）。
+        # emitted_end 保持 False——本轮仍在继续，不能被 finally 块重复定稿。
+        # injection=True 标记这是一个步骤边界，而非终止性中断：API 不能在此
+        # 结算本次会话运行，否则其状态会永远停在 "interrupted"（真正的终止
+        # stream_end 在与 finish_run 仅处理 running 的守卫竞争中落败），前端
+        # 也会一直显示"上次运行被中断"。
         await session.emit(
             "stream_end",
             message_id=message_id,
@@ -1145,8 +1132,7 @@ class Agent:
             injection=True,
         )
 
-        # Ask the handler to persist the user messages now — event order
-        # guarantees they land after the interrupted snapshot above.
+        # 现在请处理器持久化用户消息——事件顺序保证它们落在上方中断快照之后。
         for entry in entries:
             await session.emit(
                 "user_message_injected",
@@ -1165,12 +1151,10 @@ class Agent:
                     asyncio.shield(entry.persisted), timeout=self._INJECT_PERSIST_TIMEOUT
                 )
             except asyncio.TimeoutError:
-                # Timeout only gates durability, not agent progress — degrade
-                # to success so a stuck handler never stalls the loop.
-                # CancelledError must NOT be caught here: it means the turn
-                # itself is being torn down (abort watcher / shutdown), and
-                # swallowing it would let the loop append the entry and start
-                # another LLM call after the session was already closed.
+                # 超时只约束数据持久性，不约束 Agent 流程——降级为成功，避免
+                # 卡住的处理器让循环停滞。这里绝不能捕获 CancelledError：它
+                # 意味着本轮本身正被拆除（中止监视器/关闭），吞掉它会让循环
+                # 在会话已关闭后仍追加条目并发起下一次 LLM 调用。
                 return True
 
         oks = await asyncio.gather(*[_await_persist(e) for e in entries])
@@ -1184,12 +1168,10 @@ class Agent:
             ))
             entry.consumed = True
         if not accepted:
-            # Every queued message failed validation — but the interrupted
-            # stream_end above was already emitted for the CURRENT id and the
-            # handler persisted that snapshot row. Continuing under the same
-            # id would insert a second row with the same primary key at the
-            # next stream_end: the insert is swallowed, the turn's output is
-            # lost, and the run row stays "running". Continue under a fresh id.
+            # 所有排队消息都未通过校验——但上方的中断 stream_end 已针对当前
+            # ID 发出，处理器也持久化了该快照行。若沿用同一 ID 继续，下一次
+            # stream_end 会插入主键相同的第二行：插入被吞掉、本轮输出丢失、
+            # 运行行仍停在 "running"。因此换一个新 ID 继续。
             _log.warning(
                 "agent: %d injected message(s) rejected — continuing under a new message id",
                 len(entries),
@@ -1202,12 +1184,11 @@ class Agent:
         tool_defs: list[ToolDefinition],
         tool_wire_bytes: int | None = None,
     ) -> str:
-        """Enforce the wire byte ceiling: truncates oversized tool messages in
-        place (the in-memory pass; the manual compression path persists it)
-        and returns "ok" / "truncated" / "over_limit".
+        """强制网络传输字节上限：就地截断超大的工具消息（内存中的处理；
+        手动压缩路径会将其持久化），返回 "ok" / "truncated" / "over_limit"。
 
-        tool_wire_bytes carries the precomputed wire size of tool_defs so the
-        per-iteration call skips re-estimating static tool schemas."""
+        tool_wire_bytes 携带 tool_defs 预先算好的传输尺寸，使逐次迭代调用
+        不必重新估算静态的工具模式。"""
         outcome = force_compress_history(
             messages, MAX_REQUEST_BYTES, tool_defs, tool_wire_bytes=tool_wire_bytes
         )
@@ -1216,8 +1197,8 @@ class Agent:
         return outcome
 
     def _over_limit_message(self, messages: list[Message], tool_defs: list[ToolDefinition]) -> str:
-        """User-facing text when the payload still overflows after truncation
-        (system-prompt knowledge, recent text or attachments dominate)."""
+        """截断后载荷仍超限时，返回面向用户的提示文本（此时主要由系统提示
+        知识、近期文本或附件占据体积）。"""
         size_mb = estimate_request_bytes(messages, tool_defs) / (1024 * 1024)
         limit_mb = MAX_REQUEST_BYTES // (1024 * 1024)
         bd = request_byte_breakdown(messages, tool_defs)
@@ -1225,8 +1206,8 @@ class Agent:
             f"请求内容过大(约 {size_mb:.1f} MB,上限 {limit_mb} MB),"
             "自动精简后仍超出限制,已停止发送。"
         )
-        # Actionable attribution: name the biggest bucket so the user knows
-        # whether to trim knowledge files, drop attachments or start over.
+        # 可操作的归因：指出占比最大的部分，让用户知道该精简知识文件、
+        # 去掉附件还是重新开始。
         parts = []
         if bd["system"]:
             parts.append(f"知识/系统提示约 {bd['system'] / (1024 * 1024):.1f} MB")
@@ -1249,37 +1230,34 @@ class Agent:
         tool_defs: list[ToolDefinition],
         provider: LLMProvider,
     ) -> str:
-        """Shrink an over-limit request body, least-destructive first.
+        """收缩超限的请求体，按破坏性最小的顺序依次尝试。
 
-        Runs once at the top of a turn (after the synchronous truncation pass
-        in force_compress_history). The three async/content-aware stages below
-        are what that deterministic pass cannot do safely:
+        在一轮开始时运行一次（在 force_compress_history 的同步截断之后）。
+        下方三个异步/内容感知阶段，正是那个确定性截断无法安全完成的动作：
 
-          1. Force LLM summarization of the early history — catches byte-heavy
-             history the token threshold missed (CJK escaping, images).
-          2. Demote the largest static knowledge files into overflow and
-             rebuild the system prompt — the in-full knowledge load is the one
-             irreducible bulk on the system prompt.
-          3. Demote base64 images to path references — destructive to vision,
-             kept last.
+          1. 强制 LLM 摘要早期历史——捕获 Token 阈值漏掉的字节密集型历史
+             （中日韩字符转义、图片）；
+          2. 把最大的静态知识文件降级为溢出（不全文加载），并重建系统提示
+             ——全文加载的知识是系统提示中唯一无法再压缩的大块；
+          3. 把 base64 图片降级为路径引用——会损害视觉能力，放在最后。
 
-        Returns "ok" once the payload fits, "over_limit" if every stage ran
-        and it still does not. Never raises: each stage is a soft budget
-        lever, and the caller escalates to a hard stop only on "over_limit".
+        载荷一旦合规即返回 "ok"；所有阶段都跑完仍不合规则返回
+        "over_limit"。本方法绝不抛出异常：每个阶段都是软预算杠杆，调用方
+        仅在收到 "over_limit" 时才升级为硬性停止。
         """
         tools_wire = estimate_request_bytes([], tool_defs)
         if estimate_request_bytes(messages, tool_defs, tools_wire) <= MAX_REQUEST_BYTES:
             return "ok"
 
-        # 1. History: force-summarize the early segment (the current turn's
-        #    user message lives in messages[-1] and survives as the recent tail).
+        # 1. 历史：强制摘要早期片段（本轮用户消息位于 messages[-1]，作为
+        #    近期尾部保留）。
         from .compressor import RECENT_TURNS_KEEP
         if len(messages) - 1 > RECENT_TURNS_KEEP:
             try:
                 system_msgs = [m for m in messages if m.role == "system"]
                 history = [m for m in messages if m.role != "system"]
-                # step5 may already have summarized this turn; re-summarizing
-                # the summary pair drifts the context for no byte win.
+                # step5 可能已在本轮做过摘要；对摘要对再次摘要只会让上下文
+                # 漂移，却换不来任何字节收益。
                 already_summarized = bool(history) and (
                     isinstance(history[0].content, str)
                     and history[0].content.startswith(SUMMARY_MARKER)
@@ -1302,7 +1280,7 @@ class Agent:
             if estimate_request_bytes(messages, tool_defs, tools_wire) <= MAX_REQUEST_BYTES:
                 return "ok"
 
-        # 2. Knowledge: drop the largest static files first, then rebuild.
+        # 2. 知识：先丢弃最大的静态文件，然后重建。
         if self._project_context and self._project_context.loaded_content:
             from .knowledge.loader import demote_loaded_entry
             demoted = 0
@@ -1317,11 +1295,9 @@ class Agent:
                 if not demote_loaded_entry(self._project_context, largest):
                     break
                 demoted += 1
-                # Rebuild INSIDE the loop: the loop condition measures
-                # messages[0], and the loaded content lives in the cached
-                # static prompt. Rebuilding only after the loop left the
-                # measured size unchanged, so every loaded file was demoted
-                # instead of just enough to fit.
+                # 在循环内部重建：循环条件测量的是 messages[0]，而加载的
+                # 内容位于缓存的静态提示词中。若仅在循环后重建，测量尺寸
+                # 始终不变，导致所有加载文件都被降级，而非只降到刚好合规。
                 self._invalidate_static_cache()
                 messages[0] = Message(role="system", content=self._build_system_prompt())
             if demoted:
@@ -1329,7 +1305,7 @@ class Agent:
             if estimate_request_bytes(messages, tool_defs, tools_wire) <= MAX_REQUEST_BYTES:
                 return "ok"
 
-        # 3. Images: last resort — trade vision for a live turn.
+        # 3. 图片：最后手段——以牺牲视觉能力换取本轮能正常运行。
         from .compressor import demote_image_messages
         if demote_image_messages(messages):
             _log.warning("request degrade: demoted image messages to text references")
@@ -1346,32 +1322,31 @@ class Agent:
         session: ConversationSession,
         config_id: str,
     ) -> None:
-        """Tool-call loop with stop_reason state machine."""
-        # Defense in depth: resumed history (interrupted runs, compressed
-        # slices) can contain tool messages without their assistant partner;
-        # sanitize once here so every provider call in this turn is well-formed.
+        """带 stop_reason 状态机的工具调用循环。"""
+        # 纵深防御：恢复的历史（中断运行、压缩切片）可能包含缺少助手配对的
+        # 工具消息；在此先做一次清洗，保证本轮每次供应方调用都格式良好。
         messages = self._drop_orphan_tool_messages(messages)
         message_id = session.new_message()
         max_iterations = _MAX_CHAT_ITERATIONS
         max_pause_continuations = 3
         pause_count = 0
         emitted_end = False
-        # Byte-guard constant: tool schemas are static within a loop, and the
-        # per-iteration guard must not re-estimate them every step.
+        # 字节守卫常量：工具模式在一次循环内是静态的，逐次迭代的守卫不应
+        # 每一步都重新估算它们。
         tools_wire = estimate_request_bytes([], tool_defs)
-        # per-loop prompt revision — each loop tracks its own last
-        # build; a change by ANY parallel task bumps the shared revision.
+        # 每循环的提示词版本号——每个循环跟踪自己上次构建的版本；任何并行
+        # 任务做出改动都会推高这个共享版本号。
         prompt_revision = self._prompt_revision
 
         try:
             budget = max_iterations
-            # Safety valve: injections refresh budget but never total_budget,
-            # so a pathological stream of injections cannot loop forever.
+            # 安全阀：注入消息会刷新 budget，但绝不会刷新 total_budget，因此
+            # 病态的注入消息流也无法让循环永远运行下去。
             total_budget = max_iterations * 5
 
             async def _maybe_inject() -> bool:
-                """Consume queued user input at a step boundary and refresh
-                the iteration budget — an injection is a new user instruction."""
+                """在步骤边界消费排队的用户输入，并刷新迭代预算——一次注入
+                就是一条新的用户指令。"""
                 nonlocal message_id, budget
                 if session.is_aborted():
                     return False
@@ -1388,19 +1363,17 @@ class Agent:
             while True:
                 if session.is_aborted():
                     await session.emit("abort_ack", message_id=message_id)
-                    # Persist whatever accumulated so an interrupted run stays
-                    # visible in history after a reload — the hard-cancel path
-                    # already finalizes via the finally below; the graceful
-                    # abort must too, or the partial message vanishes.
+                    # 持久化已累积的内容，使中断的运行在重新加载后仍可见于
+                    # 历史——硬取消路径已通过下方 finally 定稿，优雅中止也
+                    # 必须如此，否则部分消息会消失。
                     await session.emit("stream_end", message_id=message_id, total_tokens=session.tokens_used, stop_reason="aborted")
                     emitted_end = True
                     break
 
                 if budget <= 0 or total_budget <= 0:
-                    # Budget exhausted. An injection that arrived since the
-                    # last check (e.g. while a tool was executing) refreshes
-                    # the budget; otherwise the loop ends. total_budget is the
-                    # hard safety valve and is never refreshed.
+                    # 预算耗尽。自上次检查以来到达的注入（如工具执行期间）
+                    # 会刷新预算；否则循环结束。total_budget 是硬安全阀，
+                    # 永不刷新。
                     if budget <= 0 and await _maybe_inject():
                         continue
                     exhausted = True
@@ -1417,14 +1390,13 @@ class Agent:
                     messages[0] = Message(role="system", content=self._build_system_prompt())
                     prompt_revision = self._prompt_revision
 
-                # Stream the response
+                # 流式接收响应
                 full_text = ""
                 tool_calls_buffer: dict[int, dict] = {}
                 preparing_emitted: set[int] = set()
                 stop_reason: StopReason = StopReason.UNKNOWN
-                # Extended-thinking accumulation for this iteration. Signed
-                # blocks ride on the assistant message for the next
-                # tool-loop request; unsigned text is display-only.
+                # 本次迭代的扩展思考（extended-thinking）累积。带签名的块会
+                # 随下一次工具循环请求放在助手消息上；无签名文本仅用于展示。
                 thinking_text = ""
                 thinking_blocks: list[dict] = []
                 thinking_open = False
@@ -1441,11 +1413,9 @@ class Agent:
                     pending_tool_ids,
                 )
                 if self._request_byte_outcome(messages, tool_defs, tools_wire) == "over_limit":
-                    # Sync truncation (tool outputs) was not enough. Escalate
-                    # to the async degradation chain — force-summarize history,
-                    # demote the largest knowledge files, then strip images —
-                    # before giving up with an actionable error instead of
-                    # letting the gateway reject the body with an opaque 413.
+                    # 同步截断（工具输出）仍不够。升级到异步降级链——强制
+                    # 摘要历史、降级最大的知识文件、再剥离图片——然后才带着
+                    # 可操作的错误放弃，而不是让网关以含义不明的 413 拒绝。
                     await session.emit("turn_status", phase="degrading", message_id=message_id)
                     if await self._degrade_request(messages, tool_defs, provider) == "over_limit":
                         await session.emit("error", message=self._over_limit_message(messages, tool_defs))
@@ -1454,15 +1424,12 @@ class Agent:
                         break
                     _log.info("request degrade succeeded, resuming turn")
                 try:
-                    # Phase notice covers the TTFT gap: nothing streams until
-                    # the provider answers, and the UI would otherwise show
-                    # only the old bouncing dots.
+                    # 阶段通知覆盖首 Token 延迟（TTFT）：供应方应答前没有任何
+                    # 数据流，否则前端只会显示旧的跳动圆点。
                     await session.emit("turn_status", phase="waiting_model", message_id=message_id)
-                    # OpenAI-compatible gateways report usage as request-
-                    # cumulative totals and may repeat them on every chunk
-                    # (vLLM running stats). Record the delta since the last
-                    # snapshot of THIS call so tokens_used is not inflated
-                    # by the chunk count.
+                    # OpenAI 兼容网关以请求累计总量上报用量，并可能在每个
+                    # 数据块重复携带（vLLM 运行统计）。记录本调用自上次快照
+                    # 以来的增量，避免 tokens_used 被数据块数量虚高。
                     prev_usage: tuple[int, int] = (0, 0)
                     async for chunk in provider.stream(
                         messages, tool_defs, max_tokens=self._config.max_tokens
@@ -1477,8 +1444,8 @@ class Agent:
                             thinking_text += chunk.thinking
                             await session.emit("thinking_delta", delta=chunk.thinking, message_id=message_id)
                         elif chunk.thinking_signature is not None:
-                            # Signed block closes: keep it for the next
-                            # tool-loop request (Anthropic replays it back).
+                            # 带签名块结束：保留它供下一次工具循环请求使用
+                            # （Anthropic 会把它原样回传）。
                             if thinking_open:
                                 if thinking_text and chunk.thinking_signature:
                                     thinking_blocks.append({
@@ -1490,8 +1457,8 @@ class Agent:
                                 thinking_open = False
                                 await session.emit("thinking_end", message_id=message_id)
                         elif (chunk.delta or chunk.tool_call_delta) and thinking_open:
-                            # Gateways that never send a signature: first real
-                            # content closes the display-only block.
+                            # 从不发送签名的网关：首个真实内容即关闭这个仅
+                            # 用于展示的块。
                             thinking_text = ""
                             thinking_open = False
                             await session.emit("thinking_end", message_id=message_id)
@@ -1547,10 +1514,9 @@ class Agent:
                                 context_window=session.context_window,
                             )
                 except Exception as api_err:
-                    # SDK/h11 exceptions echo the credential ("Incorrect API
-                    # key provided: sk-...", "Illegal header value b'...'") —
-                    # scrub before the string reaches the emitted event or the
-                    # log (exc_info would print the raw exception too).
+                    # SDK/h11 异常会回显凭证（"Incorrect API key provided:
+                    # sk-..."、"Illegal header value b'...'"）——在字符串进入
+                    # 发出的事件或日志前先脱敏（exc_info 也会打印原始异常）。
                     err_type = type(api_err).__name__
                     err_msg = (
                         f"LLM API error: {_scrub_credentials(str(api_err), self._credentials)}\n"
@@ -1568,10 +1534,10 @@ class Agent:
                         _scrub_credentials(traceback.format_exc(), self._credentials),
                     )
                     if classify_api_error(api_err) is StopReason.CONTEXT_EXCEEDED:
-                        # OpenAI/Gemini/gateways raise context overflow as an
-                        # ordinary 400/413 exception (only Anthropic streams a
-                        # stop reason) — route it to the same context_exceeded
-                        # affordance instead of a raw "LLM API error" bubble.
+                        # OpenAI/Gemini/网关把上下文溢出作为普通 400/413 异常
+                        # 抛出（只有 Anthropic 以停止原因流式返回）——将其路由
+                        # 到同一个 context_exceeded 处理，而非原始的"LLM API
+                        # error"气泡。
                         await session.emit("context_exceeded", message_id=message_id, config_id=config_id)
                         await session.emit("stream_end", message_id=message_id, total_tokens=session.tokens_used, stop_reason="context_exceeded")
                         emitted_end = True
@@ -1581,19 +1547,18 @@ class Agent:
                     emitted_end = True
                     break
 
-                # Stream ended with thinking still open (no signature and no
-                # following content) — close the block so the UI collapses it.
+                # 流结束时思考块仍开着（既无签名也无后续内容）——关闭该块，
+                # 让前端把它折叠起来。
                 if thinking_open:
                     thinking_open = False
                     await session.emit("thinking_end", message_id=message_id)
 
-                # Append assistant message to history. A stream truncated
-                # mid-tool-call (finish_reason="length", pause_turn, dropped
-                # connection) can leave entries whose id/name never arrived —
-                # persisting them would orphan a tool_call without a matching
-                # tool_result and the next provider request 400s on it. Drop
-                # incomplete entries here (MAX_TOKENS/END_TURN then fall
-                # through to the plain-text path below).
+                # 把助手消息追加到历史。在工具调用中途被截断的流
+                # （finish_reason="length"、pause_turn、连接断开）可能留下
+                # id/name 始终未到达的条目——持久化它们会让 tool_call 缺少
+                # 匹配的 tool_result 而成为孤儿，下一次供应方请求会因此返回
+                # 400。在此丢弃不完整条目（MAX_TOKENS/END_TURN 随后会落到
+                # 下方纯文本路径）。
                 tool_calls = (
                     [tc for tc in tool_calls_buffer.values()
                      if tc.get("id") and tc.get("function", {}).get("name")]
@@ -1605,7 +1570,7 @@ class Agent:
                 )
                 messages.append(assistant_msg)
 
-                # ─── Stop Reason State Machine ────────────────────────────
+                # ─── 停止原因（Stop Reason）状态机 ────────────────────────
                 if stop_reason == StopReason.REFUSAL:
                     await session.emit("refusal", message_id=message_id, content=full_text)
                     await session.emit("stream_end", message_id=message_id, total_tokens=session.tokens_used, stop_reason="refusal")
@@ -1637,17 +1602,16 @@ class Agent:
                     pause_count += 1
                     if pause_count > max_pause_continuations:
                         if await _maybe_inject():
-                            # The budget exhaustion belongs to the
-                            # pre-injection conversation; a fresh user
-                            # message starts a new one, or the next
-                            # legitimate pause ends the turn on the spot.
+                            # 预算耗尽属于注入前的对话；新的用户消息会
+                            # 开启新一轮，否则下一次合法 pause 会立即结束
+                            # 本轮。
                             pause_count = 0
                             continue
                         await session.emit("warning", message="Too many pause_turn continuations, stopping")
                         await session.emit("stream_end", message_id=message_id, total_tokens=session.tokens_used, stop_reason="pause_turn_exhausted")
                         emitted_end = True
                         break
-                    # Continue without tool processing — the model paused mid-generation
+                    # 不做工具处理直接继续——模型在生成中途暂停了
                     if not tool_calls:
                         if await _maybe_inject():
                             pause_count = 0
@@ -1668,12 +1632,11 @@ class Agent:
                     emitted_end = True
                     break
 
-                # ─── Process Tool Calls ───────────────────────────────────
-                pause_count = 0  # Reset on successful tool_use cycle
+                # ─── 处理工具调用（Process Tool Calls）────────────────────
+                pause_count = 0  # 工具使用周期成功时重置
 
-                # Complete ordinary calls before entering task mode. A nested task
-                # request inherits this assistant turn, so every sibling call must
-                # already have a matching tool response in its history.
+                # 进入任务模式前先完成普通调用。嵌套任务请求会继承这个助手
+                # 轮次，因此每个同级调用的历史中都必须已有匹配的工具响应。
                 for tc in sorted(
                     tool_calls,
                     key=lambda item: item.get("function", {}).get("name", "") == "plan_task",
@@ -1685,8 +1648,8 @@ class Agent:
                     try:
                         args = self._parse_tool_arguments(tc)
                     except (json.JSONDecodeError, TypeError) as _e:
-                        # Keep the assistant tool call serializable for the next
-                        # provider request; Anthropic reparses this field.
+                        # 保持助手工具调用可被下一次供应方请求序列化；
+                        # Anthropic 会重新解析该字段。
                         tc["function"]["arguments"] = "{}"
                         bad_result = {"error": f"Malformed tool arguments (invalid JSON): {_e}"}
                         await session.emit("tool_call_start", tool=tool_name, input={}, call_id=tool_id)
@@ -1709,18 +1672,16 @@ class Agent:
                             await session.emit("tool_call_end", tool=tool_name, output=_clip_tool_output(result), call_id=tool_id, status="error")
                             raise
                         except Exception as e:
-                            # Same degradation as the ordinary-tool path below:
-                            # a malformed plan (tasks not a list, entries without
-                            # id/title) must surface as a tool error the model
-                            # can see and self-correct, not crash the whole turn
-                            # into a generic "Agent execution failed".
+                            # 与下方普通工具路径相同的降级：格式错误的计划
+                            # （tasks 不是列表、条目缺 id/title）必须作为模型
+                            # 能看到并自我纠正的工具错误暴露，而不是让整轮
+                            # 崩溃成通用的"Agent execution failed"。
                             _log.warning("plan_task failed (call_id=%s): %s", tool_id, e, exc_info=True)
-                            # _run_task_mode may have died after arming
-                            # _current_task_id / _task_plan — reset them so the
-                            # stale task id is not re-injected into the shared
-                            # tool context next turn (dynamic knowledge would
-                            # bind to a task that never completes and leak) and
-                            # the snapshot below does not render stuck tasks.
+                            # _run_task_mode 可能在设置 _current_task_id /
+                            # _task_plan 之后才失败——重置它们，避免陈旧任务
+                            # ID 下一轮被重新注入共享工具上下文（动态知识会
+                            # 绑定到一个永不完成的任务并泄漏），也让下方快照
+                            # 不渲染卡住的任务。
                             self._current_task_id = None
                             self._tool_ctx.current_task_id = None
                             for tp in self._task_plan or []:
@@ -1728,9 +1689,8 @@ class Agent:
                                     tp["status"] = "failed"
                                     tp["error"] = "plan_task failed"
                             result = {"error": f"plan_task failed: {str(e)[:500]}"}
-                        # Attach the final plan snapshot to the tool output so
-                        # finished messages can render the plan in history. The
-                        # LLM-facing result below stays lean (no context bloat).
+                        # 把最终计划快照附到工具输出，使已完成消息能在历史中
+                        # 渲染计划。下方回给 LLM 的结果保持精简（不膨胀上下文）。
                         plan_snapshot = [
                             {
                                 "id": t["id"],
@@ -1771,11 +1731,10 @@ class Agent:
 
                     await session.emit("tool_call_end", tool=tool_name, output=_clip_tool_output(result), call_id=tool_id)
 
-                    # Guard the type, not just truthiness: some tools report a
-                    # COUNT under these keys (repo_graph's too_many_files
-                    # summary carries files=<int>), and iterating an int here —
-                    # outside the tool try/except — killed the whole turn with
-                    # "'int' object is not iterable".
+                    # 校验类型而非仅真假值：有些工具在这些键下报告的是数量
+                    # （repo_graph 的 too_many_files 摘要带有 files=<整数>），
+                    # 而在此处遍历整数——位于工具 try/except 之外——会以
+                    # "'int' object is not iterable" 让整轮崩溃。
                     images = result.get("images")
                     if isinstance(images, list) and images:
                         await session.emit("image_output", message_id=message_id, images=images)
@@ -1798,13 +1757,11 @@ class Agent:
                                 self._mark_prompt_dirty()
                                 await session.emit("knowledge_updated")
                         elif op in ("load", "unload", "refresh", "delete", "purge"):
-                            # delete/purge remove files or index rows — the
-                            # prompt's knowledge listing must be rebuilt or the
-                            # agent keeps reasoning about deleted files. The
-                            # static cache embeds ctx.loaded_content verbatim,
-                            # and the rebuild the dirty flag triggers RETURNS
-                            # that cache while it is set — dirty alone would
-                            # re-serve the deleted file's content.
+                            # delete/purge 会移除文件或索引行——提示词的知识
+                            # 列表必须重建，否则 Agent 会持续围绕已删除文件
+                            # 推理。静态缓存原样内嵌了 ctx.loaded_content，而
+                            # 脏标志触发的重建在缓存存在时会直接返回该缓存——
+                            # 仅靠脏标志会重新提供已删除文件的内容。
                             self._invalidate_static_cache()
                             self._mark_prompt_dirty()
 
@@ -1827,12 +1784,11 @@ class Agent:
                     emitted_end = True
         finally:
             if not emitted_end:
-                # Hard cancel (Stop mid-stream or mid-tool) unwinds straight
-                # into this fallback, which used to emit with no stop_reason —
-                # the API then classified the run "completed" and, because
-                # finish_run only transitions out of "running", the later
-                # finish_run(..., "interrupted") became a no-op. Reported as
-                # "stop, reload, and the run says completed".
+                # 硬取消（流式或工具中途停止）会直接展开到这个兜底，而它
+                # 过去发出时不带 stop_reason——API 随后把运行归类为
+                # "completed"，又因为 finish_run 只会从 "running" 状态转出，
+                # 之后的 finish_run(..., "interrupted") 变成空操作。表现为
+                # "停止、重新加载后，运行却显示已完成"。
                 await session.emit(
                     "stream_end",
                     message_id=message_id,
@@ -1843,7 +1799,7 @@ class Agent:
             await session.close()
 
     def _compute_task_progress(self, current_task_id: str | None = None) -> dict[str, Any]:
-        """Derive progress info from the live task plan (parallel-aware)."""
+        """从实时任务计划推导进度信息（可感知并行）。"""
         if not self._task_plan:
             return {}
         completed = sum(1 for t in self._task_plan if t["status"] == "completed")
@@ -1857,7 +1813,7 @@ class Agent:
         else:
             current_title = None
 
-        # Next: first pending task whose deps are all completed
+        # 下一步：首个依赖全部完成的待处理（pending）任务
         completed_ids = {t["id"] for t in self._task_plan if t["status"] == "completed"}
         next_title: str | None = None
         for t in self._task_plan:
@@ -1875,7 +1831,7 @@ class Agent:
         }
 
     async def _emit_task_progress(self, session: ConversationSession, task_id: str) -> None:
-        """Emit a task_progress event with current plan state."""
+        """携带当前计划状态发出 task_progress（任务进度）事件。"""
         progress = self._compute_task_progress(task_id)
         if progress:
             await session.emit("task_progress", task_id=task_id, **progress)
@@ -1886,14 +1842,13 @@ class Agent:
         task_tool_ctx: ToolContext,
         task_id: str,
     ) -> None:
-        """Close the task's stream on the frontend after a failure/abort path.
+        """在失败/中止路径后，关闭前端上该任务的流。
 
-        _run_task_loop emits stream_end on its normal return paths, but
-        timeout / API-error / refusal bypass them — and the frontend
-        only stops the per-task typing indicator on stream_end, not on
-        task_failed. When the failure happened before _run_task_loop opened
-        its stream (no message_id yet), nothing was ever started — emit
-        nothing instead of a stream_end with message_id=None.
+        _run_task_loop 在正常返回路径上会发出 stream_end，但超时/API 错误/
+        拒绝会绕过它们——而前端只在收到 stream_end 时才停止该任务的输入
+        指示器，而非 task_failed。若失败发生在 _run_task_loop 打开其流之前
+        （还没有 message_id），说明从未开始任何东西——此时不发任何事件，
+        而不是发出 message_id=None 的 stream_end。
         """
         message_id = getattr(task_tool_ctx, "current_message_id", None)
         if message_id is None:
@@ -1918,18 +1873,17 @@ class Agent:
         config_id: str,
         plan_tool_id: str,
     ) -> str:
-        """Execute a planned task list with DAG-aware parallel scheduling.
+        """以 DAG 感知的并行调度执行规划好的任务列表。
 
-        Tasks with no dependencies run concurrently (bounded by a semaphore).
-        When a task completes, its dependents are checked and dispatched if
-        ready. Failed tasks cause their dependents to be skipped.
+        无依赖的任务并发运行（由信号量限流）。任务完成后，检查其依赖方，
+        若就绪则派发。失败任务会导致其依赖方被跳过。
 
-        Returns summary string.
+        返回摘要字符串。
         """
         tasks = self._normalize_task_plan(plan_args.get("tasks", []))
         await session.emit("task_plan_created", tasks=tasks)
 
-        # Initialize live task plan for dynamic prompt
+        # 为动态提示词初始化实时任务计划
         self._task_plan = [
             {
                 "id": t["id"],
@@ -1946,13 +1900,13 @@ class Agent:
             await session.emit("agentic_loop_completed", tasks_done=0, tasks_failed=0, summary=summary)
             return summary
 
-        # Build DAG; fall back to sequential on cycle
+        # 构建 DAG；检测到环时回退为顺序执行
         try:
             deps, dependents = self._build_dependency_graph(tasks)
         except ValueError:
             _log.warning("Task dependency cycle detected, falling back to sequential execution")
             await session.emit("warning", message="Task dependency cycle detected, falling back to sequential execution")
-            # Sequential fallback: chain all tasks in order
+            # 顺序回退：按顺序把所有任务串成一条链
             deps = {}
             dependents = {str(t["id"]): set() for t in tasks}
             task_id_list = [str(t["id"]) for t in tasks]
@@ -1963,15 +1917,15 @@ class Agent:
         task_map = {str(t["id"]): t for t in tasks}
         completed: set[str] = set()
         failed: set[str] = set()
-        task_results: dict[str, str] = {}  # task_id -> summary text
-        semaphore = asyncio.Semaphore(3)  # max concurrency
+        task_results: dict[str, str] = {}  # 任务 ID -> 摘要文本
+        semaphore = asyncio.Semaphore(3)  # 最大并发数
 
-        # Scheduling state
-        dispatched: set[str] = set()  # tasks already started or finished
+        # 调度状态
+        dispatched: set[str] = set()  # 已开始或已完成的任务
         pending_futures: set[asyncio.Task] = set()
 
         async def _cascade_skip(task_id: str) -> None:
-            """Mark all transitive dependents of *task_id* as skipped."""
+            """把 *task_id* 的所有传递性依赖方标记为已跳过。"""
             for dep_tid in dependents.get(task_id, set()):
                 if dep_tid in completed or dep_tid in failed or dep_tid in dispatched:
                     continue
@@ -1988,13 +1942,13 @@ class Agent:
                 await _cascade_skip(dep_tid)
 
         async def _dispatch_ready() -> None:
-            """Start all tasks whose dependencies are fully completed."""
+            """启动所有依赖已全部完成的任务。"""
             for t in tasks:
                 tid = str(t["id"])
                 if tid in dispatched:
                     continue
-                # An injection (or abort) stops new dispatch; in-flight tasks
-                # finish naturally and the loop below exits.
+                # 注入（或中止）会停止新的派发；在途任务自然结束，下方循环
+                # 退出。
                 if session.is_aborted() or session.has_pending_user_input():
                     break
                 task_deps = deps.get(tid, set())
@@ -2002,14 +1956,14 @@ class Agent:
                     dispatched.add(tid)
                     fut = asyncio.create_task(_execute_and_finish(tid))
                     pending_futures.add(fut)
-                    # Remove self-reference when done to avoid retaining large closures
+                    # 完成后移除自引用，避免保留大型闭包
                     fut.add_done_callback(pending_futures.discard)
 
         async def _execute_and_finish(task_id: str) -> None:
-            """Execute one task, then dispatch newly-ready dependents."""
+            """执行单个任务，然后派发新就绪的依赖方。"""
             async with semaphore:
                 if session.is_aborted():
-                    # Mark as skipped if not yet started
+                    # 尚未开始则标记为已跳过
                     failed.add(task_id)
                     for tp in self._task_plan:
                         if tp["id"] == task_id:
@@ -2031,12 +1985,10 @@ class Agent:
                         dependency_results=dep_results,
                     )
                 except Exception as e:
-                    # A crash must not leave the task stuck at "running" with
-                    # its dependents forever undispatchable (gather with
-                    # return_exceptions=True would silently swallow it).
-                    # Scrub the whole traceback: the exception's __cause__
-                    # chain can still carry a raw provider error even when
-                    # its own message was scrubbed at the raise site.
+                    # 崩溃不能让任务卡在 "running"，使其依赖方永远无法派发
+                    # （带 return_exceptions=True 的 gather 会静默吞掉它）。
+                    # 对整条回溯脱敏：即使异常自身消息在抛出点已脱敏，其
+                    # __cause__ 链仍可能携带原始供应方错误。
                     scrubbed = _scrub_credentials(str(e), self._credentials)
                     _log.error(
                         "Task %s crashed: %s",
@@ -2065,31 +2017,28 @@ class Agent:
             else:
                 failed.add(task_id)
 
-            # Check dependents
+            # 检查依赖方
             if status != "completed":
-                # Failed -> cascade skip dependents
+                # 失败 -> 级联跳过依赖方
                 await _cascade_skip(task_id)
 
-            # Dispatch newly-ready tasks (unless aborted)
+            # 派发新就绪的任务（除非已中止）
             if not session.is_aborted():
                 await _dispatch_ready()
 
-        # ── Initial dispatch ──────────────────────────────────────
+        # ── 初始派发 ──────────────────────────────────────────────
         await _dispatch_ready()
 
-        # ── Wait for all tasks to finish ──────────────────────────
-        # Tasks are dispatched dynamically (each completion can schedule its
-        # dependents), so we must loop: a single gather() snapshots the set at
-        # call time and would return while newly-dispatched tasks still run.
+        # ── 等待所有任务结束 ─────────────────────────────────────
+        # 任务是动态派发的（每次完成都可能调度其依赖方），因此必须循环：
+        # 单个 gather() 只快照调用时刻的集合，会在新派发任务仍运行时就返回。
         while pending_futures:
             await asyncio.gather(*pending_futures, return_exceptions=True)
 
-        # In-flight injection: the user queued a message while tasks were
-        # running. Stop here (remaining tasks stay pending — the handler's
-        # stale-task sweep skips their ids), keep the plan in the dynamic
-        # prompt, and hand control back to _run_loop, whose step boundary
-        # consumes the queued message. Deferred tasks are NOT marked skipped:
-        # the user may resume them with the new instruction.
+        # 在途注入：用户在任务运行期间排队了一条消息。在此停止（剩余任务
+        # 保持 pending——处理器的陈旧任务清扫会跳过其 ID），把计划保留在
+        # 动态提示词中，并把控制权交回 _run_loop，由其步骤边界消费排队
+        # 消息。延迟的任务不标记为已跳过：用户可能用新指令恢复它们。
         if session.has_pending_user_input():
             deferred = [
                 str(t["id"]) for t in tasks
@@ -2111,7 +2060,7 @@ class Agent:
             self._tool_ctx.current_task_id = None
             return summary
 
-        # Abort: mark any remaining pending tasks as skipped
+        # 中止：把任何剩余的待处理任务标记为已跳过
         if session.is_aborted():
             for t in tasks:
                 tid = str(t["id"])
@@ -2147,15 +2096,15 @@ class Agent:
         plan_tool_id: str,
         dependency_results: list[tuple[str, str]] | None = None,
     ) -> dict:
-        """Execute one planned task. Returns {task_id, status, summary}."""
+        """执行单个规划任务，返回 {task_id, status, summary}。"""
         from .knowledge.loader import unload_by_task
 
         task_id = task["id"]
         self._turn += 1
         turn = self._turn
         task_tool_ctx = self._tool_ctx.copy_for_task(task_id, turn)
-        # Auto-route mode: pick the config serving the task's complexity tier
-        # (nearest-tier fallback). Explicit mode keeps the session config.
+        # 自动路由模式：选择服务于该任务复杂度层级的配置（最近层级回退）。
+        # 显式模式则沿用会话配置。
         task_config = config_id
         if self._tier_map:
             resolved = resolve_tier_config(self._tier_map, task.get("estimated_complexity"))
@@ -2163,7 +2112,7 @@ class Agent:
                 task_config = resolved
         task_provider = self._get_provider(task_config)
 
-        # Update live plan status
+        # 更新实时计划状态
         for tp in self._task_plan:
             if tp["id"] == task_id:
                 tp["status"] = "running"
@@ -2195,11 +2144,10 @@ class Agent:
         )
 
         async def _close_task_db() -> None:
-            """Release the per-task DB session copy_for_task created (if any).
+            """释放 copy_for_task 创建的单任务数据库会话（若有）。
 
-            The shared tool_db owned by the handler is closed there; per-task
-            sessions must be closed here so concurrent tasks don't leak
-            connection-pool slots.
+            处理器拥有的共享 tool_db 在那里关闭；单任务会话必须在此关闭，
+            避免并发任务泄漏连接池槽位。
             """
             _sess = task_tool_ctx.db_session
             if _sess is not None and _sess is not self._tool_ctx.db_session:
@@ -2252,13 +2200,11 @@ class Agent:
         finally:
             await _close_task_db()
 
-        # An abort that fired mid-loop must not report the in-flight task as
-        # completed — _run_task_mode's abort block marks the remaining pending
-        # tasks "skipped", so keep the same semantics here. Otherwise this
-        # task's completion event gets persisted and its result shows as done.
-        # No stream_end here: _run_task_loop emits it on its normal return
-        # paths (the abort break included) — a second emit with the same
-        # message_id would finalize the frontend stream twice.
+        # 循环中途触发的中止不能把在途任务报告为已完成——_run_task_mode 的
+        # 中止块把剩余待处理任务标记为 "skipped"，此处保持相同语义。否则该
+        # 任务的完成事件会被持久化，其结果显示为已完成。这里不发
+        # stream_end：_run_task_loop 在正常返回路径（含中止 break）会发出，
+        # 用相同 message_id 再发一次会让前端流被定稿两次。
         if session.is_aborted():
             error_text = "Aborted"
             await session.emit("task_skipped", task_id=task_id, error=error_text)
@@ -2276,7 +2222,7 @@ class Agent:
                     self._mark_prompt_dirty()
             return {"task_id": task_id, "status": "skipped", "summary": f"[ABORTED] {task['title']}"}
 
-        # Success
+        # 成功
         await session.emit("task_completed", task_id=task_id, summary=full_text[:500])
         for tp in self._task_plan:
             if tp["id"] == task_id:
@@ -2285,10 +2231,10 @@ class Agent:
                 break
         self._mark_prompt_dirty()
 
-        # Emit updated progress after task status change
+        # 任务状态变更后发出更新后的进度
         await self._emit_task_progress(session, task_id)
 
-        # Release dynamic knowledge bound to this task
+        # 释放绑定到本任务的动态知识
         if self._project_context:
             unloaded = unload_by_task(self._project_context, task_id)
             if unloaded:
@@ -2308,32 +2254,29 @@ class Agent:
         turn: int,
         task_tool_ctx: ToolContext,
     ) -> str:
-        """Tool-call loop for a single task with stop_reason handling. Returns final text.
+        """单个任务的工具调用循环，处理 stop_reason，返回最终文本。
 
-        Uses *task_tool_ctx* (a per-task shallow copy) so concurrent tasks
-        don't clobber each other's ``current_task_id`` / ``current_turn``.
+        使用 *task_tool_ctx*（单任务的浅拷贝），避免并发任务互相覆盖彼此的
+        ``current_task_id`` / ``current_turn``。
         """
         max_iterations = _MAX_TASK_ITERATIONS
         max_pause_continuations = 3
         pause_count = 0
         message_id = session.new_message()
-        # failure paths below _run_task_loop (timeout, API error,
-        # refusal) must still close the stream on the frontend — task_failed
-        # alone leaves the typing indicator stuck. Expose the id on the
-        # per-task context so _run_task can emit stream_end from its except
-        # branches (task_tool_ctx is a per-task shallow copy; no cross-task
-        # clobbering).
+        # _run_task_loop 下方的失败路径（超时、API 错误、拒绝）仍须关闭前端
+        # 上的流——仅 task_failed 会让输入指示器卡住。把 ID 暴露在单任务
+        # 上下文上，使 _run_task 能在其 except 分支发出 stream_end
+        # （task_tool_ctx 是单任务浅拷贝，不会跨任务覆盖）。
         task_tool_ctx.current_message_id = message_id
         full_text = ""
-        # Text produced in EARLIER iterations of this task loop — each
-        # iteration resets full_text, but the task summary (task_completed)
-        # must reflect the whole task, not just the final turn.
+        # 本任务循环更早迭代产生的文本——每次迭代都会重置 full_text，但任务
+        # 摘要（task_completed）必须反映整个任务，而非仅最后一轮。
         full_text_total: list[str] = []
-        # Byte-guard constant: tool schemas are static within a loop, and the
-        # per-iteration guard must not re-estimate them every step.
+        # 字节守卫常量：工具模式在一次循环内是静态的，逐次迭代的守卫不应
+        # 每一步都重新估算它们。
         tools_wire = estimate_request_bytes([], tool_defs)
-        # per-loop prompt revision (see _run_loop) — parallel tasks
-        # each rebuild their own system prompt on the shared revision bump.
+        # 每循环的提示词版本号（见 _run_loop）——并行任务在共享版本号推高时
+        # 各自重建自己的系统提示词。
         prompt_revision = self._prompt_revision
 
         for _ in range(max_iterations):
@@ -2347,8 +2290,8 @@ class Agent:
             full_text = ""
             tool_calls_buffer: dict[int, dict] = {}
             stop_reason: StopReason = StopReason.UNKNOWN
-            # Same extended-thinking accumulation as the chat loop — a task
-            # iteration replays its signed blocks on the next request too.
+            # 与对话循环相同的扩展思考累积——任务迭代也会在下一次请求回放
+            # 其带签名块。
             thinking_text = ""
             thinking_blocks: list[dict] = []
             thinking_open = False
@@ -2365,18 +2308,17 @@ class Agent:
                 pending_tool_ids,
             )
             if self._request_byte_outcome(messages, tool_defs, tools_wire) == "over_limit":
-                # Sync truncation was not enough. Escalate to the async
-                # degradation chain first; the task loop surfaces a genuine
-                # over-limit via RuntimeError (caught by _run_task →
-                # task_failed → _emit_task_stream_end), so raise only after
-                # every soft lever has been pulled.
+                # 同步截断不够。先升级到异步降级链；任务循环通过 RuntimeError
+                # 暴露真正的超限（由 _run_task → task_failed →
+                # _emit_task_stream_end 捕获），因此只在所有软杠杆都用尽后
+                # 才抛出。
                 await session.emit("turn_status", phase="degrading", task_id=task_id)
                 if await self._degrade_request(messages, tool_defs, provider) == "over_limit":
                     raise RuntimeError(self._over_limit_message(messages, tool_defs))
                 _log.info("request degrade succeeded in task loop, resuming")
             try:
                 await session.emit("turn_status", phase="waiting_model", task_id=task_id)
-                # Per-call cumulative usage snapshot — see the chat loop.
+                # 每次调用的累计用量快照——参见对话循环。
                 prev_usage: tuple[int, int] = (0, 0)
                 async for chunk in provider.stream(
                     messages, tool_defs, max_tokens=self._config.max_tokens
@@ -2456,10 +2398,9 @@ class Agent:
                             context_window=session.context_window,
                         )
             except Exception as api_err:
-                # Same scrub rule as the main loop: the message is raised
-                # into _execute_and_finish, which persists it to agent_tasks
-                # and emits task_failed — and the chained exception below
-                # would otherwise put the raw text into any traceback log.
+                # 与主循环相同的脱敏规则：该消息被抛入 _execute_and_finish，
+                # 由其持久化到 agent_tasks 并发出 task_failed——否则下方的
+                # 链式异常会把原始文本写进任何回溯日志。
                 scrubbed_tb = _scrub_credentials(traceback.format_exc(), self._credentials)
                 _log.error(
                     "task provider.stream() failed: task_id=%s provider=%s messages=%d pending_tool_call_ids=%s error=%s",
@@ -2470,8 +2411,8 @@ class Agent:
                     scrubbed_tb,
                 )
                 if classify_api_error(api_err) is StopReason.CONTEXT_EXCEEDED:
-                    # Same message as the stop-reason branch below so the task
-                    # card reads identically whichever path caught the overflow.
+                    # 与下方停止原因分支使用相同消息，使任务卡片无论由哪条
+                    # 路径捕获溢出，读起来都一致。
                     raise RuntimeError("Context window exceeded during task execution") from api_err
                 raise RuntimeError(
                     f"LLM API error: {_scrub_credentials(str(api_err), self._credentials)}\n"
@@ -2479,15 +2420,14 @@ class Agent:
                     f"messages={len(messages)}, error_type={type(api_err).__name__}"
                 ) from api_err
 
-            # Close a thinking block left open when the stream ended without
-            # a signature or following content.
+            # 当流结束时既无签名也无后续内容，关闭仍开着的思考块。
             if thinking_open:
                 thinking_open = False
                 await session.emit("thinking_end", message_id=message_id, task_id=task_id)
 
-            # Same truncation guard as the main loop: a task turn cut off
-            # mid-tool-call must not orphan an incomplete tool_call in
-            # history (next iteration would 400 on the message sequence).
+            # 与主循环相同的截断守卫：在工具调用中途被切断的任务轮次，不能
+            # 让不完整的 tool_call 在历史中成为孤儿（下一次迭代会因消息
+            # 序列返回 400）。
             tool_calls = (
                 [tc for tc in tool_calls_buffer.values()
                  if tc.get("id") and tc.get("function", {}).get("name")]
@@ -2498,7 +2438,7 @@ class Agent:
                 thinking_blocks=thinking_blocks or None,
             ))
 
-            # ─── Stop Reason Handling ─────────────────────────────────
+            # ─── 停止原因处理（Stop Reason Handling）──────────────────
             if stop_reason == StopReason.REFUSAL:
                 raise RuntimeError(f"Model refused: {full_text[:200]}")
 
@@ -2526,7 +2466,7 @@ class Agent:
                 await session.emit("stream_end", message_id=message_id, total_tokens=session.tokens_used, task_id=task_id)
                 return "".join([*full_text_total, full_text])
 
-            # ─── Process Tool Calls ───────────────────────────────────
+            # ─── 处理工具调用（Process Tool Calls）────────────────────
             full_text_total.append(full_text)
             pause_count = 0
             progress = self._compute_task_progress(task_id)
@@ -2539,8 +2479,8 @@ class Agent:
                 try:
                     args = self._parse_tool_arguments(tc)
                 except (json.JSONDecodeError, TypeError) as _e:
-                    # Preserve a valid provider history when the next tool-loop
-                    # iteration serializes this assistant message.
+                    # 当下一次工具循环迭代序列化这条助手消息时，保留一份合法
+                    # 的供应方历史。
                     tc["function"]["arguments"] = "{}"
                     bad_result = {"error": f"Malformed tool arguments (invalid JSON): {_e}"}
                     await session.emit("tool_call_start", tool=tool_name, input={}, call_id=tool_id, task_id=task_id)
@@ -2565,10 +2505,9 @@ class Agent:
                     task_id=task_id,
                 )
 
-                # plan_task is a chat-loop directive. Inside a subtask there
-                # is no task list to hand to the scheduler and PlannerTool
-                # only ACKs, so executing it silently does nothing — the
-                # model then believes it planned work that will never run.
+                # plan_task 是对话循环的指令。子任务内没有可交给调度器的任务
+                # 列表，而 PlannerTool 只会确认（ACK），静默执行它毫无作用——
+                # 模型随后会误以为自己规划了永远不会运行的工作。
                 if tool_name == "plan_task":
                     result = {
                         "error": (
@@ -2600,11 +2539,11 @@ class Agent:
                     **progress,
                 )
 
-                # Same type guard as the chat loop: some tools report a COUNT
-                # under these keys (repo_graph's too_many_files summary carries
-                # files=<int>), and iterating an int here — outside the tool
-                # try/except — fails the whole subtask with
-                # "'int' object is not iterable" (cascading to dependents).
+                # 与对话循环相同的类型守卫：有些工具在这些键下报告数量
+                # （repo_graph 的 too_many_files 摘要带有 files=<整数>），而
+                # 在此处遍历整数——位于工具 try/except 之外——会以
+                # "'int' object is not iterable" 让整个子任务失败（级联到
+                # 依赖方）。
                 images = result.get("images")
                 if isinstance(images, list) and images:
                     await session.emit("image_output", message_id=message_id, images=images)
@@ -2617,8 +2556,8 @@ class Agent:
 
                 if tool_name == "knowledge_rw" and self._project_context:
                     op = args.get("operation")
-                    # Same guard as the chat loop: a failed write must not put
-                    # content into the context that never reached disk.
+                    # 与对话循环相同的守卫：失败的写入不能把从未落盘的内容
+                    # 放进上下文。
                     if op == "write" and not result.get("error"):
                         from .knowledge.loader import update_context_file, _is_log_role
                         slug = args.get("slug", "")
@@ -2629,9 +2568,8 @@ class Agent:
                             self._mark_prompt_dirty()
                             await session.emit("knowledge_updated")
                     elif op in ("load", "unload", "refresh", "delete", "purge"):
-                        # Same as the chat loop: dirty alone rebuilds from the
-                        # stale static cache — drop it so deleted/refreshed
-                        # knowledge actually leaves the prompt.
+                        # 与对话循环相同：仅靠脏标志会从陈旧的静态缓存重建
+                        # ——丢弃缓存，使被删除/刷新的知识真正离开提示词。
                         self._invalidate_static_cache()
                         self._mark_prompt_dirty()
 
@@ -2648,10 +2586,9 @@ class Agent:
                     name=tool_name,
                 ))
 
-        # Loop exit: either max_iterations genuinely ran out, or the abort
-        # check above broke out mid-run. An abort is not an iteration limit
-        # and must not claim one; stream_end closes the frontend stream in
-        # both cases.
+        # 循环退出：要么确实耗尽了 max_iterations，要么上方的中止检查在运行
+        # 中途 break。中止不是迭代限制，也不能谎称达到限制；两种情况下
+        # stream_end 都会关闭前端流。
         if not session.is_aborted():
             await session.emit("warning", message=f"Task {task_id} reached maximum tool iterations - reply to continue")
         await session.emit("stream_end", message_id=message_id, total_tokens=session.tokens_used, task_id=task_id)

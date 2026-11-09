@@ -1,14 +1,12 @@
-"""Advisory validation for definition files (agents, skills, workflows).
+"""定义文件（智能体、技能、工作流）的建议性校验。
 
-Definitions are Markdown with YAML frontmatter. Registration is lazy and silent:
-``agent_sync`` skips a project agent whose frontmatter does not parse, whose
-``slug`` is missing/unsafe, or whose slug lacks the ``{project_slug}--`` prefix —
-log line only, no row, so the agent simply never appears in the picker. The
-skill/workflow loaders are lenient instead, falling back to the file stem.
+定义文件是带 YAML 前置元数据的 Markdown。注册是惰性且静默的：``agent_sync``
+会跳过前置元数据无法解析、``slug`` 缺失/不安全、或 slug 缺少
+``{project_slug}--`` 前缀的项目智能体——只写日志、不建数据库行，因此该智能体
+根本不会出现在选择器里。技能/工作流加载器则较宽松，会退而使用文件名主干。
 
-The LLM that wrote the file cannot see any of that, so the filesystem tool runs
-these checks at write/read time and hands the result back. The write still
-succeeds — the caller is expected to fix the reported errors and rewrite.
+写出文件的大模型看不到这些，因此文件系统工具在写入/读取时运行这些检查并把结果
+返回。写入仍会成功——预期调用方修复报告的错误后重写。
 """
 from __future__ import annotations
 
@@ -21,15 +19,14 @@ import frontmatter
 
 from .localization import is_locale_map, normalize_i18n_field
 
-#: Separator between project slug and agent name in project agent slugs.
+#: 项目智能体 slug 中项目 slug 与智能体名之间的分隔符。
 PROJECT_SLUG_SEPARATOR = "--"
 
-#: Path-safe slug segment: lowercase letters, digits, dashes; must start alnum.
+#: 路径安全的 slug 段：小写字母、数字、连字符，必须以字母或数字开头。
 AGENT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
-#: Leading ``{name}--`` of a slug — stripped before re-prefixing with the real
-#: project slug, so a definition copied from another project does not end up
-#: double-prefixed (``proj-a--proj-b--helper``).
+#: slug 开头的 ``{name}--``——在重新加上真实项目 slug 前缀之前先剥离，使从
+#: 其他项目复制来的定义不会出现双前缀（``proj-a--proj-b--helper``）。
 _LEADING_PREFIX_RE = re.compile(r"^[a-z0-9][a-z0-9-]*--")
 
 _AGENT_SUFFIX = ".agent.md"
@@ -37,17 +34,16 @@ _WORKFLOW_SUFFIX = ".workflow.md"
 
 
 def validate_agent_slug(slug: object) -> bool:
-    """Return True when the slug is safe to use as a filename segment."""
+    """当 slug 可安全用作文件名段时返回 True。"""
     return isinstance(slug, str) and bool(AGENT_SLUG_RE.match(slug))
 
 
 def project_slug_from_workspace(project_fs_path: str | None) -> str | None:
-    """Return the project slug encoded in a workspace path, if any.
+    """返回工作区路径中编码的项目 slug（若有）。
 
-    Workspaces are ``PROJECTS_ROOT/{slug}`` for root projects and
-    ``PROJECTS_ROOT/{parent}/projects/{child}`` for child projects, so the
-    directory name is the project slug (same derivation the API uses to build
-    the required agent-slug prefix).
+    根项目的工作区是 ``PROJECTS_ROOT/{slug}``，子项目是
+    ``PROJECTS_ROOT/{parent}/projects/{child}``，因此目录名就是项目 slug（API
+    构建所需智能体 slug 前缀时用的是同样推导）。
     """
     if not project_fs_path:
         return None
@@ -56,24 +52,22 @@ def project_slug_from_workspace(project_fs_path: str | None) -> str | None:
 
 
 def _norm(rel_path: str) -> str:
-    """Workspace-relative path with normalized separators.
+    """分隔符规范化的、相对工作区的路径。
 
-    ``.`` segments are dropped: models write shell-style paths like
-    ``./agents/foo.agent.md``, pathlib resolves those to the right file, but
-    the placement/slug checks below compare strings — a retained ``./``
-    prefix made every correctly-placed definition look misplaced.
+    会丢弃 ``.`` 段：模型会写出 ``./agents/foo.agent.md`` 之类 shell 风格路径，
+    pathlib 能解析到正确文件，但下方的位置/slug 检查是比较字符串——保留
+    ``./`` 前缀曾让每个位置正确的定义看起来放错了地方。
     """
     parts = rel_path.replace("\\", "/").lstrip("/").split("/")
     return "/".join(p for p in parts if p not in ("", "."))
 
 
 def _classify(rel_path: str, scope: str) -> str | None:
-    """Return 'agent' | 'skill' | 'workflow', or None for non-definition paths."""
+    """返回 'agent' | 'skill' | 'workflow'，非定义路径返回 None。"""
     parts = [p for p in _norm(rel_path).split("/") if p not in ("", ".")]
     if not parts:
         return None
-    # Loaders skip private/mixin paths — no definition will be registered, so
-    # validating them would only produce noise.
+    # 加载器会跳过私有/mixin 路径——不会注册任何定义，因此校验它们只会产生噪声。
     if any(part.startswith("_") for part in parts):
         return None
     name = parts[-1]
@@ -81,9 +75,8 @@ def _classify(rel_path: str, scope: str) -> str | None:
         return "agent"
     if parts[0] in ("skills", "workflows") and name.endswith(".md"):
         return parts[0][:-1]
-    # In a project workspace, agents/skills/ is the framework layout copied into
-    # the wrong place — never loaded as a project skill, so it is worth flagging.
-    # Global scope reads that same path legitimately.
+    # 项目工作区里，agents/skills/ 是被复制到错误位置的框架布局——绝不会作为
+    # 项目技能加载，因此值得标记。全局作用域读取同一路径则是合法的。
     if scope == "project" and len(parts) > 1 and parts[0] == "agents" and parts[1] == "skills":
         return "skill"
     return None
@@ -93,19 +86,17 @@ def _parse(content: str) -> tuple[dict[str, Any], str | None]:
     try:
         post = frontmatter.loads(content)
         return dict(post.metadata), None
-    except Exception as e:  # noqa: BLE001 — any parser error is reportable text
-        # PyYAML puts the offending line on its own line; flatten it so the
-        # message stays readable inside a one-line tool result.
+    except Exception as e:  # noqa: BLE001 —— 任何解析错误都可作为文本报告
+        # PyYAML 会把出错行单独换行；压平它，使消息在单行工具结果里仍可读。
         return {}, f"{type(e).__name__}: {' '.join(str(e).split())}"
 
 
 def _list_field(value: object) -> list[str]:
-    """Normalize a frontmatter list field to a list of strings.
+    """把前置元数据列表字段规范化为字符串列表。
 
-    Mirrors ``AgentConfig._list_field`` (agent.py) — that module pulls in the
-    whole tool tree, so importing it here would be circular. Behavior is
-    intentionally identical: a comma-separated scalar is split, not iterated
-    per character.
+    镜像 ``AgentConfig._list_field``（agent.py）——那个模块会拉入整个工具树，
+    在这里导入会循环依赖。行为刻意保持一致：逗号分隔的标量会被拆分，而不是
+    逐字符迭代。
     """
     if isinstance(value, str):
         return [v.strip() for v in value.split(",") if v.strip()]
@@ -121,7 +112,7 @@ def _known_tool_names() -> frozenset[str]:
 
 
 def _quoted(value: str) -> str:
-    """Quote a scalar for YAML — JSON strings are valid YAML double-quoted scalars."""
+    """为 YAML 给标量加引号——JSON 字符串是合法的 YAML 双引号标量。"""
     return json.dumps(value, ensure_ascii=False)
 
 
@@ -131,7 +122,7 @@ def _reference_warnings(
     project_fs_path: str | None,
     framework_root: str | None,
 ) -> list[str]:
-    """Warn about skills/workflows references that resolve to no file."""
+    """对解析不到任何文件的技能/工作流引用发出警告。"""
     if not project_fs_path and not framework_root:
         return []
     project = Path(project_fs_path) if project_fs_path else None
@@ -163,8 +154,8 @@ def _tool_warnings(meta: dict[str, Any]) -> list[str]:
     declared = _list_field(meta.get("tools"))
     if not declared:
         return []
-    # MCP markers are not registry tools — they are resolved from the project's
-    # MCP catalog at runtime, so they are always considered known.
+    # MCP 标记不是注册表里的工具——它们在运行时从项目的 MCP 目录解析，因此
+    # 始终视为已知。
     unknown = [
         t for t in declared
         if t != "mcp" and not t.startswith("mcp:") and t not in _known_tool_names()
@@ -175,10 +166,10 @@ def _tool_warnings(meta: dict[str, Any]) -> list[str]:
 
 
 def _suggested_frontmatter(kind: str, slug: str | None, meta: dict[str, Any]) -> str:
-    """Minimal valid frontmatter the caller can paste back in and complete."""
+    """调用方可直接粘回并补全的最小可用前置元数据。"""
     slug_line = _quoted(slug) if slug else _quoted("<必填：小写字母/数字/连字符>")
-    # Collapse locale maps to their canonical entry — the suggestion is a
-    # scalar template; a raw dict would render as Python repr in the YAML.
+    # 把语言映射折叠为其规范条目——建议是标量模板；原始字典会在 YAML 里渲染成
+    # Python repr。
     display, _ = normalize_i18n_field(meta.get("display_name"))
     description, _ = normalize_i18n_field(meta.get("description"))
     lines = ["---", f"slug: {slug_line}"]
@@ -199,18 +190,17 @@ def _suggested_frontmatter(kind: str, slug: str | None, meta: dict[str, Any]) ->
 
 
 def _slugify(value: str) -> str:
-    """Best-effort rewrite of a value into the allowed slug charset."""
+    """尽力把一个值改写为允许的 slug 字符集。"""
     normalized = re.sub(r"[^a-z0-9-]+", "-", value.strip().lower()).strip("-")
     normalized = re.sub(r"-{2,}", "-", normalized)
     return normalized if normalized and normalized[0].isalnum() else ""
 
 
 def _agent_expected_slug(stem: str, slug: str, project_slug: str | None) -> tuple[str | None, str | None]:
-    """Return (expected_slug, required_prefix) for an agent definition.
+    """为智能体定义返回（期望 slug, 必需前缀）。
 
-    The suggestion is derived from the frontmatter slug when it is usable and
-    from the filename stem otherwise, so a wrong slug still yields a concrete
-    value to write.
+    前置元数据 slug 可用时从它推导建议，否则从文件名主干推导，因此即使 slug
+    错误也能给出一个可写入的具体值。
     """
     prefix = f"{project_slug}{PROJECT_SLUG_SEPARATOR}" if project_slug else None
     for candidate in (slug, stem):
@@ -241,11 +231,10 @@ def check_definition(
     project_fs_path: str | None = None,
     framework_root: str | None = None,
 ) -> dict[str, Any] | None:
-    """Validate a written/read definition file; None when the path is not one.
+    """校验一个写入/读取的定义文件；路径不是定义文件时返回 None。
 
-    ``scope`` is ``"project"`` for the workspace overlay and ``"global"`` for the
-    framework directory — global definitions never carry the project prefix, so
-    the prefix rule only applies to project scope.
+    ``scope`` 对工作区覆盖层为 ``"project"``，对框架目录为 ``"global"``——
+    全局定义从不带项目前缀，因此前缀规则只适用于项目作用域。
     """
     kind = _classify(rel_path, scope)
     if kind is None:
@@ -280,10 +269,9 @@ def check_definition(
         placement_error = _check_agent_placement(rel, name)
         if placement_error:
             errors.append(placement_error)
-        # Everything below reads parsed frontmatter. After a parse failure the
-        # fields are simply unknown, and reporting "missing slug" / "missing
-        # display_name" alongside it would restate the symptom and point the
-        # caller at the wrong fix.
+        # 下方所有内容都读取已解析的前置元数据。解析失败后字段就是未知的，
+        # 同时报告“缺少 slug”/“缺少 display_name”只会重述症状，把调用方引向
+        # 错误的修复方向。
         if not parse_error:
             if not slug:
                 errors.append("frontmatter 缺少 slug 键：没有 slug 的智能体定义不会被注册。")

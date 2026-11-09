@@ -1,4 +1,4 @@
-"""Agent tool for reading and writing memories across all three layers."""
+"""跨全部三层读写记忆的智能体工具。"""
 from __future__ import annotations
 
 import json
@@ -15,12 +15,10 @@ _log = logging.getLogger(__name__)
 MAX_SESSION_NOTES = 20
 MAX_NOTE_LENGTH = 200
 
-# A keyword must end at a non-letter (or the string): "PASSWORD=x",
-# "api_key: ...", "the password is hunter2" all still match, while the
-# English words that merely CONTAIN a keyword — author, authentication,
-# tokenizer, secretive — no longer do. Plain substring matching rejected
-# those as secrets, so a legitimate fact ("the author of this module is ...")
-# could never be stored.
+# 关键词必须结束于非字母（或字符串末尾）："PASSWORD=x"、"api_key: ..."、
+# "the password is hunter2" 都仍匹配，而只是“包含”关键词的英文单词——author、
+# authentication、tokenizer、secretive——不再匹配。纯子串匹配会把它们当作密钥
+# 拒绝，因此合法事实（"the author of this module is ..."）永远无法存储。
 _SECRET_PATTERN = re.compile(
     r"(?:TOKEN|PASSWORD|SECRET|COOKIE|API_KEY|PRIVATE_KEY|CLIENT_SECRET|BEARER|CREDENTIAL"
     r"|(?<!O)AUTH)(?:[^A-Za-z]|$)",
@@ -29,12 +27,11 @@ _SECRET_PATTERN = re.compile(
 
 
 def _coerce_tags(value: Any) -> list[str]:
-    """Normalize the tags param to a list of strings.
+    """把 tags 参数规范化为字符串列表。
 
-    The schema declares an array, but LLMs routinely pass a bare string
-    ("important,qa" or "important"). Storing that raw would serialize a JSON
-    string instead of an array — recall then treats it as a substring match
-    and returns wrong memories. Same defense as confluence's page_ids.
+    模式声明的是数组，但 LLM 经常传裸字符串（"important,qa" 或 "important"）。
+    原样存储会序列化出 JSON 字符串而非数组——回忆时把它当子串匹配，返回错误记忆。
+    与 confluence 的 page_ids 是同一防御。
     """
     if value is None:
         return []
@@ -179,15 +176,13 @@ class MemoryRWTool(Tool):
                 return {"error": "content is required for save"}
             tags = _coerce_tags(params.get("tags"))
             scope = params.get("scope", "project")
-            # The parameters schema lists recall scopes too — a scope like
-            # "session"/"all" silently stored the memory under the project
-            # scope. Reject instead of guessing.
+            # 参数模式也列出了回忆 scope——"session"/"all" 之类 scope 会静默把记忆
+            # 存到项目 scope。拒绝而非猜测。
             if scope not in ("project", "global"):
                 return {"error": f"save supports scope 'project' or 'global' only, got {scope!r}"}
 
-        # Tags persist too — a secret smuggled through the tags param would
-        # bypass the content guard (config:{key} is built from the already-
-        # guarded key, but caller-supplied tags are not).
+        # 标签也会持久化——经 tags 参数偷带的密钥会绕过内容守卫（config:{key}
+        # 由已守卫的 key 构建，但调用方提供的标签没有）。
         guard_error = self._check_secret_guard(content, *tags)
         if guard_error:
             return {"error": guard_error}
@@ -199,9 +194,8 @@ class MemoryRWTool(Tool):
         from agent_core.tools._compat import new_uuid
 
         memory_id = new_uuid()
-        # Real datetime, not an ISO string: these are raw text() statements,
-        # so the UTCDateTime TypeDecorator never runs and strict drivers
-        # (asyncpg) reject a str bound to a timestamp parameter.
+        # 真实 datetime 而非 ISO 字符串：这些是原始 text() 语句，UTCDateTime
+        # TypeDecorator 从不运行，严格驱动（asyncpg）拒绝绑定到时间戳参数的 str。
         now = datetime.now(timezone.utc)
 
         await context.db_session.execute(
@@ -218,8 +212,8 @@ class MemoryRWTool(Tool):
                 "tags": json.dumps(tags) if tags else None,
                 "created_by": f"agent",
                 "created_at": now,
-                # Bound, not the literal 0: the column is Boolean — PostgreSQL
-                # has no implicit integer→boolean cast.
+                # 绑定值而非字面 0：该列是 Boolean——PostgreSQL 没有隐式
+                # 整数→布尔转换。
                 "archived": False,
             },
         )
@@ -263,9 +257,8 @@ class MemoryRWTool(Tool):
         scope = params.get("scope", "all")
         query = params.get("query")
         tags_filter = _coerce_tags(params.get("tags"))
-        # Clamp hard: a negative limit would slice from the END of the result
-        # list (results[:-3] drops the newest entries), zero would return
-        # nothing, and non-numeric input would TypeError.
+        # 硬性钳制：负 limit 会从结果列表末尾切片（results[:-3] 丢掉最新条目），
+        # 零什么都不返回，非数字输入会 TypeError。
         try:
             limit = max(1, min(int(params.get("limit") or 10), 50))
         except (TypeError, ValueError):
@@ -273,10 +266,9 @@ class MemoryRWTool(Tool):
 
         results: list[dict] = []
 
-        # Session notes carry no tags (save_session stores note+timestamp only),
-        # so a tags-filtered recall must not return them: they can never match
-        # the filter, and being appended first they would crowd the limit ahead
-        # of the tagged personal rows the caller asked for.
+        # 会话笔记不带标签（save_session 只存 note+timestamp），因此标签过滤的回忆
+        # 不得返回它们：它们永远无法匹配过滤器，且因先被追加，会在调用方索要的带标签
+        # 个人行之前挤占 limit。
         if scope in ("session", "all") and not tags_filter:
             session_notes = context.session_memories
             for entry in session_notes:
@@ -331,10 +323,9 @@ class MemoryRWTool(Tool):
 
         from sqlalchemy import text
 
-        # Fetch newest first with the limit pushed into SQL: slicing in
-        # Python after fetchall() pulled every episode row into memory.
-        # MSSQL has no LIMIT and SQLite has no OFFSET/FETCH — pick per dialect
-        # (the previous OFFSET/FETCH-only form failed on SQLite dev/test DBs).
+        # 先取最新并把 limit 推进 SQL：fetchall() 之后在 Python 切片会把每个
+        # episode 行都拉进内存。MSSQL 没有 LIMIT，SQLite 没有 OFFSET/FETCH——按
+        # 方言选择（之前仅 OFFSET/FETCH 的形式在 SQLite 开发/测试库上失败）。
         bind = context.db_session.bind
         if bind is not None and bind.dialect.name == "mssql":
             limit_clause = "OFFSET 0 ROWS FETCH NEXT :lim ROWS ONLY"
@@ -359,9 +350,9 @@ class MemoryRWTool(Tool):
                 oq = json.loads(row.open_questions) if row.open_questions else []
             except (json.JSONDecodeError, TypeError):
                 oq = []
-            # Normalize to UTC ISO: raw SQL bypasses the ORM's UTC-aware
-            # datetime type, so naive values must be re-stamped (SQLite
-            # returns the stored string, SQL Server a naive datetime).
+            # 规范化为 UTC ISO：原始 SQL 绕过 ORM 的 UTC 感知 datetime 类型，因此
+            # 朴素值必须重新盖戳（SQLite 返回存储的字符串，SQL Server 返回朴素
+            # datetime）。
             created = row.created_at
             if created is not None:
                 if isinstance(created, str):
@@ -398,8 +389,8 @@ class MemoryRWTool(Tool):
         if not result.fetchone():
             return {"error": "Memory not found or access denied"}
 
-        # Same secret guard as save — update must not smuggle secrets into
-        # personal memory via the content or tags fields.
+        # 同 save 的密钥守卫——update 不得经 content 或 tags 字段把密钥偷带进个人
+        # 记忆。
         guard_error = self._check_secret_guard(
             params.get("content"), *_coerce_tags(params.get("tags"))
         )
@@ -418,14 +409,13 @@ class MemoryRWTool(Tool):
             return {"error": "Nothing to update — provide content or tags"}
 
         updates.append("updated_at = :now")
-        # Real datetime, not an ISO string (raw text() bypasses UTCDateTime;
-        # asyncpg rejects a str bound to a timestamp parameter).
+        # 真实 datetime 而非 ISO 字符串（原始 text() 绕过 UTCDateTime；asyncpg
+        # 拒绝绑定到时间戳参数的 str）。
         sql_params["now"] = datetime.now(timezone.utc)
 
-        # UPDATE must repeat the ownership predicate from the SELECT
-        # above — between the check and the write, another session could have
-        # deleted this row (leaving a tombstone for a different user's row if
-        # memory_id collided) and a bare WHERE memory_id would touch it.
+        # UPDATE 必须重复上方 SELECT 的所有权谓词——在检查与写入之间，另一个会话
+        # 可能已删除该行（若 memory_id 碰撞，会给不同用户的行留下墓碑），裸的
+        # WHERE memory_id 会碰到它。
         await context.db_session.execute(
             text(
                 f"UPDATE personal_memories SET {', '.join(updates)} "
@@ -459,7 +449,7 @@ class MemoryRWTool(Tool):
         if not result.fetchone():
             return {"error": "Memory not found or access denied"}
 
-        # Same ownership predicate as the SELECT above (see _op_update note).
+        # 同上方 SELECT 的所有权谓词（见 _op_update 说明）。
         await context.db_session.execute(
             text(
                 "UPDATE personal_memories SET is_archived = :archived "

@@ -1,13 +1,11 @@
-"""Skill-source catalog loader — the recommended external skill repositories.
+"""技能来源目录加载器——推荐的外部技能仓库。
 
-The catalog is Markdown with a YAML fenced block (see
-knowledge/_template/skill-sources.md) holding a ``sources:`` list. Same
-permissive contract as _catalog.py: a malformed block is skipped, a missing
-file yields no sources, and the loader never raises.
+目录是 Markdown，带一个 YAML 围栏块（见 knowledge/_template/skill-sources.md），
+内含 ``sources:`` 列表。与 _catalog.py 相同的宽松约定：格式错误的块被跳过，缺失
+文件不产生来源，加载器从不抛异常。
 
-Projects created before this file existed have no project catalog, so the
-framework template is the fallback — otherwise the shipped defaults would only
-reach newly created projects.
+在该文件出现之前创建的项目没有项目目录，因此以框架模板回退——否则内置默认值只会
+到达新创建的项目。
 """
 from __future__ import annotations
 
@@ -30,7 +28,7 @@ TEMPLATE_REL_PATH = "knowledge/_template/skill-sources.md"
 
 
 def _derive_key(entry: dict[str, Any]) -> str:
-    """Best-effort key for an entry that declares none."""
+    """为未声明 key 的条目尽力推导一个 key。"""
     repo = str(entry.get("repo") or "").strip()
     if repo:
         return repo.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git").lower()
@@ -60,8 +58,8 @@ def _normalize_entry(raw: Any) -> dict[str, Any] | None:
         entry["valid"] = False
         entry["error"] = "entry needs either 'repo' (owner/name) or 'url'"
     elif any("<" in (value or "") or ">" in (value or "") for value in (repo, url)):
-        # The template documents the shape with <owner>/<repo> placeholders —
-        # surfacing one as a real source would send the agent to a bogus host.
+        # 模板用 <owner>/<repo> 占位符说明形态——把它当作真实来源会把智能体引到
+        # 伪造主机。
         entry["valid"] = False
         entry["error"] = "placeholder address — replace it with a real repository"
     elif repo and not _REPO_PATH_RE.fullmatch(repo):
@@ -74,14 +72,14 @@ def _normalize_entry(raw: Any) -> dict[str, Any] | None:
 
 
 def _iter_entries(block: Any) -> list[Any]:
-    """Yield raw entries from either the wrapper or the bare form."""
+    """从包装形式或裸形式产出原始条目。"""
     if not isinstance(block, dict):
         return []
     sources = block.get("sources")
     if isinstance(sources, list):
         return sources
     if isinstance(sources, dict):
-        # {sources: {key: {...}}} — the key doubles as the entry key.
+        # {sources: {key: {...}}}——该 key 同时充当条目 key。
         out = []
         for key, value in sources.items():
             if isinstance(value, dict):
@@ -129,11 +127,11 @@ async def _read_catalog(path: Path) -> list[dict[str, Any]] | None:
 
 
 async def load_skill_sources(context: ToolContext) -> dict[str, Any]:
-    """Resolve the catalog: project file first, framework template as fallback.
+    """解析目录：先项目文件，框架模板作为回退。
 
-    Returns ``{catalog_path, origin, sources}`` where ``catalog_path`` is the
-    workspace- or framework-relative path the agent can hand to the filesystem
-    tool, and ``origin`` is ``"project"``/``"template"``/``None``.
+    返回 ``{catalog_path, origin, sources}``，其中 ``catalog_path`` 是智能体可交给
+    文件系统工具的、相对工作区或框架的路径，``origin`` 为
+    ``"project"``/``"template"``/``None``。
     """
     result: dict[str, Any] = {"catalog_path": None, "origin": None, "sources": []}
 

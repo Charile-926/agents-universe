@@ -1,11 +1,11 @@
-"""SSRF protection — validate URLs and resolved IPs before outbound requests.
+"""SSRF 防护——在发出出站请求前校验 URL 与解析出的 IP。
 
-Blocks:
-- Non-http(s) schemes
-- Private/loopback/link-local/multicast/metadata IP ranges (after DNS resolution)
-- Restricted ports
-- Excessive redirects (each hop re-validated)
-- Oversized responses
+拦截：
+- 非 http(s) 协议
+- 私有/环回/链路本地/组播/元数据 IP 段（DNS 解析之后）
+- 受限端口
+- 过多重定向（每一跳都重新校验）
+- 超大响应
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import re
 import socket
 from urllib.parse import urlparse
 
-# AWS/GCP/Azure metadata endpoints
+# AWS/GCP/Azure 元数据端点
 _METADATA_IPS = frozenset({
     "169.254.169.254",
     "fd00:ec2::254",
@@ -23,9 +23,9 @@ _METADATA_IPS = frozenset({
 
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 
-# Frontend dev servers (Vite 5173/4173/5174, others) are legitimate targets
-# for browser/web_fetch tools even with SSRF_ENABLED=false — without them in
-# the allowlist an agent can never open its own dev frontend.
+# 前端开发服务器（Vite 5173/4173/5174 等）是浏览器/web_fetch 工具的合法目标，
+# 即使 SSRF_ENABLED=false 也应放行——不把它们放进白名单，智能体就永远打不开自己的
+# 开发前端。
 _ALLOWED_PORTS = frozenset({80, 443, 8080, 8443, 8000, 3000, 5000, 9090, 5173, 4173, 5174})
 
 _MAX_REDIRECTS = 5
@@ -34,16 +34,16 @@ _MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MB
 
 
 class SSRFError(Exception):
-    """Raised when a URL or resolved IP fails SSRF validation."""
+    """URL 或解析出的 IP 未通过 SSRF 校验时抛出。"""
     pass
 
 
 def _is_ip_blocked(ip_str: str) -> bool:
-    """Check if an IP address belongs to a blocked range."""
+    """判断一个 IP 地址是否属于封禁段。"""
     try:
         addr = ipaddress.ip_address(ip_str)
     except ValueError:
-        return True  # Unparseable = blocked
+        return True  # 无法解析 = 封禁
 
     if addr.is_loopback:
         return True
@@ -57,41 +57,38 @@ def _is_ip_blocked(ip_str: str) -> bool:
         return True
     if addr.is_unspecified:
         return True
-    # Any other non-public range: RFC 6598 shared space (100.64.0.0/10,
-    # including Alibaba Cloud's 100.100.100.200 metadata endpoint) is
-    # neither is_private nor is_link_local, so the checks above miss it.
+    # 其他任何非公开段：RFC 6598 共享地址空间（100.64.0.0/10，含阿里云的
+    # 100.100.100.200 元数据端点）既不是 is_private 也不是 is_link_local，上面的
+    # 检查会漏掉它。
     if not addr.is_global:
         return True
 
-    # IPv4-mapped IPv6 — check the embedded v4
+    # IPv4 映射的 IPv6——检查内嵌的 v4 地址
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
         return _is_ip_blocked(str(addr.ipv4_mapped))
 
-    # Cloud metadata (169.254.169.254)
+    # 云元数据（169.254.169.254）
     if ip_str in _METADATA_IPS:
         return True
 
     return False
 
 
-# Hostname strings glibc's inet_aton maps to real addresses even though
-# ipaddress.ip_address() rejects every one of them since Python 3.9.6:
-# integer ("2130706433" == 127.0.0.1), hex ("0x7f000001"), octal/leading-zero
-# dotted ("010.0.0.1" == 8.0.0.1), abbreviated ("127.1" == 127.0.0.1). A
-# literal-IP guard that only consults ipaddress calls these "hostnames" and
-# lets the request through — glibc's getaddrinfo then connects to the mapped
-# loopback/private/metadata address, defeating the always-on literal check
-# whenever SSRF_ENABLED skips DNS resolution (the default).
+# glibc 的 inet_aton 会映射到真实地址、但从 Python 3.9.6 起 ipaddress.ip_address()
+# 一律拒绝的主机名字符串：整数（"2130706433" == 127.0.0.1）、十六进制
+# （"0x7f000001"）、八进制/前导零点分十进制（"010.0.0.1" == 8.0.0.1）、缩写
+# （"127.1" == 127.0.0.1）。只查 ipaddress 的字面 IP 守卫会把这些当作“主机名”
+# 放行——glibc 的 getaddrinfo 随后连接到映射出的环回/私有/元数据地址，在
+# SSRF_ENABLED 跳过 DNS 解析（默认）时绕过始终开启的字面检查。
 _NUMERIC_HOST_RE = re.compile(r"^[0-9a-fA-FxX.]+$")
 
 
 def _idna_host(host: str) -> str:
-    """ASCII form of *host* under the IDNA codec getaddrinfo applies.
+    """getaddrinfo 所用 IDNA 编码下，*host* 的 ASCII 形式。
 
-    getaddrinfo encodes non-ASCII hostnames with the IDNA codec, which maps
-    the ideographic/fullwidth dot variants to "." and applies NFKC (fullwidth
-    digits become ASCII). Checking the raw string would call "127。0。0。1" a
-    hostname while the resolver connects to loopback.
+    getaddrinfo 用 IDNA 编码非 ASCII 主机名，把表意/全角点变体映射为 "."，并应用
+    NFKC（全角数字变 ASCII）。检查原始字符串会把 "127。0。0。1" 当主机名，而解析器
+    实际连接到环回。
     """
     if host.isascii():
         return host
@@ -102,25 +99,22 @@ def _idna_host(host: str) -> str:
 
 
 def _inet_aton_mapped(host: str) -> str | None:
-    """Dotted quad a numeric *host* resolves to under inet_aton semantics.
+    """在 inet_aton 语义下，数字 *host* 解析成的点分四组地址。
 
-    inet_aton accepts up to four dot-separated components (decimal, octal
-    when leading 0, hex with 0x), the last absorbing the remaining bytes:
-    "127.1" is 127.0.0.1, "2130706433" is 127.0.0.1, "2852039166" is
-    169.254.169.254 (the AWS metadata address). Returns None when *host* is
-    not an inet_aton-accepted form — i.e. a real hostname that DNS resolves
-    on its own.
+    inet_aton 接受最多四个点分成分（十进制、前导 0 时为八进制、带 0x 为十六进制），
+    最后一个吸收剩余字节："127.1" 是 127.0.0.1，"2130706433" 是 127.0.0.1，
+    "2852039166" 是 169.254.169.254（AWS 元数据地址）。当 *host* 不是 inet_aton
+    接受的形式时返回 None——即靠自身 DNS 解析的真实主机名。
     """
     if not host:
         return None
-    # Resolve IDNA dot/digit variants before the numeric-shape check — they
-    # are "unicode hostnames" to a raw scan but plain dotted quads to the
-    # resolver.
+    # 在数字形态检查前先解析 IDNA 点/数字变体——对原始扫描它们是“unicode 主机名”，
+    # 对解析器却是普通点分四组。
     host = _idna_host(host)
     if len(host) > 64 or not _NUMERIC_HOST_RE.match(host):
         return None
     if host.startswith(".") or host.endswith(".") or ".." in host:
-        return None  # inet_aton rejects these; getaddrinfo then fails DNS — inert
+        return None  # inet_aton 拒绝这些；getaddrinfo 随后 DNS 失败——无害
     parts = host.split(".")
     if not 1 <= len(parts) <= 4:
         return None
@@ -134,14 +128,14 @@ def _inet_aton_mapped(host: str) -> str | None:
             else:
                 value = int(part, 10)
         except ValueError:
-            return None  # e.g. "08.0.0.1" — invalid octal, inet_aton fails
+            return None  # 如 "08.0.0.1"——非法八进制，inet_aton 失败
         if value > 0xFFFFFFFF:
             return None
         components.append(value)
     address = 0
     for value in components[:-1]:
         if value > 0xFF:
-            return None  # non-last components are bytes — inet_aton fails
+            return None  # 非末尾成分是字节——inet_aton 失败
         address = (address << 8) | value
     last = components[-1]
     remaining = 4 - (len(components) - 1)
@@ -152,10 +146,10 @@ def _inet_aton_mapped(host: str) -> str | None:
 
 
 def validate_url(url: str, *, allow_any_port: bool = False) -> None:
-    """Validate URL scheme, host, and port BEFORE making a request.
+    """在发出请求前校验 URL 的协议、主机和端口。
 
-    Raises SSRFError if the URL is not safe to fetch.
-    This does NOT resolve DNS — call validate_resolved_ip() after resolution.
+    URL 不可安全抓取时抛出 SSRFError。
+    此处不解析 DNS——解析后请调用 validate_resolved_ip()。
     """
     parsed = urlparse(url)
 
@@ -166,32 +160,30 @@ def validate_url(url: str, *, allow_any_port: bool = False) -> None:
     if not host:
         raise SSRFError("URL has no hostname")
 
-    # Block metadata hostnames. Check the IDNA form too: fullwidth letters
-    # normalize to the ASCII name the resolver actually queries.
+    # 拦截元数据主机名。同时检查 IDNA 形式：全角字母会规范化为解析器实际查询的
+    # ASCII 名称。
     normalized_host = _idna_host(host)
     if host.lower() in _METADATA_IPS or normalized_host.lower() in _METADATA_IPS:
         raise SSRFError(f"Blocked metadata host: {host}")
 
-    # Check if host is a literal IP address
+    # 检查主机是否为字面 IP 地址
     try:
         ipaddress.ip_address(normalized_host)
-        # It IS an IP literal — validate it
+        # 它确实是 IP 字面量——进行校验
         if _is_ip_blocked(normalized_host):
             raise SSRFError(f"Blocked IP in URL: {host}")
     except ValueError:
-        # Not a canonical IP literal — but it may still be an inet_aton
-        # alternate form ipaddress rejects ("2130706433" is 127.0.0.1,
-        # "2852039166" is the AWS metadata address). glibc's getaddrinfo
-        # accepts these, so letting one through is an SSRF bypass whenever
-        # SSRF_ENABLED skips DNS resolution. Map and re-check.
+        # 不是规范的 IP 字面量——但仍可能是 ipaddress 拒绝的 inet_aton 替代形式
+        # （"2130706433" 是 127.0.0.1，"2852039166" 是 AWS 元数据地址）。glibc 的
+        # getaddrinfo 接受这些，因此在 SSRF_ENABLED 跳过 DNS 解析时放行即构成 SSRF
+        # 绕过。映射并重新检查。
         mapped = _inet_aton_mapped(host)
         if mapped is not None and _is_ip_blocked(mapped):
             raise SSRFError(f"Blocked IP in URL: {host} (={mapped})")
 
-    # Port check — `parsed.port` raises ValueError on non-numeric
-    # or out-of-range ports ("http://h:abc/", "http://h:99999/"); callers
-    # catch SSRFError only, so the error escaped the tool and surfaced as a
-    # cryptic exception string. Normalize to the structured error.
+    # 端口检查——`parsed.port` 在非数字或越界端口（"http://h:abc/"、
+    # "http://h:99999/"）时抛 ValueError；调用方只捕获 SSRFError，导致该错误
+    # 逸出工具并以晦涩的异常字符串呈现。规范化为结构化错误。
     try:
         port = parsed.port
     except ValueError as exc:
@@ -201,9 +193,9 @@ def validate_url(url: str, *, allow_any_port: bool = False) -> None:
 
 
 def validate_resolved_ip(ip_str: str, original_url: str = "") -> None:
-    """Validate a resolved IP address. Call after DNS resolution.
+    """校验解析出的 IP 地址。DNS 解析之后调用。
 
-    Raises SSRFError if the IP is in a blocked range.
+    IP 位于封禁段时抛出 SSRFError。
     """
     if _is_ip_blocked(ip_str):
         raise SSRFError(
@@ -213,10 +205,10 @@ def validate_resolved_ip(ip_str: str, original_url: str = "") -> None:
 
 
 def resolve_and_validate(hostname: str, port: int = 443) -> list[str]:
-    """Resolve hostname via DNS and validate all returned IPs.
+    """通过 DNS 解析主机名并校验返回的所有 IP。
 
-    Returns list of safe IP addresses.
-    Raises SSRFError if ALL resolved IPs are blocked, or resolution fails.
+    返回安全 IP 地址列表。
+    所有解析出的 IP 都被封禁，或解析失败时抛出 SSRFError。
     """
     try:
         results = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
@@ -242,5 +234,5 @@ def resolve_and_validate(hostname: str, port: int = 443) -> list[str]:
 
 
 def validate_redirect(new_url: str, *, allow_any_port: bool = False) -> None:
-    """Validate a redirect target URL. Same rules as validate_url."""
+    """校验重定向目标 URL。规则与 validate_url 相同。"""
     validate_url(new_url, allow_any_port=allow_any_port)

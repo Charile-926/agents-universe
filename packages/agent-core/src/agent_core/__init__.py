@@ -1,1 +1,1 @@
-"""Agents Universe — agent-core: LLM orchestration engine."""
+"""Agents Universe —— agent-core：大语言模型编排引擎。"""

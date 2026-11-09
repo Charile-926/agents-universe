@@ -1,4 +1,4 @@
-"""Filesystem tool — read/write/list files within the project scope."""
+"""文件系统工具——在项目范围内读取/写入/列举文件。"""
 from __future__ import annotations
 
 import json
@@ -13,8 +13,8 @@ from .base import Tool, ToolContext
 
 _log = logging.getLogger(__name__)
 
-# Byte caps : reading feeds the LLM context directly (2MB is
-# already huge there); writing is capped to bound disk usage.
+# 字节上限：读取会直接喂给 LLM 上下文（2MB 在那里已经很大）；写入设上限以约束
+# 磁盘占用。
 _MAX_READ_BYTES = 2_000_000
 _MAX_WRITE_BYTES = 5_000_000
 
@@ -22,11 +22,10 @@ _MAX_WRITE_BYTES = 5_000_000
 def _definition_check(
     rel_path: str, content: str, context: ToolContext, scope: str
 ) -> dict[str, Any] | None:
-    """Advisory validation block for a definition file, or None.
+    """定义文件的建议性校验块，非定义文件返回 None。
 
-    Registration of agents/skills/workflows happens later and fails silently,
-    so the writer is the only party that can still fix the file — it gets the
-    verdict with the write result instead of having to guess.
+    智能体/技能/工作流的注册在之后发生且会静默失败，因此写入方是唯一还能修复文件
+    的一方——它随写入结果拿到判定，而不必去猜。
     """
     return check_definition(
         rel_path,
@@ -41,7 +40,7 @@ def _definition_check(
 def _attach_definition_check(
     result: dict[str, Any], rel_path: str, context: ToolContext, scope: str
 ) -> dict[str, Any]:
-    """Attach the advisory block to a read result; reads stay unmodified."""
+    """把建议性校验块附加到读取结果上；读取内容本身保持不变。"""
     content = result.get("content")
     if isinstance(content, str):
         check = _definition_check(rel_path, content, context, scope)
@@ -51,20 +50,20 @@ def _attach_definition_check(
 
 
 def _normalize_rel_path(rel_path: str, project_fs_path: str) -> str:
-    """Strip erroneous absolute or project-prefixed paths to workspace-relative form.
+    """把错误的绝对路径或带项目前缀的路径，剥离为相对工作区的形式。
 
-    Models sometimes output paths like:
-      - /app/projects/slug/tests/...  (container absolute)
-      - projects/slug/tests/...       (repo-relative with project prefix)
-      - slug/tests/...                (bare slug prefix)
-    All should resolve to just: tests/...
+    模型有时会输出这样的路径：
+      - /app/projects/slug/tests/...  （容器内绝对路径）
+      - projects/slug/tests/...       （带项目前缀的相对仓库路径）
+      - slug/tests/...                （裸 slug 前缀）
+    都应解析为：tests/...
     """
     base = Path(project_fs_path).resolve()
     slug = base.name
 
     normalized = rel_path.replace("\\", "/")
 
-    # Strip absolute path prefix matching the workspace (resolved or raw form)
+    # 剥离与工作区匹配的绝对路径前缀（解析形式或原始形式）。
     for prefix in (
         str(base).replace("\\", "/") + "/",
         project_fs_path.replace("\\", "/").rstrip("/") + "/",
@@ -80,16 +79,15 @@ def _normalize_rel_path(rel_path: str, project_fs_path: str) -> str:
 
     normalized = normalized.lstrip("/")
 
-    # Strip "projects/slug/" prefix — only when no real projects/{slug}/
-    # subdirectory exists; the model may legitimately mean that subdir (e.g.
-    # a monorepo checkout inside the workspace).
+    # 剥离 "projects/slug/" 前缀——仅当不存在真实的 projects/{slug}/ 子目录时；
+    # 模型可能确实指该子目录（如工作区内的 monorepo 检出）。
     if not (base / "projects" / slug).is_dir():
         prefix_pattern = re.compile(rf"^projects/{re.escape(slug)}/", re.IGNORECASE)
         normalized = prefix_pattern.sub("", normalized)
 
-    # Strip bare "slug/" prefix — same guard: with a real top-level {slug}/
-    # subdirectory, `web/index.html` means the subdir, not a path prefix to
-    # strip (which would silently read/write/delete the WRONG file).
+    # 剥离裸 "slug/" 前缀——同样的守卫：存在真实的顶层 {slug}/ 子目录时，
+    # `web/index.html` 指该子目录，而不是要剥离的路径前缀（剥离会静默读/写/删错误
+    # 的文件）。
     if normalized.startswith(f"{slug}/") and not (base / slug).is_dir():
         normalized = normalized[len(slug) + 1:]
 
@@ -98,12 +96,12 @@ def _normalize_rel_path(rel_path: str, project_fs_path: str) -> str:
 
 def _read_file(target: Path, rel_path: str) -> dict[str, Any]:
     try:
-        # Byte cap before reading: a huge file would OOM and blow up the LLM
-        # context (mirrors api_request's 5MB cap.
+        # 读取前先做字节上限检查：超大文件会导致 OOM 并撑爆 LLM 上下文（对应
+        # api_request 的 5MB 上限）。
         if target.stat().st_size > _MAX_READ_BYTES:
             return {"error": f"Cannot read {rel_path}: file too large ({target.stat().st_size} bytes > {_MAX_READ_BYTES})"}
-        # BOM (VS Code saves) would stick to the content and break consumers
-        # that expect clean markdown/text.
+        # BOM（VS Code 保存时会带）会粘在内容上，破坏期望干净 markdown/文本的
+        # 消费方。
         content = target.read_text(encoding="utf-8").lstrip("\ufeff")
     except UnicodeDecodeError:
         _log.warning("filesystem read_file: not UTF-8: %s", rel_path)
@@ -133,11 +131,10 @@ def _list_dir(target: Path, rel_path: str) -> dict[str, Any]:
 
 
 def _media_parts(rel_path: str) -> list[str] | None:
-    """Split a .tmp/media/... path into segments, or None if it isn't one.
+    """把 .tmp/media/... 路径拆成各段，不是该路径则返回 None。
 
-    User attachments are never written to disk — they live in the API's
-    in-memory upload store for the duration of the turn. The filesystem
-    tool serves those bytes through ToolContext's optional upload hooks.
+    用户附件从不写入磁盘——它们在本轮期间存在于 API 的内存上传存储中。文件系统
+    工具通过 ToolContext 的可选上传钩子提供这些字节。
     """
     parts = rel_path.replace("\\", "/").split("/")
     if len(parts) < 3 or parts[:2] != [".tmp", "media"]:
@@ -146,7 +143,7 @@ def _media_parts(rel_path: str) -> list[str] | None:
 
 
 def _upload_store_lookup(parts: list[str], context: ToolContext) -> bytes | None:
-    """Bytes for a .tmp/media/{conversation}/{file} path from the store."""
+    """从存储中取出 .tmp/media/{会话}/{文件} 路径对应的字节。"""
     if len(parts) != 4:
         return None
     lookup = getattr(context, "upload_file_lookup", None)
@@ -154,7 +151,7 @@ def _upload_store_lookup(parts: list[str], context: ToolContext) -> bytes | None
 
 
 def _upload_store_names(parts: list[str], context: ToolContext) -> list[str]:
-    """Upload filenames for a .tmp/media/{conversation} directory."""
+    """.tmp/media/{会话} 目录下的上传文件名。"""
     if len(parts) != 3:
         return []
     names = getattr(context, "upload_file_names", None)
@@ -201,24 +198,20 @@ class FilesystemTool(Tool):
         operation = params["operation"]
         rel_path = _normalize_rel_path(params["path"], context.project_fs_path)
 
-        # Writes into .git (hooks, config) install code git executes
-        # unvalidated on later commands or let config repoint hooksPath —
-        # the shell sandbox rejects these targets, the filesystem tool must
-        # too (nested repos: subdir/.git/hooks, submodules:
-        # .git/modules/<name>/hooks). Reads from .git stay allowed.
+        # 写入 .git（钩子、配置）会安装 git 在后续命令中不经校验就执行的代码，或让
+        # 配置重指 hooksPath——shell 沙箱会拒绝这些目标，文件系统工具也必须如此
+        # （嵌套仓库：subdir/.git/hooks；子模块：.git/modules/<name>/hooks）。
+        # 从 .git 读取仍允许。
         if operation in ("write_file", "delete_file", "create_dir"):
             _git_rel = rel_path.replace("\\", "/")
-            # Case-insensitive: on Windows/macOS `.GIT/hooks/x` IS the same
-            # directory as `.git/hooks/x`, so an exact-match check let the
-            # guard be bypassed by casing.
+            # 不区分大小写：在 Windows/macOS 上 `.GIT/hooks/x` 与 `.git/hooks/x`
+            # 是同一目录，因此精确匹配检查会让守卫被大小写绕过。
             if any(part.lower() == ".git" for part in _git_rel.split("/")):
                 return {"error": ".git 目录为只读：hooks/config 会被 git 在后续命令中执行，请写到项目其他位置"}
 
-        # Framework dirs (agents/, workflows/, knowledge/_template/) are read
-        # from the framework root. agents/ and workflows/ are overlay paths:
-        # the project workspace shadows the global copies — reads prefer the
-        # workspace, writes are routed to the workspace. knowledge/_template
-        # stays strictly read-only.
+        # 框架目录（agents/、workflows/、knowledge/_template/）从框架根读取。
+        # agents/ 和 workflows/ 是覆盖路径：项目工作区遮蔽全局副本——读取优先工作区，
+        # 写入路由到工作区。knowledge/_template 严格只读。
         _is_framework_path = (
             rel_path.startswith("agents/")
             or rel_path.startswith("workflows/")
@@ -228,13 +221,12 @@ class FilesystemTool(Tool):
         if _is_framework_path and context.framework_root:
             _is_shadowed = rel_path.startswith("agents/") or rel_path.startswith("workflows/")
             if operation in ("write_file", "delete_file", "create_dir"):
-                # Shadowed writes fall through to the project-scope handling
-                # below (they belong to the workspace, never the framework).
+                # 被遮蔽的写入落到下方的项目范围处理（它们属于工作区，绝不属框架）。
                 if not _is_shadowed:
                     return {"error": f"{rel_path.split('/')[0]}/ directory is read-only"}
             else:
                 if _is_shadowed:
-                    # Reads prefer the project workspace copy when present.
+                    # 读取优先项目工作区副本（若存在）。
                     ws_base = Path(context.project_fs_path).resolve()
                     ws_target = (ws_base / rel_path).resolve()
                     if ws_target.is_relative_to(ws_base) and ws_target.exists():
@@ -247,11 +239,9 @@ class FilesystemTool(Tool):
                     return {"error": f"{rel_path.split('/')[0]}/ directory is read-only"}
                 target = (Path(context.framework_root) / rel_path).resolve()
                 fw_root = Path(context.framework_root).resolve()
-                # Containment must be against the framework DIRECTORY the
-                # path names, not framework_root itself: with PROJECTS_ROOT
-                # nested under it, `agents/../projects/other-slug/.env`
-                # resolved inside framework_root and read a sibling
-                # workspace, defeating the project isolation boundary.
+                # 包含检查必须针对路径所指的框架“目录”，而非 framework_root 本身：
+                # 当 PROJECTS_ROOT 嵌套在其下时，`agents/../projects/other-slug/.env`
+                # 会解析到 framework_root 内部并读取兄弟工作区，破坏项目隔离边界。
                 if rel_path.startswith("knowledge/_template"):
                     scope_root = fw_root / "knowledge" / "_template"
                 else:
@@ -272,15 +262,14 @@ class FilesystemTool(Tool):
                     _read_file(target, rel_path), rel_path, context, "global"
                 )
 
-        # Security: resolve and validate path is within project scope
+        # 安全：解析并校验路径位于项目范围内。
         base = Path(context.project_fs_path).resolve()
         target = (base / rel_path).resolve()
         if not target.is_relative_to(base):
             return {"error": f"Access denied: path {rel_path!r} is outside project scope"}
-        # The raw-path .git guard above is bypassed by a workspace symlink
-        # (hooks -> .git/hooks, preserved by some clones): the literal path
-        # has no .git component, but resolve() follows the link into .git —
-        # re-check the RESOLVED components or the write lands in .git/hooks.
+        # 上面原始路径的 .git 守卫会被工作区符号链接绕过（某些克隆保留了
+        # hooks -> .git/hooks）：字面路径没有 .git 成分，但 resolve() 跟随链接进入
+        # .git——重新检查解析后的各成分，否则写入会落到 .git/hooks。
         if operation in ("write_file", "delete_file", "create_dir"):
             _git_resolved = target.relative_to(base).parts
             if any(part.lower() == ".git" for part in _git_resolved):
@@ -292,9 +281,8 @@ class FilesystemTool(Tool):
                 return _attach_definition_check(
                     _read_file(target, rel_path), rel_path, context, "project"
                 )
-            # User attachments live in the in-memory upload store (never on
-            # disk) — serve those bytes so the agent can re-read full content
-            # when the inline preview was truncated or omitted.
+            # 用户附件存在于内存上传存储中（从不在磁盘上）——提供这些字节，使
+            # 行内预览被截断或省略时，智能体能重新读取完整内容。
             media_parts = _media_parts(rel_path)
             store_data = _upload_store_lookup(media_parts, context) if media_parts else None
             if store_data is not None:
@@ -317,10 +305,9 @@ class FilesystemTool(Tool):
             return hint
 
         elif operation == "write_file":
-            # `null` becomes "" (the key is present so the default never fires
-            # and encode() would raise); other non-strings are JSON-serialized.
-            # `or ""` would have silently truncated the file to empty for
-            # falsy non-strings (0, {}, [], False) — reported as success.
+            # `null` 转为 ""（键存在，所以默认值不会触发，且 encode() 会报错）；其他
+            # 非字符串做 JSON 序列化。若用 `or ""`，会对假值非字符串（0、{}、[]、
+            # False）静默把文件截断为空，却仍上报成功。
             raw_content = params.get("content")
             if raw_content is None:
                 content = ""
@@ -347,8 +334,8 @@ class FilesystemTool(Tool):
                 "path": rel_path,
                 "bytes_written": len(content.encode()),
             }
-            # The file is on disk either way; a failing check means it will not
-            # register, so the caller must rewrite rather than report success.
+            # 无论如何文件都已在磁盘上；校验失败意味着它不会注册，因此调用方必须
+            # 重写，而不是上报成功。
             check = _definition_check(rel_path, content, context, "project")
             if check is not None:
                 result["definition_check"] = check
@@ -370,7 +357,7 @@ class FilesystemTool(Tool):
                         "size_bytes": entry.stat().st_size if entry.is_file() else 0,
                     })
             if store_names:
-                # Merge in-memory uploads into the media dir listing.
+                # 把内存中的上传合并进媒体目录列表。
                 lookup = getattr(context, "upload_file_lookup", None)
                 for name in store_names:
                     data = lookup(name) if lookup else None
@@ -394,8 +381,8 @@ class FilesystemTool(Tool):
             return {"success": True, "deleted": rel_path}
 
         elif operation == "create_dir":
-            # mkdir(exist_ok=True) is a no-op for a directory but raises
-            # FileExistsError when the path is an existing regular file.
+            # mkdir(exist_ok=True) 对已存在的目录是空操作，但当路径是已存在的普通
+            # 文件时会抛 FileExistsError。
             if target.is_file():
                 return {"error": f"Cannot create directory {rel_path}: a file with that name already exists"}
             try:

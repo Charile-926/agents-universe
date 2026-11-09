@@ -1,4 +1,4 @@
-"""Anthropic Claude provider."""
+"""Anthropic Claude 供应方。"""
 from __future__ import annotations
 
 import json
@@ -28,31 +28,28 @@ def _context_window(model: str) -> int:
         "claude-sonnet-4-6",
     )):
         return 1_000_000
-    # Default for remaining models (haiku-4-5 and any legacy/unknown model)
+    # 其余模型（haiku-4-5 及任何旧版/未知模型）的默认值。
     return 200_000
 
 
-# Per-model output ceilings (max_tokens) for the Anthropic Messages API.
-# Agent configs default max_tokens to 128000 (agent.py AgentConfig), which
-# every Anthropic model rejects with HTTP 400 — the API refuses a ceiling
-# above the model's actual output cap. Clamp like the OpenAI provider's
-# _clamp_max_tokens, but model-aware: haiku-class caps at 8k, sonnet-class at
-# 64k, opus-class at 128k. Unrecognized models get sonnet's 64k — the safest
-# ceiling that still fits every known Anthropic family (haiku's 8k would be
-# needlessly restrictive for future models, and 64k exceeds no current cap).
+# Anthropic Messages API 逐模型的输出上限（max_tokens）。Agent 配置默认 max_tokens
+# 为 128000（agent.py 的 AgentConfig），每个 Anthropic 模型都以 HTTP 400 拒绝它——
+# API 不接受高于模型实际输出上限的天花板。像 OpenAI 供应方的 _clamp_max_tokens
+# 一样限制，但按模型区分：haiku 类上限 8k，sonnet 类 64k，opus 类 128k。未识别
+# 模型采用 sonnet 的 64k——这是仍能容纳所有已知 Anthropic 家族的最安全上限
+# （haiku 的 8k 对未来模型会造成不必要的限制，而 64k 不超过任何当前上限）。
 def _max_output_tokens(model: str) -> int:
     m = model.lower()
     if "haiku" in m:
         return 8_192
     if "opus" in m:
         return 128_000
-    # sonnet-class and any unrecognized model.
+    # sonnet 类及任何未识别模型。
     return 64_000
 
 
-# Families whose current-generation API takes the adaptive thinking param.
-# budget_tokens is rejected with HTTP 400 on the 4.6+/5 families — those must
-# never receive it. Kept in sync with _context_window's model list.
+# 当代 API 接受自适应思考参数的家族。4.6+/5 家族会以 HTTP 400 拒绝
+# budget_tokens——绝不能给它们发该参数。与 _context_window 的模型列表保持同步。
 _ADAPTIVE_THINKING_FAMILIES = (
     "claude-fable-5",
     "claude-mythos-5",
@@ -64,12 +61,10 @@ _ADAPTIVE_THINKING_FAMILIES = (
 
 
 def _thinking_rejected(exc: BaseException) -> bool:
-    """True when a request failed because of the `thinking` field itself.
+    """当请求因 `thinking` 字段本身而失败时为真。
 
-    Used for the one-shot retry-without-thinking fallback: corporate gateways
-    (Bedrock-style proxies) may reject the param outright. Only the error
-    text mentioning "thinking" counts — an unrelated 400 must not silently
-    disable thinking.
+    用于一次性的“去掉思考后重试”回退：企业网关（Bedrock 风格代理）可能直接拒绝
+    该参数。只有错误文本提到 "thinking" 才算——无关的 400 绝不能静默关闭思考。
     """
     text = str(exc)
     resp = getattr(exc, "response", None)
@@ -82,24 +77,21 @@ def _thinking_rejected(exc: BaseException) -> bool:
 
 
 def _content_blocks(content: str | list) -> list[dict]:
-    """Normalize an entry's content field into a block list."""
+    """把一个条目的内容字段规范化为块列表。"""
     if isinstance(content, str):
         return [{"type": "text", "text": content}] if content else []
     return list(content)
 
 
 def _merge_same_role_turns(out: list[dict]) -> list[dict]:
-    """Fold adjacent turns of one role together.
+    """把相邻的同角色轮次折叠到一起。
 
-    The direct Messages API combines consecutive same-role turns, but
-    Bedrock-style gateways reject the request outright ("roles must
-    alternate between user and assistant"). Agent histories do produce
-    them: several injections dequeued at one step boundary, an injection
-    consumed right after a tool-results turn, a delegated child's persisted
-    reply replayed ahead of its parent's on the next turn, and a pause_turn
-    continuation appended after the paused assistant turn. Tool results
-    already lead their user turn, so appended text lands after them as the
-    API expects.
+    直连 Messages API 会合并连续的同角色轮次，但 Bedrock 风格网关会直接拒绝请求
+    （"roles must alternate between user and assistant"）。Agent 历史确实会产生
+    这种轮次：在一个步骤边界出队的多个注入、紧接工具结果轮次之后被消费的注入、
+    下一轮被重放到其父轮次之前的委派子智能体持久化回复，以及追加在暂停的助手轮次
+    之后的 pause_turn 续接。工具结果已经位于其用户轮次开头，因此追加的文本按 API
+    预期落在它们之后。
     """
     merged: list[dict] = []
     for entry in out:
@@ -109,7 +101,7 @@ def _merge_same_role_turns(out: list[dict]) -> list[dict]:
         prev = merged[-1]
         blocks = _content_blocks(entry["content"])
         if entry["role"] == "assistant":
-            # Signed thinking blocks must lead the assistant turn's content.
+            # 带签名的思考块必须位于助手轮次内容的开头。
             thinking = [b for b in blocks if b.get("type") == "thinking"]
             other = [b for b in blocks if b.get("type") != "thinking"]
             prev["content"] = thinking + _content_blocks(prev["content"]) + other
@@ -119,29 +111,26 @@ def _merge_same_role_turns(out: list[dict]) -> list[dict]:
 
 
 class AnthropicClaudeProvider(LLMProvider):
-    """Anthropic Claude via the anthropic SDK (direct) or raw httpx (gateway).
+    """通过 anthropic SDK（直连）或原生 httpx（网关）调用 Anthropic Claude。
 
-    For direct Anthropic API: pass a standard api_key (sk-ant-...).
-    For Bedrock-compatible corporate gateways: pass api_key as the Bearer token
-    and base_url pointing to the gateway — uses raw httpx (no botocore).
+    直连 Anthropic API：传入标准 api_key（sk-ant-...）。
+    对接 Bedrock 兼容的企业网关：把 api_key 作为 Bearer 令牌传入，base_url 指向
+    网关——使用原生 httpx（不依赖 botocore）。
     """
 
     def __init__(self, api_key: str, model: str = "claude-sonnet-4-6", base_url: str | None = None, ssl_verify: bool = False, url_mode: str = "base_url", context_window: int | None = None, thinking_enabled: bool | None = None, reasoning_effort: str | None = None) -> None:
         self._model = model
         self._url_mode = url_mode
-        # Extended thinking switch: explicit per-config override wins, else
-        # AGENT_EXTENDED_THINKING (default on). Also flipped off for the
-        # instance lifetime when a gateway rejects the param with a
-        # thinking-related 400. reasoning_effort is OpenAI-only — accepted so
-        # the provider-agnostic cred dict never TypeErrors a turn.
+        # 扩展思考开关：显式的逐配置覆盖优先，否则取 AGENT_EXTENDED_THINKING
+        # （默认开启）。当网关以与思考相关的 400 拒绝该参数时，也会在本实例
+        # 生命周期内关闭它。reasoning_effort 仅 OpenAI 使用——这里接受它，使
+        # 与供应方无关的凭证字典绝不会让某轮 TypeError。
         self._thinking_enabled = thinking_enabled if thinking_enabled is not None else thinking_enabled_by_env()
-        # Per-config override from Settings → AI Models; None = name-matched default.
+        # 来自“设置 → AI 模型”的逐配置覆盖；None = 名称匹配默认值。
         self._context_window_override = context_window
-        # Exact host comparison, not substring: a gateway whose domain merely
-        # CONTAINS "api.anthropic.com" (e.g. api.anthropic.com.evil.example)
-        # must not be misdetected as the official API and forced down the
-        # AsyncAnthropic SDK path with its different timeout/header behavior
-        # .
+        # 用精确主机比较，而非子串：域名仅仅“包含” api.anthropic.com 的网关
+        # （如 api.anthropic.com.evil.example）不能被误判为官方 API，从而被迫走
+        # 超时/头行为不同的 AsyncAnthropic SDK 路径。
         from urllib.parse import urlparse
         _host = urlparse(base_url).hostname if base_url else None
         self._is_gateway = bool(_host and _host.lower() != "api.anthropic.com")
@@ -149,22 +138,22 @@ class AnthropicClaudeProvider(LLMProvider):
         self._base_url = (base_url or "").rstrip("/")
 
         if self._is_gateway:
-            # Phased timeout: read must survive large-prompt time-to-first-
-            # token; a plain 120s scalar also capped write-heavy bodies.
+            # 分阶段超时：读取必须撑过大提示词的首 token 等待；普通 120 秒标量
+            # 还会限制写入密集的请求体。
             self._http = httpx.AsyncClient(
                 verify=ssl_verify,
                 timeout=httpx.Timeout(300.0, connect=10.0, write=120.0, pool=60.0),
             )
         else:
             import os
-            # The Anthropic SDK swapped its HTTP transport from httpx to httpx2
-            # in 1.0: a 1.x AsyncAnthropic passed an httpx.AsyncClient raises
-            # TypeError("Expected an instance of httpx2.AsyncClient ..."). Pick
-            # the transport that matches the installed SDK so a current SDK
-            # (CI installs anthropic 1.2) and an older 0.x both keep working.
+            # Anthropic SDK 在 1.0 把 HTTP 传输从 httpx 换成了 httpx2：给 1.x
+            # AsyncAnthropic 传入 httpx.AsyncClient 会抛
+            # TypeError("Expected an instance of httpx2.AsyncClient ...")。
+            # 选择与已安装 SDK 匹配的传输，使当前 SDK（CI 安装 anthropic 1.2）
+            # 和较旧的 0.x 都能继续工作。
             try:
                 import httpx2
-            except ImportError:  # pre-mcp2 environments have no httpx2 package
+            except ImportError:  # mcp2 之前的环境没有 httpx2 包
                 httpx2 = None
             try:
                 _pairs = (getattr(anthropic, "__version__", "0") or "0").split(".")[:2]
@@ -176,7 +165,7 @@ class AnthropicClaudeProvider(LLMProvider):
                 verify=ssl_verify,
                 timeout=_http_lib.Timeout(300.0, connect=10.0, write=120.0, pool=60.0),
             )
-            # Keep a reference so close() can release it even if SDK init fails
+            # 保留一个引用，使即使 SDK 初始化失败，close() 也能释放它。
             self._http = http_client
             kwargs: dict = {"api_key": api_key, "http_client": http_client, "max_retries": 1}
             if base_url:
@@ -186,7 +175,7 @@ class AnthropicClaudeProvider(LLMProvider):
             try:
                 self._client = anthropic.AsyncAnthropic(**kwargs)
             except Exception:
-                # Can't await in __init__ — schedule the close if a loop is running
+                # __init__ 里无法 await——若有事件循环在运行，则调度关闭。
                 import asyncio
                 try:
                     asyncio.get_running_loop().create_task(http_client.aclose())
@@ -213,18 +202,15 @@ class AnthropicClaudeProvider(LLMProvider):
         return True
 
     def _thinking_param(self, max_tokens: int) -> dict | None:
-        """Request body `thinking` field for this model, or None when off.
+        """本模型请求体的 `thinking` 字段，关闭时为 None。
 
-        - 4.6+/5 families take the adaptive shape. `display: "summarized"` is
-          load-bearing: the default display is "omitted" on Fable/Mythos/
-          Opus 5/Sonnet 5, which streams EMPTY thinking deltas — without it
-          the whole thinking UI silently does nothing.
-        - haiku-4-5 and older take the legacy budget_tokens shape
-          (>=1024 and strictly < max_tokens; never sent to 4.6+/5 — those
-          400 on it).
-        - Unknown Claude names default to adaptive, the safest against a
-          budget-400; a gateway that predates adaptive is covered by the
-          retry-without-thinking fallback.
+        - 4.6+/5 家族采用自适应形态。`display: "summarized"` 是关键：Fable/
+          Mythos/Opus 5/Sonnet 5 上默认 display 为 "omitted"，会流式输出空的
+          思考增量——没有它，整个思考界面会静默毫无反应。
+        - haiku-4-5 及更旧模型采用旧版 budget_tokens 形态（>=1024 且严格小于
+          max_tokens；绝不发给 4.6+/5——它们会对此报 400）。
+        - 未知的 Claude 名称默认采用自适应，这是对 budget 400 最安全的选择；
+          早于自适应的网关由“去掉思考后重试”回退覆盖。
         """
         if not self._thinking_enabled:
             return None
@@ -234,13 +220,13 @@ class AnthropicClaudeProvider(LLMProvider):
         if "haiku" in m:
             budget = min(4096, max_tokens - 1024)
             if budget < 1024:
-                # max_tokens too small to fit a valid budget — skip thinking.
+                # max_tokens 太小，放不下合法预算——跳过思考。
                 return None
             return {"type": "enabled", "budget_tokens": budget}
         return {"type": "adaptive", "display": "summarized"}
 
     def _disable_thinking(self, reason: str) -> None:
-        """Turn thinking off for the rest of this provider instance's life."""
+        """在本供应方实例的剩余生命周期内关闭思考。"""
         if self._thinking_enabled:
             self._thinking_enabled = False
             import logging
@@ -249,7 +235,7 @@ class AnthropicClaudeProvider(LLMProvider):
             )
 
     def _to_anthropic_messages(self, messages: list[Message]) -> tuple[str | None, list[dict]]:
-        """Convert to Anthropic format. Returns (system_prompt, messages)."""
+        """转换为 Anthropic 格式。返回（系统提示词, 消息列表）。"""
         system = None
         out: list[dict] = []
         for msg in messages:
@@ -261,11 +247,9 @@ class AnthropicClaudeProvider(LLMProvider):
                     "tool_use_id": msg.tool_call_id,
                     "content": msg.content if isinstance(msg.content, str) else json.dumps(msg.content),
                 }
-                # parallel tool calls produce consecutive tool
-                # messages. Each must not become its own user turn — the API
-                # rejects consecutive user messages ("roles must alternate").
-                # Merge into the previous user message when it holds only
-                # tool_result parts.
+                # 并行工具调用会产生连续的工具消息。每个都不能变成独立的用户轮次
+                # ——API 拒绝连续的用户消息（"roles must alternate"）。当前一条用户
+                # 消息只含 tool_result 部分时，合并进它。
                 if (
                     out
                     and out[-1]["role"] == "user"
@@ -277,21 +261,18 @@ class AnthropicClaudeProvider(LLMProvider):
                     out.append({"role": "user", "content": [block]})
             elif msg.role == "assistant" and msg.tool_calls:
                 content = []
-                # Signed thinking blocks must be replayed first when the
-                # assistant turn carries tool_use and thinking is enabled.
-                # Only in-memory (same-turn) blocks reach here — signatures
-                # are never persisted, so compressed history can't carry a
-                # stale block that would 400.
+                # 当助手轮次携带 tool_use 且思考开启时，带签名的思考块必须先回放。
+                # 只有内存中的（同轮）块能到达这里——签名从不持久化，因此压缩历史
+                # 无法携带会导致 400 的过期块。
                 for blk in msg.thinking_blocks or []:
                     if blk.get("signature"):
                         content.append(blk)
                 if msg.content:
                     content.append({"type": "text", "text": msg.content})
                 for tc in msg.tool_calls:
-                    # truncated tool calls (stream cut off at
-                    # max_tokens) can carry invalid arguments JSON; a throw
-                    # here aborts the whole replay. Mirror agent.py's guard:
-                    # fall back to {} so the API call still goes out.
+                    # 被截断的工具调用（流式在 max_tokens 处中断）可能携带非法的
+                    # 参数 JSON；这里抛错会中止整个回放。镜像 agent.py 的守卫：
+                    # 退化为 {}，使 API 调用仍能发出。
                     try:
                         input_args = json.loads(tc["function"]["arguments"])
                     except (json.JSONDecodeError, TypeError, ValueError):
@@ -319,9 +300,8 @@ class AnthropicClaudeProvider(LLMProvider):
                         content.append({"type": "text", "text": part.get("text", "")})
                 out.append({"role": msg.role, "content": content})
             else:
-                # Plain assistant text with in-memory thinking blocks: the
-                # API wants a block list (thinking first, then text) — a
-                # bare string would drop the blocks.
+                # 带内存思考块的普通助手文本：API 要求块列表（思考在前，文本在后）
+                # ——裸字符串会丢弃这些块。
                 blocks = [b for b in (msg.thinking_blocks or []) if b.get("signature")]
                 if msg.role == "assistant" and blocks:
                     content: list[dict] = list(blocks)
@@ -350,8 +330,7 @@ class AnthropicClaudeProvider(LLMProvider):
             if block.type == "text":
                 text_parts.append(block.text)
             elif block.type == "thinking":
-                # Unsigned blocks are display-only and must never be
-                # replayed back to the API.
+                # 无签名块仅供展示，绝不能回放到 API。
                 sig = getattr(block, "signature", None)
                 if sig:
                     thinking_blocks.append({
@@ -387,7 +366,7 @@ class AnthropicClaudeProvider(LLMProvider):
         )
 
     def _parse_raw_response(self, data: dict) -> CompletionResult:
-        """Parse a raw JSON response from the gateway (same schema as Anthropic Messages API)."""
+        """解析网关返回的原始 JSON 响应（与 Anthropic Messages API 同 schema）。"""
         text_parts = []
         tool_calls = []
         thinking_blocks = []
@@ -430,7 +409,7 @@ class AnthropicClaudeProvider(LLMProvider):
             stop_reason=StopReason.from_anthropic(raw_stop),
         )
 
-    # ─── Gateway (raw httpx, no botocore) ─────────────────────────────────
+    # ─── 网关（原生 httpx，不依赖 botocore）──────────────────────────────
 
     def _gateway_headers(self) -> dict[str, str]:
         return {
@@ -457,10 +436,9 @@ class AnthropicClaudeProvider(LLMProvider):
         if thinking_param:
             payload["thinking"] = thinking_param
         else:
-            # The Messages API rejects any temperature other than 1 while
-            # thinking is enabled. Omitting the field keeps the API default
-            # (1); sending the agent's 0.0 would 400 every call and trip the
-            # retry-without-thinking fallback, silently disabling thinking.
+            # 思考开启时，Messages API 拒绝除 1 以外的任何 temperature。省略该字段
+            # 保留 API 默认值（1）；发送 Agent 的 0.0 会让每次调用都报 400，触发
+            # “去掉思考后重试”回退，从而静默关闭思考。
             payload["temperature"] = temperature
         return payload
 
@@ -477,10 +455,9 @@ class AnthropicClaudeProvider(LLMProvider):
             resp = await self._http.post(url, headers=self._gateway_headers(), json=payload)
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            # Gateway rejected the thinking field — retry once without it.
-            # Only a 400 can mean "parameter invalid"; retrying a 429/5xx
-            # body that merely mentions thinking doubles the pressure and
-            # silently disables thinking for the rest of the turn.
+            # 网关拒绝了思考字段——去掉它重试一次。只有 400 才可能表示“参数
+            # 非法”；对仅提到 thinking 的 429/5xx 响应体重试会加倍压力，并在本轮
+            # 剩余时间静默关闭思考。
             if (
                 thinking and "thinking" in payload
                 and exc.response.status_code == 400
@@ -495,11 +472,10 @@ class AnthropicClaudeProvider(LLMProvider):
 
     @staticmethod
     def _completion_to_chunks(result: CompletionResult) -> list[StreamChunk]:
-        """Chunks for a non-streaming result replayed through the stream API.
+        """非流式结果经流式接口回放时所用的数据块。
 
-        Thinking text + signature go out first so the agent loop can both
-        display them and keep the signed block for the next tool-loop
-        request.
+        思考文本和签名先发出，使 Agent 循环既能展示它们，又能为下一次工具循环
+        请求保留带签名的块。
         """
         chunks: list[StreamChunk] = []
         for blk in result.message.thinking_blocks or []:
@@ -514,10 +490,9 @@ class AnthropicClaudeProvider(LLMProvider):
                     "index": i, "id": tc["id"],
                     "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]},
                 }))
-        # stop_reason must ride along: the agent loop keys off the normalized
-        # field, so dropping it here made refusal / context-exceeded /
-        # max-tokens endings degrade to a silent normal completion on the
-        # non-streaming gateway fallback.
+        # stop_reason 必须随附：Agent 循环以规范化字段为判断依据，因此在这里丢弃
+        # 它，会让拒绝/上下文超限/达到 max_tokens 的结尾在非流式网关回退中退化为
+        # 静默的普通补全。
         chunks.append(StreamChunk(
             finish_reason=result.finish_reason,
             stop_reason=result.stop_reason,
@@ -529,7 +504,7 @@ class AnthropicClaudeProvider(LLMProvider):
         self, messages: list[Message], tools: list[ToolDefinition] | None,
         max_tokens: int, temperature: float, thinking: bool = True,
     ) -> AsyncIterator[StreamChunk]:
-        """Stream from the gateway. Tries SSE streaming first, falls back to non-streaming."""
+        """从网关流式获取。先尝试 SSE 流式，失败则退化为非流式。"""
         if self._url_mode == "full_url":
             url = self._base_url
             payload = self._gateway_payload(messages, tools, max_tokens, temperature, thinking=thinking)
@@ -542,15 +517,15 @@ class AnthropicClaudeProvider(LLMProvider):
         try:
             async with self._http.stream("POST", url, headers=headers, json=payload) as resp:
                 if resp.status_code == 404:
-                    # Gateway doesn't support streaming endpoint — fall back
+                    # 网关不支持流式端点——退化为非流式。
                     result = await self._gateway_complete(messages, tools, max_tokens, temperature, thinking=thinking)
                     for chunk in self._completion_to_chunks(result):
                         yield chunk
                     return
 
                 if resp.status_code >= 400:
-                    # Read the body first so the thinking-rejection check can
-                    # inspect it; raise_for_status alone loses the text.
+                    # 先读取响应体，使思考拒绝检查能检查它；仅 raise_for_status
+                    # 会丢失文本。
                     await resp.aread()
                     if (
                         thinking and "thinking" in payload
@@ -573,7 +548,7 @@ class AnthropicClaudeProvider(LLMProvider):
                     async for chunk in self._parse_sse(resp):
                         yield chunk
                 else:
-                    # Not SSE — read the full body and parse as JSON
+                    # 不是 SSE——读取完整响应体并按 JSON 解析。
                     body = b""
                     async for raw in resp.aiter_bytes():
                         body += raw
@@ -583,10 +558,8 @@ class AnthropicClaudeProvider(LLMProvider):
                         yield chunk
 
         except httpx.HTTPStatusError as exc:
-            # Fall back only when the gateway rejects the streaming ENDPOINT
-            # (missing or unsupported). Re-issuing the same payload
-            # non-streaming on a 429/401/400 doubles rate-limit pressure and
-            # swaps the original status for the fallback's failure.
+            # 只在网关拒绝流式端点（缺失或不支持）时回退。在 429/401/400 时
+            # 以非流式重新发送相同载荷会加倍限流压力，并用回退的失败替换原始状态。
             if exc.response.status_code not in (404, 405, 501):
                 raise
             result = await self._gateway_complete(messages, tools, max_tokens, temperature, thinking=thinking)
@@ -594,7 +567,7 @@ class AnthropicClaudeProvider(LLMProvider):
                 yield chunk
 
     async def _parse_sse(self, resp: httpx.Response) -> AsyncIterator[StreamChunk]:
-        """Parse Server-Sent Events from the gateway streaming response."""
+        """解析网关流式响应中的服务器发送事件（SSE）。"""
         input_tokens = 0
         tool_call_ids: dict[int, str] = {}
 
@@ -602,10 +575,9 @@ class AnthropicClaudeProvider(LLMProvider):
             line = line.strip()
             if not line:
                 continue
-            # SSE spec allows both "data: <payload>" and "data:<payload>";
-            # some gateways/nginx configs emit the latter — matching only the
-            # spaced form would silently swallow the whole stream (empty reply,
-            # no error).
+            # SSE 规范允许 "data: <payload>" 和 "data:<payload>" 两种形式；某些
+            # 网关/nginx 配置会发出后者——只匹配带空格的形式会静默吞掉整个流
+            # （空回复，无错误）。
             if line.startswith("data:"):
                 data_str = line[5:].strip()
                 if data_str == "[DONE]":
@@ -664,16 +636,15 @@ class AnthropicClaudeProvider(LLMProvider):
                     )
 
                 elif event_type == "error":
-                    # The direct SDK raises on mid-stream error events; the
-                    # gateway path must too. Silently returning here ended the
-                    # turn as a normal END_TURN with a truncated reply.
+                    # 直连 SDK 会对流式中途的错误事件抛出；网关路径也必须如此。
+                    # 在这里静默返回会把本轮以截断回复的普通 END_TURN 结束。
                     err = event.get("error") or {}
                     raise RuntimeError(
                         "Anthropic gateway stream error: "
                         f"{err.get('type') or 'error'}: {err.get('message') or 'no message'}"
                     )
 
-    # ─── Lifecycle ────────────────────────────────────────────────────────
+    # ─── 生命周期 ────────────────────────────────────────────────────────
 
     async def close(self) -> None:
         if self._is_gateway:
@@ -681,7 +652,7 @@ class AnthropicClaudeProvider(LLMProvider):
         else:
             await self._client.close()
 
-    # ─── Public API ───────────────────────────────────────────────────────
+    # ─── 公开 API ───────────────────────────────────────────────────────
 
     def _request_kwargs(
         self, messages: list[Message], tools: list[ToolDefinition] | None,
@@ -702,8 +673,8 @@ class AnthropicClaudeProvider(LLMProvider):
         if thinking_param:
             kwargs["thinking"] = thinking_param
         else:
-            # Any temperature other than 1 is rejected while thinking is on;
-            # the API default is 1, so omit the field in that case.
+            # 思考开启时，除 1 以外的任何 temperature 都会被拒绝；API 默认值是 1，
+            # 因此这种情况下省略该字段。
             kwargs["temperature"] = temperature
         return kwargs
 
@@ -721,12 +692,11 @@ class AnthropicClaudeProvider(LLMProvider):
         try:
             response = await self._client.messages.create(**kwargs)
         except Exception as exc:
-            # Gateway/proxy rejected the thinking field — retry once without.
+            # 网关/代理拒绝了思考字段——去掉它重试一次。
             if "thinking" in kwargs and _thinking_rejected(exc):
                 self._disable_thinking(f"request rejected thinking param: {exc}")
                 kwargs.pop("thinking", None)
-                # The retry dropped the thinking param, so the temperature
-                # that was omitted for it can go back in.
+                # 重试去掉了思考参数，因此为它省略的 temperature 可以加回来。
                 kwargs.setdefault("temperature", temperature)
                 response = await self._client.messages.create(**kwargs)
             else:
@@ -776,9 +746,8 @@ class AnthropicClaudeProvider(LLMProvider):
                             elif event.type == "content_block_delta":
                                 delta = event.delta
                                 if getattr(delta, "type", None) == "thinking" or hasattr(delta, "thinking"):
-                                    # ThinkingDelta has .thinking, not .text —
-                                    # check it before the text branch would
-                                    # silently drop it.
+                                    # ThinkingDelta 有 .thinking 而非 .text——在
+                                    # 文本分支会静默丢弃它之前先检查。
                                     yield StreamChunk(thinking=delta.thinking)
                                     emitted = True
                                 elif getattr(delta, "type", None) == "signature" or hasattr(delta, "signature"):
@@ -811,16 +780,14 @@ class AnthropicClaudeProvider(LLMProvider):
                                 emitted = True
                 return
             except Exception as exc:
-                # The 400 surfaces when the stream context opens (before any
-                # event) — once chunks are out we must not restart the stream
-                # or the client would see duplicated content.
+                # 400 在流式上下文打开时（任何事件之前）浮现——一旦数据块已发出，
+                # 就不能重启流，否则客户端会看到重复内容。
                 if not emitted and "thinking" in kwargs and _thinking_rejected(exc):
                     self._disable_thinking(f"stream rejected thinking param: {exc}")
                     kwargs.pop("thinking", None)
-                    # The retry dropped the thinking param, so the temperature
-                    # that was omitted for it can go back in — mirrors the
-                    # complete() fallback; without it the retried request runs
-                    # at the API default 1.0 instead of the configured value.
+                    # 重试去掉了思考参数，因此为它省略的 temperature 可以加回来
+                    # ——与 complete() 回退对应；否则重试请求会以 API 默认 1.0
+                    # 而非配置值运行。
                     kwargs.setdefault("temperature", temperature)
                     continue
                 raise

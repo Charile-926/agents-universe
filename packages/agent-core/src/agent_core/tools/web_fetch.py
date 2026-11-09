@@ -1,4 +1,4 @@
-"""Web fetch tool — retrieve content from URLs with SSRF protection."""
+"""网页抓取工具——带 SSRF 防护地从 URL 取回内容。"""
 from __future__ import annotations
 
 import logging
@@ -36,11 +36,10 @@ class WebFetchTool(Tool):
         if not isinstance(url, str) or not url.startswith(("http://", "https://")):
             return {"error": "Invalid URL: must start with http:// or https://"}
 
-        # LLM-supplied params are strings far more often than the
-        # schema implies ("30", "50000"). A string timeout hit httpx.Timeout
-        # with a TypeError that escaped the RequestError handlers, and a
-        # string max_chars crashed the slice. Clamp both like shell does
-        # (timeout 1-120s; max_chars 1-200k).
+        # LLM 提供的参数远比模式暗示的更常是字符串（"30"、"50000"）。字符串超时
+        # 以逃过 RequestError 处理器的 TypeError 撞上 httpx.Timeout，字符串
+        # max_chars 则让切片崩溃。像 shell 一样钳制两者（超时 1-120 秒；
+        # max_chars 1-20 万）。
         try:
             timeout = int(params.get("timeout_seconds", 30))
         except (TypeError, ValueError):
@@ -52,9 +51,9 @@ class WebFetchTool(Tool):
             max_chars = 50000
         max_chars = max(1, min(max_chars, 200_000))
 
-        # SSRF: validate initial URL. validate_url is the always-on literal
-        # check (scheme/host/IP/port/metadata); validate_outbound_url adds DNS
-        # resolution checks behind the SSRF_ENABLED env gate.
+        # SSRF：校验初始 URL。validate_url 是始终开启的字面检查（方案/主机/IP/
+        # 端口/元数据）；validate_outbound_url 在 SSRF_ENABLED 环境门后加 DNS 解析
+        # 检查。
         try:
             validate_url(url)
             validate_outbound_url(url)
@@ -64,7 +63,7 @@ class WebFetchTool(Tool):
         http = ensure_http_client(context, target_url=url)
 
         try:
-            # Manual redirect loop — re-validate each hop
+            # 手动重定向循环——每一跳重新校验
             current_url = url
             redirects = 0
 
@@ -85,7 +84,7 @@ class WebFetchTool(Tool):
                         if not location:
                             return {"error": "Redirect with no Location header"}
 
-                        # Resolve relative redirects (path-relative, query-only, protocol-relative)
+                        # 解析相对重定向（路径相对、仅查询、协议相对）
                         from urllib.parse import urljoin, urlparse
                         resolved_location = urljoin(current_url, location)
                         parsed = urlparse(resolved_location)
@@ -93,7 +92,7 @@ class WebFetchTool(Tool):
                             return {"error": f"Blocked redirect to non-http URL: {location}"}
                         location = resolved_location
 
-                        # SSRF: validate redirect target
+                        # SSRF：校验重定向目标
                         try:
                             validate_redirect(location)
                             validate_outbound_url(location)
@@ -103,10 +102,9 @@ class WebFetchTool(Tool):
                         current_url = location
                         continue
 
-                    # Non-redirect response — read body with a hard size limit.
-                    # content-length is only a fast-path pre-check; chunked or
-                    # absent-length bodies are enforced by streaming and aborting
-                    # past _MAX_RESPONSE_BYTES instead of buffering them whole.
+                    # 非重定向响应——以硬性大小限制读取正文。content-length 只是
+                    # 快速路径预检；分块或无长度正文通过流式读取并在超过
+                    # _MAX_RESPONSE_BYTES 时中止来强制，而非整体缓冲。
                     content_length = response.headers.get("content-length")
                     try:
                         clen = int(content_length) if content_length else 0

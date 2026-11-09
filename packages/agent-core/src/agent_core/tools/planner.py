@@ -1,4 +1,4 @@
-"""Planner tool — generate a structured task list for complex goals."""
+"""规划器工具——为复杂目标生成结构化任务清单。"""
 from __future__ import annotations
 
 import json
@@ -9,8 +9,8 @@ from .base import Tool, ToolContext
 
 
 class PlannerTool(Tool):
-    """Generates a structured task list. The agent-core loop intercepts this tool call
-    to switch into Task mode — it doesn't call an external service."""
+    """生成结构化任务清单。agent-core 主循环拦截该工具调用以切换到任务模式——
+    它不调用外部服务。"""
 
     name = "plan_task"
     prompt_hint = (
@@ -62,16 +62,14 @@ class PlannerTool(Tool):
 
     async def execute(self, params: dict[str, Any], context: ToolContext) -> dict[str, Any]:
         tasks = params.get("tasks", [])
-        # The schema declares an array of objects, but models also emit a bare
-        # string or a list of strings; .get() on those raises AttributeError,
-        # which reaches the model as an opaque crash instead of something it
-        # can correct.
+        # 模式声明的是对象数组，但模型也可能发出裸字符串或字符串列表；对这些调用
+        # .get() 会抛 AttributeError，以不透明的崩溃而非模型可纠正的信息到达模型。
         if not isinstance(tasks, list):
             return {"error": "tasks must be an array of task objects"}
         for task in tasks:
             if not isinstance(task, dict):
                 return {"error": f"each task must be an object, got {type(task).__name__}"}
-        # Assign stable IDs if not provided
+        # 未提供 ID 时分配稳定 ID
         for task in tasks:
             if not task.get("id"):
                 task["id"] = f"t{uuid.uuid4().hex[:6]}"

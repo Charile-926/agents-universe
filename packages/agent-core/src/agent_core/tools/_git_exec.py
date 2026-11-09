@@ -1,10 +1,8 @@
-"""Shared git subprocess runner for the git-backed tools.
+"""git 系工具共享的 git 子进程运行器。
 
-Extracted from git_repo so that every tool shelling out to git — including the
-ones talking to remotes outside the configured host (skill_source) — goes
-through one hardened path: credential injection via a temp askpass helper,
-kill-on-timeout, output sanitization/truncation, and an environment with the
-server's own credentials stripped.
+从 git_repo 抽出，使每个调用 git 的工具——包括与配置主机之外远程通信的工具
+（skill_source）——都走同一条加固路径：经临时 askpass 助手注入凭证、超时即杀、
+输出清洗/截断，以及剥离服务器自身凭证的环境。
 """
 from __future__ import annotations
 
@@ -58,12 +56,11 @@ def _sanitize_output(text: str, token: str | None) -> str:
 
 
 def _rmtree_force(path: Path) -> None:
-    """Remove a directory tree, clearing read-only attributes first on win32.
+    """删除目录树，win32 上先清除只读属性。
 
-    git loose objects are created with the read-only attribute on Windows, and
-    shutil.rmtree then fails with WinError 5 on them (the clone rollback masks
-    this with ignore_errors). Clear the attribute everywhere first so a genuine
-    failure (e.g. an antivirus file lock) still surfaces as remove_failed.
+    Windows 上 git 的松散对象以只读属性创建，shutil.rmtree 随后对它们报
+    WinError 5 失败（克隆回滚用 ignore_errors 掩盖了这点）。先在所有位置清除
+    属性，使真实失败（如杀毒软件文件锁）仍能作为 remove_failed 浮现。
     """
     if sys.platform == "win32":
         for root, _dirs, files in os.walk(path):
@@ -76,14 +73,13 @@ def _rmtree_force(path: Path) -> None:
 
 
 def _safe_git_env() -> dict[str, str]:
-    """os.environ with credential-like keys stripped for the git subprocess.
+    """为 git 子进程剥离类凭证键后的 os.environ。
 
-    Git hooks (post-commit, pre-push, ...) execute with this environment, so
-    DB passwords / API keys in the server env must not reach them. Mirrors
-    ToolContext.safe_env() filtering; GIT_ASKPASS_TOKEN is re-added by the
-    caller after filtering. Proxy spellings are normalized afterwards (in
-    run_git's default path) — git's libcurl reads ALL_PROXY and chokes on
-    empty placeholders, exactly what apply_proxy_env scrubs.
+    Git 钩子（post-commit、pre-push 等）以该环境执行，因此服务器环境里的数据库
+    密码 / API 密钥绝不能到达它们。对应 ToolContext.safe_env() 的过滤；
+    GIT_ASKPASS_TOKEN 由调用方在过滤后重新加回。代理拼写随后（在 run_git 的
+    默认路径里）规范化——git 的 libcurl 读 ALL_PROXY 并被空占位符卡住，正是
+    apply_proxy_env 清洗的内容。
     """
     deny_suffixes = ToolContext._ENV_DENY_SUFFIXES
     deny_prefixes = ToolContext._ENV_DENY_PREFIXES
@@ -108,13 +104,11 @@ async def run_git(
     token: str | None = None,
     env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Run git with credentials injected through a throwaway askpass helper.
+    """以一次性 askpass 助手注入凭证的方式运行 git。
 
-    ``env`` replaces the default filtered os.environ — callers that need extra
-    hardening variables pass their own copy (skill_source already runs its copy
-    through ToolContext.proxy_env, so a caller-supplied env is left alone). The
-    token is never placed on the command line or in the URL; it only ever lives
-    in the helper's environment.
+    ``env`` 替换默认过滤后的 os.environ——需要额外加固变量的调用方传入自己的
+    副本（skill_source 已把它的副本经 ToolContext.proxy_env 处理，因此调用方提供
+    的 env 原样保留）。令牌从不放在命令行或 URL 里；它只存在于助手的环境中。
     """
     if not _GIT_BIN:
         return _dependency_missing("Git executable was not found")
@@ -123,8 +117,7 @@ async def run_git(
     else:
         env = dict(env)
     askpass: Path | None = None
-    # Without this an anonymous clone of a repository that wants credentials
-    # blocks forever on the terminal prompt instead of failing.
+    # 没有它，对需要凭证的仓库做匿名克隆会在终端提示上永久阻塞而非失败。
     env["GIT_TERMINAL_PROMPT"] = "0"
     if token:
         suffix = ".cmd" if sys.platform == "win32" else ".sh"
@@ -148,9 +141,8 @@ async def run_git(
             if sys.platform != "win32":
                 askpass.chmod(0o700)
         except OSError as exc:
-            # delete=False left the file on disk and the finally below only
-            # wraps the subprocess block — clean up here or every failed
-            # helper write leaks a git-askpass-* temp file.
+            # delete=False 把文件留在磁盘，下方 finally 只包裹子进程块——在这里
+            # 清理，否则每次失败的助手写入都会泄漏一个 git-askpass-* 临时文件。
             if askpass is not None:
                 try:
                     askpass.unlink(missing_ok=True)
@@ -161,10 +153,9 @@ async def run_git(
             GIT_ASKPASS=str(askpass),
             GIT_ASKPASS_TOKEN=token,
         )
-    # process is pre-declared: a cancellation landing between the await of
-    # create_subprocess_exec and its assignment would otherwise hit a
-    # NameError in the CancelledError handler below (same pattern as
-    # code_executor.py / shell.py).
+    # process 预先声明：取消若落在 create_subprocess_exec 的 await 与其赋值之间，
+    # 否则会在下方 CancelledError 处理器里撞上 NameError（同 code_executor.py /
+    # shell.py 的模式）。
     process: asyncio.subprocess.Process | None = None
     try:
         try:
