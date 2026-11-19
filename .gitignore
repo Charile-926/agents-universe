@@ -59,6 +59,9 @@ packages/web/.vite/
 *.db
 *.sqlite
 
+# Runtime data (Redis dump, SQLite files, project workspaces — generated, not committed)
+data/
+
 # API test runtime workspace (SQLite file + PROJECTS_ROOT under tests/_tmp)
 packages/api/tests/_tmp/
 

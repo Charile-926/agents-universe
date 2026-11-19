@@ -12,7 +12,7 @@ Agents Universe 是一个开源（Apache-2.0）的企业级 AI Agent 平台。�
 
 ![Agents Universe 系统界面](docs/images/system_screenshot.webp)
 
-*Codex 式三栏界面：左侧会话与项目导航，中间对话流，右侧计划与知识上下文（点击可查看大图）*
+*ChatGPT 风格界面：左侧项目与按日期分组的会话历史，顶部智能体/模型选择器与页签，中间居中对话流与悬浮输入框，右侧知识/记忆抽屉（点击可查看大图）*
 
 **30 秒了解 Agents Universe**
 
@@ -313,7 +313,7 @@ python -m agent_core.knowledge.index --global-dir ./knowledge
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Browser (Vue 3)                          │
-│            Codex-style 三栏布局 + WebSocket 实时流               │
+│          ChatGPT 风格布局 + WebSocket 实时流式推送               │
 └────────────────────────────┬────────────────────────────────────┘
                              │ HTTP / WebSocket
 ┌────────────────────────────▼────────────────────────────────────┐
@@ -394,7 +394,7 @@ agents-universe/
 │   │       ├── websocket/        # WebSocket 实时通信
 │   │       └── dependencies/     # FastAPI 依赖注入
 │   │
-│   └── web/              # Codex-style Browser UI
+│   └── web/              # ChatGPT 风格 Browser UI（Vue 3）
 │       └── src/
 │           ├── components/       # Vue 组件
 │           ├── stores/           # Pinia 状态管理
@@ -436,7 +436,7 @@ agents-universe/
 - 回退链：用户模型配置 → 系统默认模型（环境变量配置）
 - 上下文压缩（`compressor.py`）使用当前会话的同一模型生成历史摘要
 
-**自动模型路由**：Composer 模型选择条可切换到「自动」，按任务复杂度在用户已配置的模型间路由：
+**自动模型路由**：顶栏模型选择器可切换到「自动」，按任务复杂度在用户已配置的模型间路由：
 
 - 每个模型在 Settings 中标注档位（轻量/标准/旗舰，`complexity_tier`）；添加时按 model_id 关键词自动推断默认值，可手动修改
 - 普通轮次：先用最便宜的档位模型做一次轻量复杂度预分类（单次小调用，失败静默回退），再按结果选择模型
@@ -590,6 +590,36 @@ cd packages/api && pytest
 # Web — Vitest + Vue Test Utils
 cd packages/web && npm test
 ```
+
+## 部署上线（Gitee + 服务器）
+
+代码托管在 Gitee（`git@gitee.com:ethan_926/agents-universe.git`），生产以 Docker 镜像运行在云服务器（nginx + uvicorn 同容器，SQLite + Redis），源码位于服务器的 `/root/agents-universe`。**前端与后端代码都打包进镜像，改代码必须重建镜像**，仅传文件不会生效。
+
+**日常发布三步**
+
+1. 本地（PyCharm）：`Ctrl+K` 提交 → `Commit and Push` 推送到 Gitee。
+2. 服务器拉取并重建（本机 PowerShell，已配免密 SSH；`<server>` 换成你的服务器地址）：
+
+   ```powershell
+   ssh root@<server> "cd /root/agents-universe && git checkout -- data/redis/dump.rdb && git fetch origin && git reset --hard origin/main && docker build --target final -t agents-universe-api:latest . && docker compose up -d api"
+   ```
+
+3. 验证：`curl http://<server>:8000/health` 返回 ok 后，浏览器 `Ctrl+F5` 强刷即可看到新版。
+
+**两个必须注意的点**
+
+- `--target final` 不能省：`Dockerfile` 最后一个 stage 是 `web-dev` 开发镜像，不带该参数会建成跑 vite dev 的镜像，线上直接不可用。
+- 服务器 `docker-compose.yml` 的 api 服务只有 `image` 没有 `build` 段，`docker compose build api` 会静默跳过、什么都不做；必须用上面的 `docker build`。
+
+**哪类改动需要哪种操作**
+
+| 改动内容 | 操作 |
+|---|---|
+| `packages/web`、`packages/api`、`packages/agent-core`、`agents/`、`workflows/`、`knowledge/` | 重建镜像 + 重启容器 |
+| `.env`、`docker-compose.yml`（环境变量、端口等） | 无需重建，`docker compose up -d api` 重建容器即可 |
+| `data/`（数据库、项目文件、Redis dump） | 挂载卷 / 已忽略，即时生效 |
+
+> `.env`、`docker-compose.yml`、`data/` 均在 Git 忽略名单或未被跟踪，`git reset --hard` 不会覆盖密钥与运行数据。生产环境请关闭 `AUTH_BYPASS_ENABLED` 并配置 OAuth SSO。
 
 ## 参与贡献与延伸阅读
 
