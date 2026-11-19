@@ -1,6 +1,7 @@
 <template>
   <div
     class="chat-panel"
+    :class="{ 'is-fresh': showAgentCapabilities }"
     @dragenter="onDragEnter"
     @dragover="onDragOver"
     @dragleave="onDragLeave"
@@ -42,9 +43,10 @@
         :message="msg"
       />
 
-      <!-- Fresh (zero-message) conversation: show what the current agent
-           can do instead of a blank list. The first message hides it. -->
+      <!-- Fresh (zero-message) conversation: ChatGPT-style centered greeting
+           plus what the current agent can do. The first message hides it. -->
       <div v-if="showAgentCapabilities" class="fresh-conversation-card">
+        <h1 class="chat-greeting">{{ t('chatPanel.greeting') }}</h1>
         <AgentCapabilitiesCard
           :agent="agentStore.currentAgent"
           @apply-prompt="applyComposerDraft"
@@ -482,9 +484,23 @@ function handleCancel(promptId: string) {
 </script>
 
 <style scoped>
-/* Vertically center the capability card in the empty flex-column message list. */
+/* Vertically center the greeting + capability card in the empty flex-column
+   message list; the composer below is centered as a group via .is-fresh. */
 .fresh-conversation-card {
   margin: auto 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  width: 100%;
+}
+
+.chat-greeting {
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+  text-align: center;
 }
 
 /* Drop hint while an OS file drag is over the panel (.chat-panel is the
@@ -500,10 +516,10 @@ function handleCancel(promptId: string) {
   justify-content: center;
   gap: 10px;
   pointer-events: none;
-  color: var(--accent);
+  color: var(--text-primary);
   font-size: 14px;
-  background: rgba(15, 15, 15, 0.72);
-  border: 2px dashed var(--accent);
-  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.85);
+  border: 2px dashed var(--border-strong);
+  border-radius: 12px;
 }
 </style>

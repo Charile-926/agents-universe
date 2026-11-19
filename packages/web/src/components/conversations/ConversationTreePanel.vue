@@ -1,6 +1,6 @@
 <template>
-  <div class="conv-tree">
-    <div class="conv-tree-header">
+  <div class="conv-tree" :class="{ 'conv-tree--embedded': embedded }">
+    <div v-if="!embedded" class="conv-tree-header">
       <span class="conv-tree-header-title">{{ t('conversations.historyTitle') }}</span>
       <button class="conv-tree-new-btn" :title="t('conversations.newConversation')" @click="onNewConversation"><Plus :size="14" /></button>
     </div>
@@ -30,20 +30,23 @@
       <span>{{ isSearching ? t('conversations.noMatches') : t('conversations.empty') }}</span>
     </div>
     <div v-else class="conv-tree-list">
-      <ConversationTreeItem
-        v-for="conv in conversations"
-        :key="conv.conversation_id"
-        :conversation="conv"
-        :is-active="convStore.conversationId === conv.conversation_id"
-        :is-expanded="expandedIds.has(conv.conversation_id)"
-        :is-streaming="!!convStore.streamingIds[conv.conversation_id] || !!conv.is_running"
-        :tasks="tasksFor(conv)"
-        :agent-label="agentLabelFor(conv)"
-        @select="selectConversation(conv)"
-        @toggle-expand="toggleExpand(conv.conversation_id)"
-        @delete="deleteConversation(conv.conversation_id)"
-        @rename="(title) => renameConversation(conv.conversation_id, title)"
-      />
+      <template v-for="section in sections" :key="section.key">
+        <div v-if="section.label" class="conv-tree-group-label">{{ section.label }}</div>
+        <ConversationTreeItem
+          v-for="conv in section.items"
+          :key="conv.conversation_id"
+          :conversation="conv"
+          :is-active="convStore.conversationId === conv.conversation_id"
+          :is-expanded="expandedIds.has(conv.conversation_id)"
+          :is-streaming="!!convStore.streamingIds[conv.conversation_id] || !!conv.is_running"
+          :tasks="tasksFor(conv)"
+          :agent-label="agentLabelFor(conv)"
+          @select="selectConversation(conv)"
+          @toggle-expand="toggleExpand(conv.conversation_id)"
+          @delete="deleteConversation(conv.conversation_id)"
+          @rename="(title) => renameConversation(conv.conversation_id, title)"
+        />
+      </template>
     </div>
   </div>
 </template>
@@ -61,7 +64,7 @@ import { mapDbTasks } from '@/stores/conversation'
 import type { ConversationItem, AgentTask } from '@/types'
 import ConversationTreeItem from './ConversationTreeItem.vue'
 
-const props = defineProps<{ projectId?: string; agentSlug?: string }>()
+const props = defineProps<{ projectId?: string; agentSlug?: string; embedded?: boolean }>()
 const emit = defineEmits<{ 'new-conversation': [] }>()
 
 const convStore = useConversationStore()
@@ -118,15 +121,17 @@ function onNewConversation() {
 }
 
 async function load() {
-  // Bumped before any early return: clearing the search with no agent selected
-  // must still invalidate an in-flight response for the previous state.
+  // Bumped before any early return: clearing the search with no project
+  // selected must still invalidate an in-flight response for the previous state.
   const seq = ++loadSeq
   const query = activeQuery.value
-  if (!props.projectId || (!query && !props.agentSlug)) {
+  if (!props.projectId) {
     conversations.value = []
     return
   }
   try {
+    // Embedded (ChatGPT-style sidebar) lists every conversation in the
+    // project; agentSlug, when provided, still narrows the list.
     const list = query
       ? await conversationsApi.list(props.projectId, undefined, query)
       : await conversationsApi.list(props.projectId, props.agentSlug)
@@ -140,11 +145,41 @@ async function load() {
   }
 }
 
-/** Owning agent's display name, only while searching and only for another
- *  agent's conversation (the current agent's rows need no badge). */
+/** ChatGPT-style date buckets for the embedded sidebar list. The server
+ *  already sorts by recency, so bucketing preserves that order. */
+const sections = computed<Array<{ key: string; label: string; items: ConversationItem[] }>>(() => {
+  if (!props.embedded) {
+    return [{ key: 'all', label: '', items: conversations.value }]
+  }
+  const now = new Date()
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const DAY = 86_400_000
+  const groups = [
+    { key: 'today', label: t('conversations.groupToday'), items: [] as ConversationItem[] },
+    { key: 'yesterday', label: t('conversations.groupYesterday'), items: [] as ConversationItem[] },
+    { key: 'week', label: t('conversations.groupLastWeek'), items: [] as ConversationItem[] },
+    { key: 'earlier', label: t('conversations.groupEarlier'), items: [] as ConversationItem[] },
+  ]
+  for (const conv of conversations.value) {
+    const ts = Date.parse(conv.updated_at || conv.created_at)
+    let bucket = groups[3]
+    if (!Number.isNaN(ts)) {
+      if (ts >= startOfToday) bucket = groups[0]
+      else if (ts >= startOfToday - DAY) bucket = groups[1]
+      else if (ts >= startOfToday - 7 * DAY) bucket = groups[2]
+    }
+    bucket.items.push(conv)
+  }
+  return groups.filter((g) => g.items.length > 0)
+})
+
+/** Owning agent's display name. Embedded (project-wide) lists badge every
+ *  other agent's conversation; the agent-scoped panel only badges while
+ *  searching (its rows all belong to the current agent otherwise). */
 function agentLabelFor(conv: ConversationItem): string | undefined {
-  if (!isSearching.value || !conv.agent_slug) return undefined
+  if (!conv.agent_slug) return undefined
   if (conv.agent_slug === agentStore.currentAgent?.slug) return undefined
+  if (!props.embedded && !isSearching.value) return undefined
   return agentStore.agents.find((a) => a.slug === conv.agent_slug)?.label ?? conv.agent_slug
 }
 

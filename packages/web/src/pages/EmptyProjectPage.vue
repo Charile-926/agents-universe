@@ -3,9 +3,9 @@
     <div class="empty-project-content">
       <div class="empty-project-logo">
         <span class="empty-project-logo-icon">
-          <Bot :size="36" />
+          <Bot :size="28" />
         </span>
-        <h1 class="empty-project-brand">Agents Universe</h1>
+        <h1 class="empty-project-greeting">{{ t('emptyProject.greeting') }}</h1>
         <p class="empty-project-tagline">{{ t('emptyProject.tagline') }}</p>
       </div>
 

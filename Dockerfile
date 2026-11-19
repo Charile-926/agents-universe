@@ -19,7 +19,7 @@ ARG VITE_BASE_PATH=/
 ARG VITE_API_BASE_PATH=
 ENV VITE_BASE_PATH=$VITE_BASE_PATH
 ENV VITE_API_BASE_PATH=$VITE_API_BASE_PATH
-RUN npx vite build
+RUN NODE_OPTIONS=--max-old-space-size=1024 npx vite build
 
 # ── Stage 2: Python base with ODBC + Playwright + nginx ───────────────────
 # Pin to bookworm (Debian 12) - Microsoft ODBC packages support bookworm;

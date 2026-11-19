@@ -220,6 +220,7 @@ export default {
     deleteConfirm: '删除 MCP 服务器「{name}」？',
   },
   chatPanel: {
+    greeting: '有什么可以帮忙的？',
     connecting: '连接中…',
     connectFailed: '连接已断开，正在自动重连…',
     reconnect: '立即重连',
@@ -344,6 +345,7 @@ export default {
     sourceLabel: '图表源码 (markdown)',
   },
   chatPage: {
+    greeting: '有什么可以帮忙的？',
     newConversationHint: '开始一段新对话',
     startChat: '开始聊天',
     projectNotFound: '项目不存在或已被删除，请从左侧重新选择项目。',
@@ -370,6 +372,10 @@ export default {
     noMatches: '没有匹配的对话',
     renameTitle: '重命名',
     renameFailed: '重命名会话失败',
+    groupToday: '今天',
+    groupYesterday: '昨天',
+    groupLastWeek: '7 天内',
+    groupEarlier: '更早',
   },
   contextMeter: {
     label: '上下文',
@@ -453,8 +459,14 @@ export default {
     tabWorkspace: '工作区',
     tabPublishes: '发布',
     tabSchedules: '定时任务',
+    newChat: '新建对话',
+    selectAgent: '选择智能体',
+    selectModel: '选择模型',
+    openKnowledge: '知识面板',
+    openMemory: '记忆面板',
   },
   emptyProject: {
+    greeting: '有什么可以帮忙的？',
     tagline: '企业级 AI Agent 框架',
     featureChatTitle: '智能对话',
     featureChatDesc: '与 AI Agent 进行多轮对话，支持流式输出与工具调用',

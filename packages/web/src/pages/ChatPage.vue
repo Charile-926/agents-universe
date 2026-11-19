@@ -11,6 +11,7 @@
         <span class="thinking-dot" /><span class="thinking-dot" /><span class="thinking-dot" />
       </div>
       <template v-else>
+        <h1 class="chat-greeting">{{ t('chatPage.greeting') }}</h1>
         <p v-if="loadError" class="chat-empty-error">{{ loadError }}</p>
         <AgentCapabilitiesCard
           v-if="agentStore.currentAgent"
@@ -29,9 +30,18 @@
 
 <style scoped>
 .chat-empty-error {
-  color: var(--color-error, #f38ba8);
+  color: var(--color-error, #d92d20);
   font-size: 13px;
   margin-bottom: 12px;
+}
+
+.chat-greeting {
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+  text-align: center;
+  margin-bottom: 18px;
 }
 </style>
 

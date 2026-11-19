@@ -29,7 +29,19 @@ const projectStore = vi.hoisted(() => ({
   setProjects: vi.fn(),
 }))
 vi.mock('@/stores/project', () => ({ useProjectStore: () => projectStore }))
-vi.mock('@/stores/agent', () => ({ useAgentStore: () => ({ currentAgent: null }) }))
+const agentStore = vi.hoisted(() => ({
+  currentAgent: null,
+  agents: [],
+  modelConfigs: [],
+  selectedConfigId: '',
+  setSelectedConfigId: vi.fn(),
+  fetchModelConfigs: vi.fn(),
+  fetchAgents: vi.fn(),
+}))
+vi.mock('@/stores/agent', () => ({
+  useAgentStore: () => agentStore,
+  AUTO_MODEL_CONFIG_ID: '__auto__',
+}))
 const conversationStore = vi.hoisted(() => ({
   messages: [] as unknown[],
   isStreaming: false,
@@ -47,6 +59,7 @@ vi.mock('@/api/conversations', () => ({ conversationsApi: { compress: vi.fn() } 
 // Child components — the topnav under test lives in this layout, not in them.
 vi.mock('@/components/sidebar/ProjectTree.vue', () => ({ default: { name: 'ChildStub', template: '<div />' } }))
 vi.mock('@/components/sidebar/AgentSwitcher.vue', () => ({ default: { name: 'ChildStub', template: '<div />' } }))
+vi.mock('@/components/sidebar/AgentPickerDialog.vue', () => ({ default: { name: 'ChildStub', template: '<div />' } }))
 vi.mock('@/components/sidebar/SidebarFooter.vue', () => ({ default: { name: 'ChildStub', template: '<div />' } }))
 vi.mock('@/components/knowledge/ContextMeter.vue', () => ({ default: { name: 'ChildStub', template: '<div />' } }))
 vi.mock('@/components/conversations/ConversationTreePanel.vue', () => ({ default: { name: 'ChildStub', template: '<div />' } }))
@@ -59,6 +72,9 @@ beforeEach(() => {
   conversationStore.conversationId = null
   conversationStore.tokensUsed = 0
   conversationStore.messages = []
+  agentStore.modelConfigs = []
+  agentStore.selectedConfigId = ''
+  agentStore.setSelectedConfigId.mockClear()
 })
 
 describe('AppLayout center topnav', () => {
@@ -112,8 +128,8 @@ describe('AppLayout session token counter', () => {
     expect(counter.exists()).toBe(true)
     expect(counter.text()).toContain('会话消耗')
     expect(counter.text()).toContain((12345).toLocaleString())
-    // The compress button shares the right-aligned group with the counter.
-    expect(wrapper.find('.topnav-right .compress-btn').exists()).toBe(true)
+    // The compress button shares the right-aligned topbar group with the counter.
+    expect(wrapper.find('.topbar-right .nav-compress').exists()).toBe(true)
   })
 
   it('hides the counter when nothing was consumed yet', () => {
@@ -149,6 +165,37 @@ describe('AppLayout session token counter', () => {
     conversationStore.tokensUsed = 500
     const wrapper = mount(AppLayout)
     expect(wrapper.find('.nav-tokens').exists()).toBe(false)
-    expect(wrapper.find('.topnav-right').exists()).toBe(false)
+    expect(wrapper.find('.nav-compress').exists()).toBe(false)
+  })
+})
+
+describe('AppLayout model picker (ChatGPT-style top bar)', () => {
+  it('lists auto first and selects a real model through the store', async () => {
+    routeState.path = '/projects/p-1/chat'
+    agentStore.modelConfigs = [
+      { config_id: 'm1', model_id: 'gpt-4o', is_system: false },
+    ] as never[]
+    const wrapper = mount(AppLayout)
+
+    await wrapper.find('.model-picker-btn').trigger('click')
+    const items = wrapper.findAll('.model-menu-item')
+    expect(items).toHaveLength(2)
+    expect(items[0].text()).toContain('自动')
+    expect(items[1].text()).toContain('gpt-4o')
+
+    await items[1].trigger('click')
+    expect(agentStore.setSelectedConfigId).toHaveBeenCalledWith('m1')
+    // Selecting closes the menu.
+    expect(wrapper.find('.model-menu').exists()).toBe(false)
+  })
+
+  it('shows the selected model name on the picker button', () => {
+    routeState.path = '/projects/p-1/chat'
+    agentStore.modelConfigs = [
+      { config_id: 'm1', model_id: 'gpt-4o', is_system: false },
+    ] as never[]
+    agentStore.selectedConfigId = 'm1'
+    const wrapper = mount(AppLayout)
+    expect(wrapper.find('.model-picker-btn').text()).toContain('gpt-4o')
   })
 })

@@ -37,7 +37,13 @@ services:
     env_file:
       - .env
     volumes:
-      # All persistent data lives under the DOCKER_VOLUME_ROOT host directory
+      # All persistent data lives under the DOCKER_VOLUME_ROOT host directory.
+      # Linux hosts: Docker auto-creates a missing bind-mount source dir as
+      # root:root, and the non-root appuser inside the image cannot write it
+      # (project creation fails with PROJECT_FS_INIT_FAILED). Pre-create the
+      # dir and hand it to the image's runtime uid before `docker compose up`
+      # (verify uid/gid with `docker compose exec api id`):
+      #   mkdir -p ./data/projects && sudo chown 997:997 ./data/projects
       - ${DOCKER_VOLUME_ROOT:-./data}/projects:/app/projects
       - ${DOCKER_VOLUME_ROOT:-./data}/maven:/home/appuser/.m2
       - ${DOCKER_VOLUME_ROOT:-./data}/gradle:/home/appuser/.gradle

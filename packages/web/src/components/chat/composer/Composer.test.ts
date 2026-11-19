@@ -138,7 +138,7 @@ describe('Composer attachments', () => {
   })
 })
 
-describe('Composer auto model option', () => {
+describe('Composer model selection (top-bar driven)', () => {
   beforeEach(() => {
     agentState.modelConfigs = [
       { config_id: 'm1', model_id: 'gpt-4o', is_system: false },
@@ -148,31 +148,32 @@ describe('Composer auto model option', () => {
     agentState.setSelectedConfigId.mockClear()
   })
 
-  it('renders the auto pill first, before real models', async () => {
+  it('no longer renders model pills — selection lives in the top bar', async () => {
     const wrapper = mount(Composer, { props: makeProps() })
     await nextTick()
 
-    const pills = wrapper.findAll('.provider-pill')
-    expect(pills[0].text()).toBe('自动')
-    expect(pills[1].text()).toBe('gpt-4o')
+    expect(wrapper.findAll('.provider-pill')).toHaveLength(0)
   })
 
-  it('clicking auto selects it through the store', async () => {
+  it('submits the config selected through the store', async () => {
+    agentState.selectedConfigId = 'm2'
     const wrapper = mount(Composer, { props: makeProps() })
     await nextTick()
 
-    await wrapper.findAll('.provider-pill')[0].trigger('click')
+    const view = EditorView.findFromDOM(wrapper.find('.cm-content').element as HTMLElement)!
+    view.dispatch({ changes: { from: 0, insert: 'hello' } })
     await nextTick()
 
-    expect(agentState.setSelectedConfigId).toHaveBeenCalledWith(AUTO_MODEL_CONFIG_ID)
-    expect(wrapper.findAll('.provider-pill')[0].classes()).toContain('active')
+    await wrapper.find('.submit-btn').trigger('click')
+    const payload = wrapper.emitted('submit')![0][0] as { config_id?: string }
+    expect(payload.config_id).toBe('m2')
   })
 
-  it('submits config_id "auto" when auto is selected', async () => {
+  it('submits config_id "auto" when auto is selected in the store', async () => {
+    agentState.selectedConfigId = AUTO_MODEL_CONFIG_ID
     const wrapper = mount(Composer, { props: makeProps() })
     await nextTick()
 
-    await wrapper.findAll('.provider-pill')[0].trigger('click')
     const view = EditorView.findFromDOM(wrapper.find('.cm-content').element as HTMLElement)!
     view.dispatch({ changes: { from: 0, insert: 'hello' } })
     await nextTick()
@@ -373,8 +374,13 @@ describe('Composer selection hydration on page load', () => {
     await nextTick()
 
     expect(agentState.setSelectedConfigId).not.toHaveBeenCalled()
-    const pills = wrapper.findAll('.provider-pill')
-    expect(pills[1].classes()).toContain('active')
+    // The adopted selection is what the next submit sends.
+    const view = EditorView.findFromDOM(wrapper.find('.cm-content').element as HTMLElement)!
+    view.dispatch({ changes: { from: 0, insert: 'hi' } })
+    await nextTick()
+    await wrapper.find('.submit-btn').trigger('click')
+    const payload = wrapper.emitted('submit')![0][0] as { config_id?: string }
+    expect(payload.config_id).toBe('m1')
   })
 
   it('selects the first real model when nothing was saved', async () => {

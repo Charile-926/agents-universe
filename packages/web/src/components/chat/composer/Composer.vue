@@ -1,16 +1,5 @@
 <template>
   <div class="composer">
-    <!-- Model pills -->
-    <div class="composer-providers" v-if="modelOptions.length">
-      <button
-        v-for="opt in modelOptions"
-        :key="opt.id"
-        class="provider-pill"
-        :class="{ active: selectedConfigId === opt.id }"
-        @click="selectConfig(opt.id)"
-      ><Sparkles v-if="opt.auto" :size="12" class="provider-pill-auto" />{{ opt.label }}</button>
-    </div>
-
     <!-- Attachments (pending uploads) -->
     <div v-if="attachments.length" class="composer-attachments">
       <div
@@ -43,13 +32,10 @@
     <SlashPopup v-if="showSlash" @select="insertSlash" @close="showSlash = false" />
     <div v-if="mentionHint" class="composer-mention-hint">{{ mentionHint }}</div>
 
-    <!-- Actions -->
+    <!-- Actions — ChatGPT style: attach on the left, round send on the right -->
     <div class="composer-toolbar">
-      <button class="composer-new-chat" type="button" :title="t('composer.newConversation')" @click="emit('new-conversation')">
-        <Plus :size="16" />
-      </button>
       <button class="composer-attach" type="button" :title="t('composer.attach')" @click="fileInput?.click()">
-        <Paperclip :size="16" />
+        <Plus :size="18" />
       </button>
       <input
         ref="fileInput"
@@ -65,7 +51,7 @@
         @click="emit('abort')"
         :title="t('composer.stop')"
       >
-        <Square :size="14" />
+        <Square :size="12" />
       </button>
       <!-- Send stays enabled while streaming: the message is queued and
            injected at the agent's next step boundary, never interrupting it. -->
@@ -75,7 +61,7 @@
         @click="submit"
         :title="hasPending ? t('composer.uploadingTitle') : isStreaming ? t('composer.sendInjectionTitle') : t('composer.sendTitle')"
       >
-        <Send :size="14" />
+        <ArrowUp :size="16" />
       </button>
     </div>
   </div>
@@ -84,12 +70,11 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch, reactive } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { Send, Square, Paperclip, FileText, X, Plus, Sparkles } from 'lucide-vue-next'
+import { Square, FileText, X, Plus, ArrowUp } from 'lucide-vue-next'
 import { EditorView, keymap, placeholder as cmPlaceholder } from '@codemirror/view'
 import { EditorState } from '@codemirror/state'
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
 import { markdown } from '@codemirror/lang-markdown'
-import { oneDark } from '@codemirror/theme-one-dark'
 import { useAgentStore, AUTO_MODEL_CONFIG_ID } from '@/stores/agent'
 import { mediaApi } from '@/api/media'
 import { ApiError } from '@/api/client'
@@ -464,15 +449,23 @@ onMounted(() => {
         history(),
         keymap.of([...defaultKeymap, ...historyKeymap]),
         markdown(),
-        oneDark,
         updateListener,
         pasteHandlers,
         cmPlaceholder(() => placeholderEl),
         EditorView.lineWrapping,
+        // ChatGPT-style light editor: transparent surface, near-black text,
+        // soft gray placeholder; markdown highlighting falls back to the
+        // default light highlight style shipped with the language pack.
         EditorView.theme({
-          '&': { background: 'transparent', fontSize: '14px' },
+          '&': { background: 'transparent', fontSize: '15px', color: '#0d0d0d' },
           '.cm-focused': { outline: 'none' },
-          '.cm-scroller': { fontFamily: 'inherit' },
+          '.cm-scroller': { fontFamily: 'inherit', lineHeight: '1.6' },
+          '.cm-content': { caretColor: '#0d0d0d', padding: '0' },
+          '.cm-cursor, .cm-dropCursor': { borderLeftColor: '#0d0d0d' },
+          '.cm-placeholder': { color: '#8f8f8f' },
+          '&.cm-focused .cm-selectionBackground, .cm-selectionBackground': { backgroundColor: 'rgba(0, 0, 0, 0.08)' },
+          '.cm-activeLine': { backgroundColor: 'transparent' },
+          '.cm-gutters': { display: 'none' },
         }),
       ],
     }),

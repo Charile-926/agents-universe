@@ -17,6 +17,25 @@ unset _v
 echo "[entrypoint] Running database migrations..."
 alembic upgrade head
 
+# Preflight: PROJECTS_ROOT must be writable by the runtime user. On Linux
+# hosts Docker auto-creates a missing bind-mount source dir as root:root,
+# which masks the image's `chown appuser /app/projects` — every project
+# creation then dies with PermissionError -> PROJECT_FS_INIT_FAILED while
+# the container still reports healthy. We run non-root and cannot chown a
+# root-owned host dir, so surface the exact fix loudly at startup instead
+# of letting each create 500 silently. Non-fatal: reads and conversations
+# still work, same fail-open policy as the other startup steps.
+echo "[entrypoint] Checking PROJECTS_ROOT writability..."
+_projects_root="${PROJECTS_ROOT:-/app/projects}"
+if mkdir -p "$_projects_root" 2>/dev/null && touch "$_projects_root/.write-test" 2>/dev/null; then
+    rm -f "$_projects_root/.write-test"
+else
+    echo "[entrypoint] ERROR: PROJECTS_ROOT ($_projects_root) is not writable by uid $(id -u):$(id -g)." >&2
+    echo "[entrypoint] ERROR: project creation WILL FAIL until the host directory mounted there is handed to this uid." >&2
+    echo "[entrypoint] ERROR: on the host run: chown $(id -u):$(id -g) <host-dir-mounted-at $_projects_root>" >&2
+fi
+unset _projects_root
+
 # Index the global knowledge base (project creation auto-indexes its own
 # workspace; the global tier has no other trigger, so a fresh deployment
 # would otherwise show an empty knowledge panel). Idempotent — unchanged

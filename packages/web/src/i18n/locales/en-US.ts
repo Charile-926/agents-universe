@@ -220,6 +220,7 @@ export default {
     deleteConfirm: 'Delete MCP server "{name}"?',
   },
   chatPanel: {
+    greeting: 'What can I help with?',
     connecting: 'Connecting…',
     connectFailed: 'Connection lost, reconnecting…',
     reconnect: 'Reconnect now',
@@ -345,6 +346,7 @@ export default {
     sourceLabel: 'Diagram source (markdown)',
   },
   chatPage: {
+    greeting: 'What can I help with?',
     newConversationHint: 'Start a new conversation',
     startChat: 'Start chatting',
     projectNotFound: 'Project not found or deleted. Please pick a project from the left.',
@@ -371,6 +373,10 @@ export default {
     noMatches: 'No matching conversations',
     renameTitle: 'Rename',
     renameFailed: 'Failed to rename conversation',
+    groupToday: 'Today',
+    groupYesterday: 'Yesterday',
+    groupLastWeek: 'Previous 7 days',
+    groupEarlier: 'Earlier',
   },
   contextMeter: {
     label: 'Context',
@@ -454,8 +460,14 @@ export default {
     tabWorkspace: 'Workspace',
     tabPublishes: 'Publishes',
     tabSchedules: 'Scheduled Tasks',
+    newChat: 'New chat',
+    selectAgent: 'Select agent',
+    selectModel: 'Select model',
+    openKnowledge: 'Knowledge panel',
+    openMemory: 'Memory panel',
   },
   emptyProject: {
+    greeting: 'What can I help with?',
     tagline: 'Enterprise AI Agent framework',
     featureChatTitle: 'Smart chat',
     featureChatDesc: 'Multi-turn conversations with AI agents, with streaming output and tool calling',

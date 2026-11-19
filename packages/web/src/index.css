@@ -2,74 +2,78 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── ChatGPT-style light theme ─────────────────────────────────────────────
+   Clean white canvas, soft gray sidebar, near-black text and controls.
+   All legacy component rules read these tokens, so the whole app flips
+   to the light palette from here. */
 :root {
   /* Backgrounds — depth hierarchy */
-  --bg-primary:    #0f0f0f;
-  --bg-secondary:  #141414;
-  --bg-tertiary:   #1c1c1c;
-  --bg-elevated:   #242424;
+  --bg-primary:    #ffffff;
+  --bg-secondary:  #f9f9f9;
+  --bg-tertiary:   #ececec;
+  --bg-elevated:   #ffffff;
 
   /* Borders */
-  --border:        rgba(255, 255, 255, 0.07);
-  --border-strong: rgba(255, 255, 255, 0.14);
-  --border-glow:   rgba(107, 159, 255, 0.3);
+  --border:        rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.16);
+  --border-glow:   rgba(0, 0, 0, 0.20);
 
   /* Text */
-  --text-primary:   #f0f0f0;
-  --text-secondary: #878787;
-  --text-muted:     #7a7a7a;
+  --text-primary:   #0d0d0d;
+  --text-secondary: #5d5d5d;
+  --text-muted:     #8f8f8f;
 
-  /* Accent */
-  --accent:       #6b9fff;
-  --accent-hover: #89b4ff;
-  --accent-dim:   rgba(107, 159, 255, 0.12);
-  --accent-2:     #8b5cf6;
+  /* Accent — ChatGPT uses near-black for primary actions */
+  --accent:       #0d0d0d;
+  --accent-hover: #3a3a3a;
+  --accent-dim:   rgba(0, 0, 0, 0.06);
+  --accent-2:     #5d5d5d;
 
-  /* Gradients */
-  --accent-gradient:       linear-gradient(135deg, #6b9fff 0%, #8b5cf6 100%);
-  --accent-gradient-hover: linear-gradient(135deg, #89b4ff 0%, #a78bfa 100%);
+  /* Gradients — flattened to solid fills */
+  --accent-gradient:       #0d0d0d;
+  --accent-gradient-hover: #3a3a3a;
 
-  /* Glows */
-  --accent-glow:        0 0 20px rgba(107, 159, 255, 0.25);
-  --accent-glow-strong: 0 0 32px rgba(107, 159, 255, 0.40);
-  --success-glow:       0 0 16px rgba(74, 222, 128, 0.20);
+  /* Glows — removed */
+  --accent-glow:        none;
+  --accent-glow-strong: none;
+  --success-glow:       none;
 
-  /* Glass */
-  --glass-bg:     rgba(20, 20, 20, 0.72);
-  --glass-blur:   12px;
-  --glass-border: rgba(255, 255, 255, 0.08);
+  /* Glass — solid surfaces, no blur */
+  --glass-bg:     #f9f9f9;
+  --glass-blur:   0px;
+  --glass-border: rgba(0, 0, 0, 0.06);
 
   /* Semantic */
-  --color-success: #4ade80;
-  --color-warning: #fbbf24;
-  --color-error:   #f87171;
+  --color-success: #008a05;
+  --color-warning: #b45309;
+  --color-error:   #d92d20;
 
-  /* Radius scale */
-  --radius-xs:   3px;   /* badges, tiny chips */
-  --radius-sm:   5px;   /* small buttons, list rows, chips */
-  --radius-md:   7px;   /* buttons, inputs, code blocks */
-  --radius-lg:   10px;  /* popups, message bubbles */
-  --radius-xl:   12px;  /* modals, cards */
+  /* Radius scale — ChatGPT runs rounder */
+  --radius-xs:   4px;
+  --radius-sm:   8px;
+  --radius-md:   10px;
+  --radius-lg:   16px;
+  --radius-xl:   20px;
   --radius-full: 999px;
 
   /* Type scale */
-  --text-2xs: 10px;
-  --text-xs:  11px;
-  --text-sm:  12px;
+  --text-2xs: 11px;
+  --text-xs:  12px;
+  --text-sm:  12.5px;
   --text-base: 13px;
   --text-md:  14px;
   --text-lg:  16px;
   --text-xl:  18px;
-  --text-2xl: 21px;
+  --text-2xl: 22px;
   --text-3xl: 28px;
-  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --font-mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, 'Helvetica Neue', 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
 
-  /* Shadows */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.30);
-  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.35);
-  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.60);
-  --focus-ring: 0 0 0 3px rgba(107, 159, 255, 0.15);
+  /* Shadows — soft, neutral */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.16);
+  --focus-ring: 0 0 0 3px rgba(0, 0, 0, 0.08);
 
   /* Spacing scale (advisory — applied only where rules are touched) */
   --space-1: 4px;
@@ -85,9 +89,9 @@
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
 
   /* Semantic aliases */
-  --text-link: #7eb8f5;
-  --bubble-user-gradient: linear-gradient(135deg, #1a3154 0%, #1d3d68 50%, #1e3a5f 100%);
-  --bubble-user-border: rgba(107, 159, 255, 0.18);
+  --text-link: #0066de;
+  --bubble-user-gradient: #f4f4f4;
+  --bubble-user-border: transparent;
 }
 
 * {
@@ -101,35 +105,23 @@ html, body, #root {
   font-family: var(--font-sans);
   background: var(--bg-primary);
   color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
-/* Ambient aurora background - fixed, pure CSS, zero JS overhead */
-body::before {
-  content: '';
-  position: fixed;
-  inset: 0;
-  z-index: -1;
-  pointer-events: none;
-  background:
-    radial-gradient(ellipse 800px 600px at 0% 0%,   rgba(107, 159, 255, 0.05) 0%, transparent 60%),
-    radial-gradient(ellipse 700px 500px at 100% 100%, rgba(139, 92, 246, 0.04) 0%, transparent 60%),
-    radial-gradient(ellipse 500px 400px at 50% 50%,  rgba(107, 159, 255, 0.02) 0%, transparent 70%);
-}
-
-/* Scrollbar */
-::-webkit-scrollbar { width: 5px; height: 5px; }
+/* Scrollbar — thin, neutral */
+::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
-  background: linear-gradient(180deg, rgba(107, 159, 255, 0.3), rgba(139, 92, 246, 0.3));
+  background: rgba(0, 0, 0, 0.16);
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: linear-gradient(180deg, rgba(107, 159, 255, 0.5), rgba(139, 92, 246, 0.5));
-  box-shadow: 0 0 8px rgba(107, 159, 255, 0.3);
+  background: rgba(0, 0, 0, 0.28);
 }
 
 /* Selection */
 ::selection {
-  background: rgba(107, 159, 255, 0.25);
-  color: #fff;
+  background: rgba(0, 0, 0, 0.10);
+  color: inherit;
 }
