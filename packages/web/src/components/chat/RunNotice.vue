@@ -18,14 +18,14 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import type { ConversationRun } from '@/types'
 
 const props = defineProps<{
   run: ConversationRun
 }>()
 
-const { t } = useI18n()
+const { t } = useT()
 
 const label = computed(() =>
   props.run.status === 'failed'

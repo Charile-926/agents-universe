@@ -43,12 +43,12 @@
 <script setup lang="ts">
 import { computed, nextTick, ref } from 'vue'
 import { ChevronDown, ChevronRight, Pencil, Trash2 } from 'lucide-vue-next'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { relativeTime } from '@/utils/time'
 import type { ConversationItem, AgentTask } from '@/types'
 import TaskTreeItem from './TaskTreeItem.vue'
 
-const { t } = useI18n()
+const { t } = useT()
 
 const props = defineProps<{
   conversation: ConversationItem

@@ -84,7 +84,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { Bot, Star, Search, SearchX, X, RotateCcw } from 'lucide-vue-next'
 import { useAgentStore } from '@/stores/agent'
 import { useFavoritesStore } from '@/stores/favorites'
@@ -97,7 +97,7 @@ const emit = defineEmits<{ close: [] }>()
 const overlayEl = ref<HTMLElement | null>(null)
 useClickOutside(overlayEl, () => emit('close'), true)
 
-const { t } = useI18n()
+const { t } = useT()
 const agentStore = useAgentStore()
 const favoritesStore = useFavoritesStore()
 const projectStore = useProjectStore()

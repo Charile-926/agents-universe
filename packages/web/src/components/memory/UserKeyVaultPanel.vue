@@ -47,10 +47,10 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { useUserTokensStore } from '@/stores/userTokens'
 
-const { t } = useI18n()
+const { t } = useT()
 const store = useUserTokensStore()
 
 const showAddForm = ref(false)

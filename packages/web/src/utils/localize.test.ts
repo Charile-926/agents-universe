@@ -1,10 +1,5 @@
-import { describe, it, expect, beforeEach } from 'vitest'
-import { setLocale } from '@/i18n'
+import { describe, it, expect } from 'vitest'
 import { resolveLocalized, localizedText, searchBlob } from './localize'
-
-beforeEach(() => {
-  setLocale('zh-CN')
-})
 
 describe('resolveLocalized', () => {
   it('returns the canonical value when overrides are absent', () => {
@@ -12,40 +7,34 @@ describe('resolveLocalized', () => {
     expect(resolveLocalized('技术负责人', undefined)).toBe('技术负责人')
   })
 
-  it('returns the locale override when present', () => {
-    const overrides = { 'en-US': 'Tech Lead' }
-    setLocale('en-US')
-    expect(resolveLocalized('技术负责人', overrides)).toBe('Tech Lead')
+  it('returns the zh-CN override when present', () => {
+    const overrides = { 'zh-CN': '技术负责人（正式）' }
+    expect(resolveLocalized('技术负责人', overrides)).toBe('技术负责人（正式）')
   })
 
   it('falls back to canonical when the locale has no override', () => {
     const overrides = { 'en-US': 'Tech Lead' }
-    // locale is zh-CN — no zh-CN key in the map, canonical wins
+    // 平台固定简体中文 — 映射里没有 zh-CN，canonical 胜出
     expect(resolveLocalized('技术负责人', overrides)).toBe('技术负责人')
   })
 
-  it('switches the resolved value reactively on locale change', () => {
+  it('ignores overrides of languages the platform no longer supports', () => {
     const overrides = { 'zh-CN': '技术负责人', 'en-US': 'Tech Lead' }
     expect(resolveLocalized('技术负责人', overrides)).toBe('技术负责人')
-    setLocale('en-US')
-    expect(resolveLocalized('技术负责人', overrides)).toBe('Tech Lead')
   })
 
   it('resolves non-string values (e.g. starter prompt lists)', () => {
     const prompts = ['帮我评审代码']
-    const overrides = { 'en-US': ['Review my code'] }
-    setLocale('en-US')
-    expect(resolveLocalized(prompts, overrides)).toEqual(['Review my code'])
-    setLocale('zh-CN')
-    expect(resolveLocalized(prompts, overrides)).toEqual(prompts)
+    const overrides = { 'zh-CN': ['帮我评审代码（正式）'] }
+    expect(resolveLocalized(prompts, overrides)).toEqual(['帮我评审代码（正式）'])
+    expect(resolveLocalized(prompts, null)).toEqual(prompts)
   })
 })
 
 describe('localizedText', () => {
   it('returns the localized string', () => {
-    const overrides = { 'en-US': 'Tech Lead' }
-    setLocale('en-US')
-    expect(localizedText('技术负责人', overrides)).toBe('Tech Lead')
+    const overrides = { 'zh-CN': '技术负责人（正式）' }
+    expect(localizedText('技术负责人', overrides)).toBe('技术负责人（正式）')
   })
 
   it('applies the fallback when both canonical and overrides are empty', () => {

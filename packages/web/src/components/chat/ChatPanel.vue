@@ -139,7 +139,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { Paperclip } from 'lucide-vue-next'
 import { useConversationStore } from '@/stores/conversation'
 import { useAgentStore } from '@/stores/agent'
@@ -165,7 +165,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{ 'new-conversation': [] }>()
 
-const { t } = useI18n()
+const { t } = useT()
 const convStore = useConversationStore()
 const agentStore = useAgentStore()
 const projectStore = useProjectStore()

@@ -46,12 +46,13 @@ describe('websocket warning events', () => {
     store.startConversation('c1')
 
     useWebSocket(ref('c1'))
-    lastSocket().emit({ type: 'warning', message: 'Reached maximum loop iterations' })
+    lastSocket().emit({ type: 'warning', message: '已用完本轮循环预算' })
 
     const msg = store.messages.at(-1)
     expect(msg?.role).toBe('assistant')
     expect(msg?.isError).toBe(true)
-    expect(msg?.content).toBe('Reached maximum loop iterations')
+    // 中文提示原样展示（服务端英文内部描述则回落通用提示）。
+    expect(msg?.content).toBe('已用完本轮循环预算')
   })
 
   it('does not clear the streaming state (the run may still be alive)', () => {
@@ -62,11 +63,11 @@ describe('websocket warning events', () => {
 
     useWebSocket(ref('c1'))
     // Mid-run warning, e.g. history compression timed out.
-    lastSocket().emit({ type: 'warning', message: 'History compression timed out, keeping recent messages only' })
+    lastSocket().emit({ type: 'warning', message: '历史压缩超时，仅保留最近消息' })
 
     // The turn keeps streaming — the warning is informational only.
     expect(store.isStreaming).toBe(true)
-    expect(store.messages.at(-1)?.content).toContain('History compression timed out')
+    expect(store.messages.at(-1)?.content).toContain('历史压缩超时')
   })
 
   it('falls back to a generic label when the message field is missing', () => {
@@ -76,6 +77,16 @@ describe('websocket warning events', () => {
     useWebSocket(ref('c1'))
     lastSocket().emit({ type: 'warning' })
 
-    expect(store.messages.at(-1)?.content).toBe('Warning')
+    expect(store.messages.at(-1)?.content).toBe('操作失败，请稍后重试。')
+  })
+
+  it('does not leak a server-side English description', () => {
+    const store = useConversationStore()
+    store.startConversation('c1')
+
+    useWebSocket(ref('c1'))
+    lastSocket().emit({ type: 'warning', message: 'Reached maximum loop iterations' })
+
+    expect(store.messages.at(-1)?.content).toBe('操作失败，请稍后重试。')
   })
 })

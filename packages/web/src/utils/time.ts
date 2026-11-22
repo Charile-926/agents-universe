@@ -16,5 +16,5 @@ export function relativeTime(value: string | number | null | undefined): string 
   if (hours < 24) return t('common.time.hoursAgo', { n: hours })
   const days = Math.floor(hours / 24)
   if (days < 30) return t('common.time.daysAgo', { n: days })
-  return new Date(value).toLocaleDateString(i18n.global.locale.value, { month: 'short', day: 'numeric' })
+  return new Date(value).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })
 }

@@ -220,7 +220,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import {
   Rocket, X, Plus, Bot, Cpu, Clock, KeyRound, Copy, Link,
   ExternalLink, Trash2, Loader2, AlertTriangle,
@@ -234,7 +234,7 @@ import type { PublishItem, PublishKeyItem, PublishKeyCreateResult } from '@/api/
 
 const router = useRouter()
 const route = useRoute()
-const { t } = useI18n()
+const { t } = useT()
 const agentStore = useAgentStore()
 const projectStore = useProjectStore()
 

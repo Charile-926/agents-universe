@@ -9,13 +9,13 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { useConversationStore } from '@/stores/conversation'
 import { useAgentStore } from '@/stores/agent'
 
 const props = defineProps<{ hideStepInfo?: boolean }>()
 
-const { t } = useI18n()
+const { t } = useT()
 const convStore = useConversationStore()
 const agentStore = useAgentStore()
 const now = ref(Date.now())

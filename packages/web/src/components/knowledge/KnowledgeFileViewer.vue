@@ -105,7 +105,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { FileText, X, Loader2, AlertCircle, Tag, ChevronLeft, ChevronRight, FolderOpen, Trash2 } from 'lucide-vue-next'
 import { useProjectStore } from '@/stores/project'
 import { useKnowledgeStore } from '@/stores/knowledge'
@@ -133,7 +133,7 @@ const emit = defineEmits<{ close: [] }>()
 const overlayEl = ref<HTMLElement | null>(null)
 useClickOutside(overlayEl, () => emit('close'), true)
 
-const { t } = useI18n()
+const { t } = useT()
 const projectStore = useProjectStore()
 const knowledgeStore = useKnowledgeStore()
 const navStack = ref<NavEntry[]>([])

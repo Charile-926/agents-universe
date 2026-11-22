@@ -65,7 +65,7 @@ let pendingNewPid: string | null = null
 
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { useRoute, useRouter } from 'vue-router'
 import { useConversationStore } from '@/stores/conversation'
 import { useAgentStore } from '@/stores/agent'
@@ -85,7 +85,7 @@ import AgentCapabilitiesCard from '@/components/chat/AgentCapabilitiesCard.vue'
 
 const route = useRoute()
 const router = useRouter()
-const { t } = useI18n()
+const { t } = useT()
 const convStore = useConversationStore()
 const agentStore = useAgentStore()
 

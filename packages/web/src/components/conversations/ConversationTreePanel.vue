@@ -53,7 +53,7 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { MessageSquare, Plus, Search, X } from 'lucide-vue-next'
 import { useConversationStore } from '@/stores/conversation'
 import { useAgentStore } from '@/stores/agent'
@@ -69,7 +69,7 @@ const emit = defineEmits<{ 'new-conversation': [] }>()
 
 const convStore = useConversationStore()
 const agentStore = useAgentStore()
-const { t } = useI18n()
+const { t } = useT()
 const conversations = ref<ConversationItem[]>([])
 const expandedIds = reactive(new Set<string>())
 const taskCache = reactive(new Map<string, AgentTask[]>())

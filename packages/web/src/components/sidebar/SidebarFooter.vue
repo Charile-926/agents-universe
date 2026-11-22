@@ -8,13 +8,6 @@
         }}</span>
       </div>
       <div class="user-info-actions">
-        <button
-          class="settings-btn"
-          :title="t('sidebar.footer.switchLanguage')"
-          @click="toggleLocale"
-        >
-          <Languages :size="12" />
-        </button>
         <button class="settings-btn" :title="t('sidebar.footer.takeTour')" @click="startTour">
           <Compass :size="12" />
         </button>
@@ -35,34 +28,23 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRouter } from 'vue-router'
-import { useI18n } from 'vue-i18n'
-import { Settings, LogOut, Languages, Compass } from 'lucide-vue-next'
+import { useT } from '@/i18n'
+import { Settings, LogOut, Compass } from 'lucide-vue-next'
 import { useAuthStore } from '@/stores/auth'
 import { useTourStore } from '@/stores/tour'
-import { withApi } from '@/utils/basePath'
-import { setLocale, type AppLocale } from '@/i18n'
-import { patchPreferences } from '@/api/preferences'
+import { withBase } from '@/utils/basePath'
+import { apiFetch } from '@/api/client'
 
 const authStore = useAuthStore()
 const tourStore = useTourStore()
 const router = useRouter()
-const { t, locale } = useI18n()
+const { t } = useT()
 
 const initials = computed(() => {
   const name = authStore.displayName || ''
   if (!name) return '?'
   return name.slice(0, 2).toUpperCase()
 })
-
-function toggleLocale() {
-  const next: AppLocale = locale.value === 'zh-CN' ? 'en-US' : 'zh-CN'
-  setLocale(next)
-  // Keep the server copy in step so the choice follows the account; a failed
-  // write only loses cross-device sync, the local toggle already applied.
-  patchPreferences({ locale: next }).catch((err) => {
-    console.warn('sidebar: failed to persist locale', err)
-  })
-}
 
 function goSettings() {
   router.push('/settings/tokens')
@@ -72,8 +54,13 @@ function startTour() {
   void tourStore.start(0, router)
 }
 
-function handleLogout() {
+async function handleLogout() {
+  try {
+    await apiFetch('/api/auth/logout', { method: 'POST' })
+  } catch {
+    // 服务端失败也要清掉本地会话
+  }
   authStore.logout()
-  window.location.href = withApi('/auth/logout')
+  window.location.href = withBase('/login')
 }
 </script>

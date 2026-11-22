@@ -38,12 +38,12 @@ let mermaidRenderSeq = 0
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { X, ZoomIn, ZoomOut } from 'lucide-vue-next'
 
 const props = defineProps<{ code: string }>()
 
-const { t } = useI18n()
+const { t } = useT()
 
 const containerEl = ref<HTMLElement | null>(null)
 const fsEl = ref<HTMLElement | null>(null)

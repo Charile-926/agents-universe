@@ -75,13 +75,14 @@ describe('Composer attachments', () => {
     expect(wrapper.find('.attachment-error').text()).toContain('文件超出服务器大小限制')
   })
 
-  it('falls back to the server message when the error carries no code', async () => {
+  it('falls back to a generic hint when the error carries no code', async () => {
+    // 服务端原文可能带内部信息，无错误码时只展示通用中文提示。
     mediaMock.upload.mockRejectedValue(new ApiError(500, 'boom'))
     const wrapper = mount(Composer, { props: makeProps() })
     await selectFile(wrapper)
     await flushPromises()
 
-    expect(wrapper.find('.attachment-error').text()).toContain('boom')
+    expect(wrapper.find('.attachment-error').text()).toContain('操作失败，请稍后重试。')
   })
 
   it('shows the size reason for a locally rejected oversized file', async () => {

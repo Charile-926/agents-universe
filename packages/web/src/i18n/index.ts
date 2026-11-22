@@ -54,9 +54,26 @@ export function t(
   })
 }
 
+/**
+ * 历史遗留的语言类型。界面已固定简体中文，保留它只为让旧调用点（preferences、
+ * 引导 tour、时间格式）继续编译；运行时不存在第二种语言。
+ */
+export type AppLocale = 'zh-CN' | 'en-US'
+
+/** 固定语言状态的只读占位，形状对齐旧 `i18n.global.locale.value` 调用。 */
+const localeRef = { value: 'zh-CN' as AppLocale }
+
+/**
+ * 兼容旧调用点：调用后不做任何切换（平台已移除语言切换）。
+ * 保留空实现是为了让仍未清理的调用点不抛错，新代码不应再调用它。
+ */
+export function setLocale(_locale: AppLocale) {
+  /* 单语言：无操作 */
+}
+
 /** 组件内使用：`const { t } = useT()`。 */
 export function useT() {
-  return { t, te }
+  return { t, te, locale: localeRef }
 }
 
 /**
@@ -67,7 +84,7 @@ export const i18n = {
   install() {
     /* 单语言，无需注册任何插件能力 */
   },
-  global: { t, te },
+  global: { t, te, locale: localeRef },
 }
 
 /** 文档语言固定为简体中文。 */

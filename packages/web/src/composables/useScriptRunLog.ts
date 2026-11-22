@@ -1,5 +1,5 @@
 import { ref, nextTick, onBeforeUnmount } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { apiBase } from '@/utils/basePath'
 import { scriptsApi } from '@/api/scripts'
 import { translateErrorCode } from '@/utils/apiError'
@@ -23,7 +23,7 @@ const POLL_MAX_ATTEMPTS = 120
  * and render the same lines.
  */
 export function useScriptRunLog(opts: { onDone?: (done: ScriptRunDone) => void } = {}) {
-  const { t } = useI18n()
+  const { t } = useT()
 
   const activeRunId = ref<string | null>(null)
   const logs = ref<LogLine[]>([])

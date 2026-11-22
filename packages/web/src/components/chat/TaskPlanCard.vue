@@ -47,12 +47,12 @@
 
 <script setup lang="ts">
 import { ref, computed } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { useConversationStore } from '@/stores/conversation'
 import type { AgentTask, ToolCallRecord } from '@/types'
 import ToolCallCard from './ToolCallCard.vue'
 
-const { t } = useI18n()
+const { t } = useT()
 const props = defineProps<{
   tasks: AgentTask[]
   toolCalls: ToolCallRecord[]

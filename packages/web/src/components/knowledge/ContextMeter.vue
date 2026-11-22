@@ -24,11 +24,11 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { Gauge, FileStack, Zap, History } from 'lucide-vue-next'
 import { useConversationStore } from '@/stores/conversation'
 
-const { t } = useI18n()
+const { t } = useT()
 const convStore = useConversationStore()
 
 // Meter shows current context occupancy vs the provider window (falls back

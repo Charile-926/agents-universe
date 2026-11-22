@@ -1,5 +1,5 @@
 import { computed, ref } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { scriptsApi, type RunDetail, type RunRow } from '@/api/scripts'
 
 /**
@@ -11,7 +11,7 @@ import { scriptsApi, type RunDetail, type RunRow } from '@/api/scripts'
  * watching a fresh run land on the same card.
  */
 export function useScriptRunResult() {
-  const { t } = useI18n()
+  const { t } = useT()
 
   const detail = ref<RunDetail | null>(null)
   const history = ref<RunRow[]>([])

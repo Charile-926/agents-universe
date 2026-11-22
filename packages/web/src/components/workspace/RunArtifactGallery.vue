@@ -39,7 +39,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { ExternalLink, Paperclip } from 'lucide-vue-next'
 import { artifactPath, type ArtifactEntry } from '@/api/scripts'
 import { withApi } from '@/utils/basePath'
@@ -50,7 +50,7 @@ const props = defineProps<{
   reportUrl: string | null
 }>()
 
-const { t } = useI18n()
+const { t } = useT()
 
 // The manifest carries the HTML report as an entry too; it is reachable
 // through the sandboxed report URL below, never as a plain download.

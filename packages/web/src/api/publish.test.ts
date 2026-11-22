@@ -109,7 +109,7 @@ describe('publishApi.runSession', () => {
 
     await expect(publishApi.runSession('p1', 'tok', 'hello'))
       .rejects.toMatchObject({ status: 401 })
-    expect(window.location.href).toContain('/auth/login')
+    expect(window.location.href).toContain('/login')
     vi.unstubAllGlobals()
   })
 

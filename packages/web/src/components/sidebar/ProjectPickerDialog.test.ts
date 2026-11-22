@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount, type VueWrapper } from '@vue/test-utils'
 import ProjectPickerDialog from './ProjectPickerDialog.vue'
 import { projectsApi } from '@/api/projects'
-import { setLocale } from '@/i18n'
 import type { Project } from '@/types'
 
 const router = vi.hoisted(() => ({ push: vi.fn() }))
@@ -75,7 +74,6 @@ describe('ProjectPickerDialog', () => {
     wrapper?.unmount()
     wrapper = null
     document.body.innerHTML = ''
-    setLocale('zh-CN')
   })
 
   it('renders the category tag for each favoritable project', async () => {
@@ -89,17 +87,16 @@ describe('ProjectPickerDialog', () => {
     })
   })
 
-  it('renders the localized English category tag when the locale is en-US', async () => {
+  it('honours the zh-CN override of the category tag', async () => {
     projectStore.projects = [
       makeProject({
-        category_i18n: { label: { 'zh-CN': '数据分析', 'en-US': 'Data Analysis' } },
+        category_i18n: { label: { 'zh-CN': '分析数据', 'en-US': 'Data Analysis' } },
       }),
     ]
-    setLocale('en-US')
     wrapper = mount(ProjectPickerDialog, { attachTo: document.body })
     await vi.waitFor(() => {
       const tag = document.querySelector('.picker-category-tag')
-      expect(tag?.textContent).toBe('Data Analysis')
+      expect(tag?.textContent).toBe('分析数据')
     })
   })
 

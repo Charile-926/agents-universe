@@ -126,7 +126,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { useRoute } from 'vue-router'
 import { FileText, FolderTree, Loader2, Pencil, Play, RefreshCw, Terminal, FlaskConical } from 'lucide-vue-next'
 import { apiFetch } from '@/api/client'
@@ -146,7 +146,7 @@ interface ScriptItem { script_id: string; run_id?: string; name: string; status:
 interface SpecItem { slug: string; run_id?: string; title: string; file: string; status: string }
 
 const route = useRoute()
-const { t } = useI18n()
+const { t } = useT()
 const projectId = computed(() => route.params.projectId as string)
 
 const nodes = ref<WorkspaceTreeNode[]>([])

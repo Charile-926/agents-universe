@@ -59,9 +59,9 @@
 
 <script setup lang="ts">
 import { ref, computed, onUnmounted } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 
-const { t } = useI18n()
+const { t } = useT()
 const props = withDefaults(defineProps<{
   promptId: string
   fieldKey: string

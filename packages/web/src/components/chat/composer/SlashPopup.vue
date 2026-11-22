@@ -17,12 +17,12 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { useClickOutside } from '@/composables/useClickOutside'
 
 const emit = defineEmits<{ select: [slug: string]; close: [] }>()
 
-const { t } = useI18n()
+const { t } = useT()
 
 const COMMANDS = [
   { slug: 'plan', description: t('slashCommands.plan') },

@@ -18,7 +18,7 @@
 
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { ChevronDown, ChevronUp } from 'lucide-vue-next'
 
 const props = defineProps<{
@@ -29,7 +29,7 @@ const props = defineProps<{
   live?: boolean
 }>()
 
-const { t } = useI18n()
+const { t } = useT()
 const expanded = ref(props.live ?? false)
 
 watch(

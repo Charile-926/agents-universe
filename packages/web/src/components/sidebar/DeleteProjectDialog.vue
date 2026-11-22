@@ -59,7 +59,7 @@
 
 <script setup lang="ts">
 import { ref, nextTick, onMounted } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { Trash2, X } from 'lucide-vue-next'
 import type { Project } from '@/types'
 import { projectsApi } from '@/api/projects'
@@ -67,7 +67,7 @@ import { ApiError } from '@/api/client'
 import { translateApiError } from '@/utils/apiError'
 import { useClickOutside } from '@/composables/useClickOutside'
 
-const { t } = useI18n()
+const { t } = useT()
 const props = defineProps<{ project: Project }>()
 const emit = defineEmits<{ close: []; deleted: [projectId: string] }>()
 const overlayEl = ref<HTMLElement | null>(null)

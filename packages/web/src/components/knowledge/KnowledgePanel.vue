@@ -111,7 +111,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { BarChart3, Zap, FileCheck, RefreshCw, Sparkles, Library, FolderOpen, FileText, CopyPlus } from 'lucide-vue-next'
 import { useKnowledgeStore } from '@/stores/knowledge'
 import { useKnowledgeData } from '@/composables/useKnowledgeData'
@@ -120,7 +120,7 @@ import KnowledgeFileViewer from './KnowledgeFileViewer.vue'
 import TemplatePickerDialog from './TemplatePickerDialog.vue'
 
 const props = defineProps<{ projectId?: string }>()
-const { t } = useI18n()
+const { t } = useT()
 const knowledgeStore = useKnowledgeStore()
 const viewerSlug = ref<string | null>(null)
 const showTemplatePicker = ref(false)

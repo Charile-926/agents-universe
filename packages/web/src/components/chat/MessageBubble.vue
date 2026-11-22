@@ -156,7 +156,7 @@
 
 <script setup lang="ts">
 import { computed, ref, onUnmounted } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { useRouter } from 'vue-router'
 import { Bot, Download, X, ZoomIn, ZoomOut } from 'lucide-vue-next'
 import { renderMarkdown } from '@/utils/markdown'
@@ -171,7 +171,7 @@ import MermaidBlock from './MermaidBlock.vue'
 
 const props = defineProps<{ message: Message }>()
 
-const { t } = useI18n()
+const { t } = useT()
 const router = useRouter()
 const agentStore = useAgentStore()
 

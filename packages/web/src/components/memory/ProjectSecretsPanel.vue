@@ -47,11 +47,11 @@
 
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { useProjectSecretsStore } from '@/stores/projectSecrets'
 import { useProjectStore } from '@/stores/project'
 
-const { t } = useI18n()
+const { t } = useT()
 const store = useProjectSecretsStore()
 const projectStore = useProjectStore()
 const projectId = computed(() => projectStore.currentProject?.project_id)

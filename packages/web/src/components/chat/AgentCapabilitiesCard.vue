@@ -23,14 +23,14 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { resolveLocalized, localizedText } from '@/utils/localize'
 import type { AgentInfo } from '@/types'
 
 const props = defineProps<{ agent: AgentInfo | null }>()
 const emit = defineEmits<{ 'apply-prompt': [prompt: string] }>()
 
-const { t } = useI18n()
+const { t } = useT()
 
 const agentName = computed(() =>
   props.agent ? localizedText(props.agent.label, props.agent.i18n?.display_name) : '',

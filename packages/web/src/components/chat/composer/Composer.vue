@@ -69,7 +69,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch, reactive } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { Square, FileText, X, Plus, ArrowUp } from 'lucide-vue-next'
 import { EditorView, keymap, placeholder as cmPlaceholder } from '@codemirror/view'
 import { EditorState } from '@codemirror/state'
@@ -119,7 +119,7 @@ const emit = defineEmits<{
   'new-conversation': []
 }>()
 
-const { t } = useI18n()
+const { t } = useT()
 const agentStore = useAgentStore()
 const editorWrap = ref<HTMLElement | null>(null)
 const showMention = ref(false)

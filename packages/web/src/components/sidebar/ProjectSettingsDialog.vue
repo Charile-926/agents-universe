@@ -85,7 +85,7 @@
 
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { Settings, X } from 'lucide-vue-next'
 import type { Project } from '@/types'
 import { projectsApi } from '@/api/projects'
@@ -99,7 +99,7 @@ const emit = defineEmits<{ close: []; changed: [] }>()
 const overlayEl = ref<HTMLElement | null>(null)
 useClickOutside(overlayEl, () => emit('close'), true)
 
-const { t } = useI18n()
+const { t } = useT()
 const projectStore = useProjectStore()
 const membersStore = useProjectMembersStore()
 

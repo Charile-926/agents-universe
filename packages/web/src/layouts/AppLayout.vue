@@ -150,6 +150,14 @@
           </button>
           <button
             class="topbar-icon-btn"
+            :class="{ active: !rightCollapsed && activeTab === 'distill' }"
+            :title="t('skillDistill.title')"
+            @click="openPanel('distill')"
+          >
+            <Wand2 :size="17" />
+          </button>
+          <button
+            class="topbar-icon-btn"
             :title="t('layout.togglePanel')"
             @click="toggleRight"
           >
@@ -204,9 +212,9 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { RouterView, useRouter, useRoute } from 'vue-router'
-import { ChevronLeft, ChevronRight, ChevronDown, Bot, Menu, PanelRight, PanelLeft, BookOpen, Brain, Shrink, SquarePen, Sparkles, Check } from 'lucide-vue-next'
+import { ChevronLeft, ChevronRight, ChevronDown, Bot, Menu, PanelRight, PanelLeft, BookOpen, Brain, Shrink, SquarePen, Sparkles, Check, Wand2 } from 'lucide-vue-next'
 import { useProjectStore } from '@/stores/project'
 import { useAgentStore, AUTO_MODEL_CONFIG_ID } from '@/stores/agent'
 import { useConversationStore } from '@/stores/conversation'
@@ -220,6 +228,7 @@ import ContextMeter from '@/components/knowledge/ContextMeter.vue'
 import ConversationTreePanel from '@/components/conversations/ConversationTreePanel.vue'
 import KnowledgePanel from '@/components/knowledge/KnowledgePanel.vue'
 import MemoryPanel from '@/components/memory/MemoryPanel.vue'
+import SkillDistillPanel from '@/components/skills/SkillDistillPanel.vue'
 import { closeAllConnections } from '@/composables/useWebSocket'
 import { invalidateLatestConversation } from '@/pages/ChatPage.vue'
 import { useProjectData } from '@/composables/useProjectData'
@@ -233,7 +242,7 @@ const leftCollapsed = ref(false)
 // closed and opens from the top-bar icons.
 const rightCollapsed = ref(true)
 const isMobile = ref(false)
-const activeTab = ref<'knowledge' | 'memory'>('knowledge')
+const activeTab = ref<'knowledge' | 'memory' | 'distill'>('knowledge')
 
 /** Sync isMobile flag and auto-collapse sidebars when entering mobile. */
 function checkMobile() {
@@ -290,7 +299,7 @@ function toggleRight() {
 }
 
 /** Open the right drawer on a specific tab (top-bar knowledge/memory icons). */
-function openPanel(tab: 'knowledge' | 'memory') {
+function openPanel(tab: 'knowledge' | 'memory' | 'distill') {
   if (!rightCollapsed.value && activeTab.value === tab) {
     rightCollapsed.value = true
     return
@@ -325,10 +334,11 @@ watch(() => route.fullPath, () => {
 })
 
 /* ── Panel tabs & content ─────────────────────────────────────── */
-const { t } = useI18n()
+const { t } = useT()
 const tabs = computed(() => [
   { id: 'knowledge' as const, label: t('layout.tabKnowledge'), icon: BookOpen },
   { id: 'memory' as const, label: t('layout.tabMemory'), icon: Brain },
+  { id: 'distill' as const, label: t('skillDistill.title'), icon: Wand2 },
 ])
 
 const projectStore = useProjectStore()
@@ -453,13 +463,16 @@ watch(routePid, async (pid) => {
 
 const currentProjectId = computed(() => projectStore.currentProject?.project_id)
 
-const panelComponent = computed(() =>
-  activeTab.value === 'memory' ? MemoryPanel : KnowledgePanel,
-)
+const panelComponent = computed(() => {
+  if (activeTab.value === 'memory') return MemoryPanel
+  if (activeTab.value === 'distill') return SkillDistillPanel
+  return KnowledgePanel
+})
 
-const panelProps = computed(() =>
-  activeTab.value === 'memory' ? {} : { projectId: currentProjectId.value },
-)
+const panelProps = computed(() => {
+  if (activeTab.value === 'memory' || activeTab.value === 'distill') return {}
+  return { projectId: currentProjectId.value }
+})
 
 function handleNewConversation() {
   closeAllConnections()

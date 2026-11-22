@@ -54,7 +54,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { CopyPlus, X } from 'lucide-vue-next'
 import { knowledgeApi } from '@/api/knowledge'
 import { useKnowledgeStore } from '@/stores/knowledge'
@@ -66,7 +66,7 @@ const emit = defineEmits<{ close: []; copied: [slug: string] }>()
 const overlayEl = ref<HTMLElement | null>(null)
 useClickOutside(overlayEl, () => emit('close'), true)
 
-const { t } = useI18n()
+const { t } = useT()
 const knowledgeStore = useKnowledgeStore()
 
 const templates = ref<KnowledgeTemplate[]>([])

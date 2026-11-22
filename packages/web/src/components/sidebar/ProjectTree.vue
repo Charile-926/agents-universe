@@ -38,7 +38,7 @@
 
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { useRouter } from 'vue-router'
 import { Plus, Folder } from 'lucide-vue-next'
 import { useProjectStore } from '@/stores/project'
@@ -47,7 +47,7 @@ import type { Project } from '@/types'
 import { localizedText } from '@/utils/localize'
 import ProjectPickerDialog from './ProjectPickerDialog.vue'
 
-const { t } = useI18n()
+const { t } = useT()
 const projectStore = useProjectStore()
 const favoritesStore = useFavoritesStore()
 const router = useRouter()

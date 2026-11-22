@@ -40,7 +40,7 @@ beforeEach(() => {
 describe('tour store', () => {
   it('setServerState seeds completed from the server', () => {
     const store = useTourStore()
-    store.setServerState({ onboarding_completed: true, onboarding_completed_at: 'x', locale: null })
+    store.setServerState({ onboarding_completed: true, onboarding_completed_at: 'x' })
     expect(store.completed).toBe(true)
   })
 
@@ -48,7 +48,7 @@ describe('tour store', () => {
     const store = useTourStore()
     const done = store.start(0, fakeRouter())
     expect(store.isActive).toBe(true)
-    expect(store.stepIndex).toBe(0) // language step shows synchronously
+    expect(store.stepIndex).toBe(0) // welcome step shows synchronously
 
     await store.skip()
     await flush()
@@ -101,7 +101,6 @@ describe('tour store', () => {
   it('walks a no-project tour through to done and completes', async () => {
     const store = useTourStore()
     const done = store.start(0, fakeRouter())
-    await store.next() // language → welcome
     await store.next() // welcome → project-cta (no project yet)
 
     // advanceTo(create-project-form): opens (missing) dialog → waitFor times out → skip
@@ -130,7 +129,6 @@ describe('tour store', () => {
 
     const store = useTourStore()
     store.start(0, fakeRouter('/projects/p-1/chat'))
-    await store.next() // language → welcome
     await store.next()
 
     // project-cta / create-project-form / project-created all skipped (user
@@ -143,7 +141,6 @@ describe('tour store', () => {
   it('stop cancels the in-flight advance so an immediate restart shows its first step', async () => {
     const store = useTourStore()
     store.start(0, fakeRouter())
-    await store.next() // language → welcome
     await store.next() // welcome → project-cta (no project yet)
     const walking = store.next() // advanceTo(create-project-form): waitFor pending
     store.stop()
@@ -172,7 +169,6 @@ describe('tour store', () => {
 
     const store = useTourStore()
     store.start(0, fakeRouter('/projects/p-1/chat'))
-    await store.next() // language → welcome
     await store.next()
     const chatComposer = TOUR_STEPS.findIndex((s) => s.id === 'chat-composer')
     expect(store.stepIndex).toBe(chatComposer)

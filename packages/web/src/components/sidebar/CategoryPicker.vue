@@ -30,11 +30,11 @@
 </template>
 
 <script setup lang="ts">
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { localizedText } from '@/utils/localize'
 import type { ProjectCategory } from '@/types'
 
-const { t } = useI18n()
+const { t } = useT()
 
 defineProps<{
   modelValue: string

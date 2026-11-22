@@ -58,10 +58,10 @@
 
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { Bot, MessageSquare, BookOpen, Brain, Plus } from 'lucide-vue-next'
 import CreateProjectDialog from '@/components/sidebar/CreateProjectDialog.vue'
 
-const { t } = useI18n()
+const { t } = useT()
 const showCreate = ref(false)
 </script>

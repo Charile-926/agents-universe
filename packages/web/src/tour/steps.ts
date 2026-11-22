@@ -87,19 +87,7 @@ const noProjects = () => useProjectStore().projects.length === 0
 const hasProject = () => currentProjectId() != null
 
 export const TOUR_STEPS: TourStep[] = [
-  // First, an explicit language pick — the rest of the tour (and the app)
-  // renders in the chosen language immediately after the click.
-  {
-    id: 'language',
-    titleKey: 'tour.language.title',
-    bodyKey: 'tour.language.body',
-    center: true,
-    choices: [
-      { label: '中文', value: 'zh-CN' },
-      { label: 'English', value: 'en-US' },
-    ],
-  },
-
+  // 语言选择步骤已随「移除多语言」下线：界面固定简体中文，不再让用户选语言。
   { id: 'welcome', titleKey: 'tour.welcome.title', bodyKey: 'tour.welcome.body', center: true },
 
   // Create-first-project branch (only when the user has no projects yet)

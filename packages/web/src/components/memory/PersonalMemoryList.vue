@@ -35,13 +35,13 @@
 
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { Brain, Plus, Trash2 } from 'lucide-vue-next'
 import { useMemoryStore } from '@/stores/memory'
 import { useProjectStore } from '@/stores/project'
 import { memoriesApi } from '@/api/memories'
 
-const { t } = useI18n()
+const { t } = useT()
 const memoryStore = useMemoryStore()
 const projectStore = useProjectStore()
 

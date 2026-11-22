@@ -456,7 +456,7 @@ describe('useWebSocket error frame settlement', () => {
     expect(store.isStreaming).toBe(true)
     expect(store.messages).toHaveLength(1)
     expect(store.messages[0].isError).toBe(true)
-    expect(store.messages[0].content).toContain('No pending prompt')
+    expect(store.messages[0].content).toBe('操作失败，请稍后重试。')
   })
 
   it('terminal errors still settle the turn', () => {

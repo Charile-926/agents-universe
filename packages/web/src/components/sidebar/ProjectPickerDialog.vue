@@ -134,7 +134,7 @@
 
 <script setup lang="ts">
 import { ref, computed, nextTick, watch, onMounted } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { useRouter } from 'vue-router'
 import { Folder, FolderHeart, Star, Search, SearchX, Plus, X, Trash2, Settings } from 'lucide-vue-next'
 import { useProjectStore } from '@/stores/project'
@@ -151,7 +151,7 @@ const emit = defineEmits<{ close: [] }>()
 const overlayEl = ref<HTMLElement | null>(null)
 useClickOutside(overlayEl, () => emit('close'), true)
 
-const { t } = useI18n()
+const { t } = useT()
 const projectStore = useProjectStore()
 const favoritesStore = useFavoritesStore()
 const router = useRouter()

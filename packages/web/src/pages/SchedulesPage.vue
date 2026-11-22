@@ -327,7 +327,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useRoute } from 'vue-router'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import {
   CalendarClock, Plus, Loader2, Play, Pencil, Trash2, Terminal, ChevronDown,
   Clock, Globe, Repeat, Link2, ListChecks, Bot, FlaskConical, X, History,
@@ -346,7 +346,7 @@ interface ScriptItem { script_id: string; name: string; script_type: string }
 interface SpecItem { slug: string; title: string; file: string }
 
 const route = useRoute()
-const { t } = useI18n()
+const { t } = useT()
 const store = useSchedulesStore()
 const agentStore = useAgentStore()
 const projectId = computed(() => route.params.projectId as string)

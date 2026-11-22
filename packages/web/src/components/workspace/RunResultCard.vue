@@ -39,7 +39,7 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import type { RunResult } from '@/api/scripts'
 
 const props = defineProps<{
@@ -51,7 +51,7 @@ const props = defineProps<{
   completedAt?: string | null
 }>()
 
-const { t } = useI18n()
+const { t } = useT()
 
 const verdict = computed(() => {
   const status = props.result?.status || props.status

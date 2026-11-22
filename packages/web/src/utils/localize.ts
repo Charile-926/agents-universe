@@ -1,22 +1,20 @@
-import { i18n } from '@/i18n'
 import type { LocaleOverrides } from '@/types'
 
 /**
- * Resolve a canonical value against the current locale's overrides.
+ * Resolve a canonical value against the overrides of the single supported
+ * locale (简体中文).
  *
- * Data payloads carry the zh canonical in the top-level fields plus a
- * per-locale map for the non-canonical languages — `overrides[locale] ??
- * canonical`. Reading `i18n.global.locale.value` here makes every caller
- * inside a computed re-evaluate on a locale switch, so the UI updates
- * instantly without refetching.
+ * 平台已移除语言切换，overrides 里只可能命中 zh-CN 那一份；canonical 本身
+ * 就是中文，因此直接取 canonical，命中时再用 overrides 覆盖。
  */
+const LOCALE = 'zh-CN'
+
 export function resolveLocalized<T>(
   canonical: T | null | undefined,
   overrides: LocaleOverrides<T> | null | undefined,
 ): T | undefined {
   if (!overrides) return canonical ?? undefined
-  const locale = i18n.global.locale.value as string
-  return (overrides as Record<string, T | undefined>)[locale] ?? canonical ?? undefined
+  return (overrides as Record<string, T | undefined>)[LOCALE] ?? canonical ?? undefined
 }
 
 /** String variant of resolveLocalized with an explicit fallback. */

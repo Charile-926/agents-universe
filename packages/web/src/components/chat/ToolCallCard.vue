@@ -59,11 +59,11 @@
 
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { ChevronDown, ChevronUp } from 'lucide-vue-next'
 import type { ToolCallRecord } from '@/types'
 
-const { t } = useI18n()
+const { t } = useT()
 const props = defineProps<{ call: ToolCallRecord; defaultExpanded?: boolean }>()
 const expanded = ref(props.defaultExpanded ?? false)
 

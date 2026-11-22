@@ -1,15 +1,11 @@
 /**
- * Compile-check every message in both locales.
+ * 中文文案目录自检。
  *
- * vue-i18n parses `@`, `{`, `|` as message-format syntax at compile time; a
- * bare `@` (e.g. the @-mention tour step) throws "Invalid linked format"
- * while rendering - which silently kills whatever component shows the
- * message. Walking every key through t() fails the test before that class
- * of bug reaches a screen.
+ * 平台已固定简体中文，这里只需要保证：目录里每条文案都能被 t() 解析（不会
+ * 出现空串或被原样回吐的 key），以及关键页面文案齐全，避免界面上出现空白。
  */
 import { describe, expect, it } from 'vitest'
 import zhCN from './locales/zh-CN'
-import enUS from './locales/en-US'
 import { i18n } from './index'
 
 function flatten(obj: Record<string, unknown>, prefix = ''): [string, string][] {
@@ -22,28 +18,21 @@ function flatten(obj: Record<string, unknown>, prefix = ''): [string, string][] 
   return out
 }
 
-describe('locale messages', () => {
-  it('every message in both locales compiles', () => {
+describe('中文文案目录', () => {
+  it('每条文案都能解析且非空', () => {
     const bad: string[] = []
-    for (const locale of ['zh-CN', 'en-US'] as const) {
-      i18n.global.locale.value = locale
-      const msgs = (locale === 'zh-CN' ? zhCN : enUS) as Record<string, unknown>
-      for (const [key, msg] of flatten(msgs)) {
-        try {
-          i18n.global.t(key)
-        } catch (e) {
-          bad.push(`[${locale}] ${key}: "${msg}" -> ${e instanceof Error ? e.message.split('\n')[0] : e}`)
-        }
-      }
+    for (const key of flatten(zhCN as Record<string, unknown>).map(([k]) => k)) {
+      const resolved = i18n.global.t(key)
+      if (!resolved || resolved === key || !resolved.trim()) bad.push(key)
     }
     expect(bad).toEqual([])
   })
 
-  it('zh-CN and en-US expose the same key set', () => {
-    const zhKeys = new Set(flatten(zhCN as Record<string, unknown>).map(([k]) => k))
-    const enKeys = new Set(flatten(enUS as Record<string, unknown>).map(([k]) => k))
-    const onlyZh = [...zhKeys].filter(k => !enKeys.has(k))
-    const onlyEn = [...enKeys].filter(k => !zhKeys.has(k))
-    expect({ onlyZh, onlyEn }).toEqual({ onlyZh: [], onlyEn: [] })
+  it('关键页面文案齐全', () => {
+    expect(i18n.global.t('auth.title')).toBe('Agents Universe')
+    expect(i18n.global.t('auth.submitLogin')).toBe('登录')
+    expect(i18n.global.t('skillDistill.title')).toBe('炼化 Skill')
+    expect(i18n.global.t('layout.tabConversations')).not.toBe('layout.tabConversations')
+    expect(i18n.global.t('errors.UNKNOWN')).toContain('操作失败')
   })
 })

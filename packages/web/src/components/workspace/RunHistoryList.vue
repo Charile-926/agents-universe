@@ -20,7 +20,7 @@
 </template>
 
 <script setup lang="ts">
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import type { RunRow } from '@/api/scripts'
 
 defineProps<{
@@ -31,7 +31,7 @@ defineProps<{
 
 const emit = defineEmits<{ select: [runId: string] }>()
 
-const { t } = useI18n()
+const { t } = useT()
 
 function verdictOf(run: RunRow): string {
   const status = run.summary?.status || run.status

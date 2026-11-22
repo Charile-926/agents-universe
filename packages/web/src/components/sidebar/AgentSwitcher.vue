@@ -87,7 +87,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { Bot, Plus } from 'lucide-vue-next'
 import { useAgentStore } from '@/stores/agent'
 import { useFavoritesStore } from '@/stores/favorites'
@@ -97,7 +97,7 @@ import { localizedText } from '@/utils/localize'
 import type { AgentInfo } from '@/types'
 import AgentPickerDialog from './AgentPickerDialog.vue'
 
-const { t } = useI18n()
+const { t } = useT()
 const agentStore = useAgentStore()
 const favoritesStore = useFavoritesStore()
 const projectStore = useProjectStore()

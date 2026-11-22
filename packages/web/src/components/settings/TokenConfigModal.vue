@@ -447,7 +447,7 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { KeyRound, X, Cpu, Zap, Cloud, GitBranch, BookOpen, Globe, Sparkles } from 'lucide-vue-next'
 import { apiFetch, ApiError } from '@/api/client'
 import { modelConfigsApi } from '@/api/modelConfigs'
@@ -465,7 +465,7 @@ const emit = defineEmits<{ close: [] }>()
 const props = defineProps<{ targetConfigId?: string | null }>()
 const overlayEl = ref<HTMLElement | null>(null)
 useClickOutside(overlayEl, () => emit('close'), true)
-const { t } = useI18n()
+const { t } = useT()
 const agentStore = useAgentStore()
 const projectStore = useProjectStore()
 

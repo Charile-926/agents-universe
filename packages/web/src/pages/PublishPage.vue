@@ -124,7 +124,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, nextTick, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { Bot, Send, Square, Sparkles, Loader2, Zap, AlertTriangle, X } from 'lucide-vue-next'
 import { publishApi } from '@/api/publish'
 import { ApiError } from '@/api/client'
@@ -134,7 +134,7 @@ import { translateApiErrorWith } from '@/utils/apiError'
 
 const route = useRoute()
 const router = useRouter()
-const { t } = useI18n()
+const { t } = useT()
 
 const publishId = computed(() => route.params.publishId as string)
 

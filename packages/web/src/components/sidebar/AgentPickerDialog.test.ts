@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { mount, type VueWrapper } from '@vue/test-utils'
-import { setLocale } from '@/i18n'
 import AgentPickerDialog from './AgentPickerDialog.vue'
 import type { AgentInfo } from '@/types'
 
@@ -54,7 +53,6 @@ describe('AgentPickerDialog', () => {
     wrapper?.unmount()
     wrapper = null
     document.body.innerHTML = ''
-    setLocale('zh-CN')
   })
 
   function mountDialog() {
@@ -124,7 +122,8 @@ describe('AgentPickerDialog', () => {
   })
 
   it('filters agents across languages via the search box', async () => {
-    // Canonical label is zh, en override lives only in i18n.
+    // Canonical label is zh, en override lives only in i18n — the search must
+    // still match English even though the UI itself is single-language.
     agentStore.agents = [
       {
         ...makeAgent('tech-lead', 'agile-development', '技术负责人'),
@@ -136,16 +135,15 @@ describe('AgentPickerDialog', () => {
     await vi.waitFor(() => expect(document.querySelectorAll('.picker-item').length).toBe(2))
 
     // Search in English against the en override of a zh canonical agent.
-    setLocale('en-US')
     const input = document.querySelector<HTMLInputElement>('.picker-search')!
     input.value = 'tech lead'
     input.dispatchEvent(new Event('input', { bubbles: true }))
     await vi.waitFor(() => {
       const names = [...document.querySelectorAll('.picker-item-name')].map(n => n.textContent)
-      expect(names).toEqual(['Tech Lead'])
+      expect(names).toEqual(['技术负责人'])
     })
 
-    // Search in Chinese against the zh canonical while locale is en-US.
+    // Search in Chinese against the zh canonical.
     input.value = '数据分析'
     input.dispatchEvent(new Event('input', { bubbles: true }))
     await vi.waitFor(() => {

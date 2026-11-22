@@ -36,12 +36,12 @@
 
 <script setup lang="ts">
 import { reactive } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useT } from '@/i18n'
 import { ChevronDown, ChevronUp, History } from 'lucide-vue-next'
 import { useMemoryStore } from '@/stores/memory'
 import { relativeTime } from '@/utils/time'
 
-const { t } = useI18n()
+const { t } = useT()
 const memoryStore = useMemoryStore()
 const expanded = reactive(new Set<string>())
 

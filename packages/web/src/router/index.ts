@@ -1,17 +1,23 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { basePath, withApi } from '@/utils/basePath'
+import { useProjectStore } from '@/stores/project'
 
 /**
- * 单页路由：登录页 + 炼化工作台。
+ * 路由表：基础工作台（项目 / 对话 / 工作区 / 发布 / 定时任务 / API Key 配置）
+ * + 本地账号登录 + 炼化 Skill。
  *
- * 原多页面工作区（对话 / 工作区 / 发布 / 定时任务）已下线，所有旧链接统一
- * 重定向到工作台，避免书签 404。
+ * 炼化 Skill 只是工作台里的一个核心能力：它挂在右栏 tab 上（AppLayout），
+ * 同时保留 /distill 独立页面，便于直接分发入口。
  */
 const router = createRouter({
   history: createWebHistory(basePath || '/'),
   routes: [
     {
-      path: '/',
+      path: '/login',
+      component: () => import('@/pages/LoginPage.vue'),
+    },
+    {
+      path: '/distill',
       component: () => import('@/layouts/AppShell.vue'),
       children: [
         {
@@ -22,20 +28,73 @@ const router = createRouter({
     },
     {
       path: '/app',
-      component: () => import('@/layouts/AppShell.vue'),
+      component: () => import('@/layouts/AppLayout.vue'),
       children: [
         {
           path: '',
-          component: () => import('@/pages/DistillPage.vue'),
+          component: () => import('@/pages/EmptyProjectPage.vue'),
         },
       ],
     },
     {
-      path: '/login',
-      component: () => import('@/pages/LoginPage.vue'),
+      path: '/projects/:projectId',
+      component: () => import('@/layouts/AppLayout.vue'),
+      children: [
+        {
+          path: '',
+          redirect: (to) => ({ path: `/projects/${to.params.projectId}/chat` }),
+        },
+        {
+          path: 'chat',
+          component: () => import('@/pages/ChatPage.vue'),
+        },
+        {
+          path: 'workspace',
+          component: () => import('@/pages/WorkspacePage.vue'),
+        },
+        {
+          path: 'publishes',
+          component: () => import('@/pages/PublishesPage.vue'),
+        },
+        {
+          path: 'schedules',
+          component: () => import('@/pages/SchedulesPage.vue'),
+        },
+        // 知识库与脚本已并入统一工作区 tab，旧链接重定向以保住书签。
+        {
+          path: 'knowledge',
+          redirect: (to) => ({ path: `/projects/${to.params.projectId}/workspace` }),
+        },
+        {
+          path: 'scripts',
+          redirect: (to) => ({ path: `/projects/${to.params.projectId}/workspace` }),
+        },
+      ],
     },
     {
-      path: '/projects/:pathMatch(.*)*',
+      path: '/settings/tokens',
+      component: () => import('@/pages/TokenConfigPage.vue'),
+    },
+    {
+      // 发布管理已并入项目布局，旧书签落到当前项目的 publishes。
+      path: '/settings/publishes',
+      redirect: () => {
+        const store = useProjectStore()
+        const wanted = store.currentProject?.project_id ?? store.getSavedProjectId()
+        if (store.projects.length > 0) {
+          const match = store.projects.find(p => p.project_id === wanted) ?? store.projects[0]
+          return { path: `/projects/${match.project_id}/publishes` }
+        }
+        return wanted ? { path: `/projects/${wanted}/publishes` } : '/app'
+      },
+    },
+    {
+      // 对外已发布智能体的独立对话页，刻意放在 AppLayout 之外。
+      path: '/p/:publishId',
+      component: () => import('@/pages/PublishPage.vue'),
+    },
+    {
+      path: '/',
       redirect: '/app',
     },
     {
@@ -49,8 +108,14 @@ const router = createRouter({
 let authChecked = false
 
 router.beforeEach(async (to, _from, next) => {
-  if (to.path === '/login') { next(); return }
-  if (authChecked) { next(); return }
+  if (to.path === '/login') {
+    next()
+    return
+  }
+  if (authChecked) {
+    next()
+    return
+  }
   try {
     const res = await fetch(withApi('/api/me'), { credentials: 'include' })
     if (res.status === 401) {

@@ -1,7 +1,6 @@
-import { afterAll, beforeAll, describe, it, expect } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import { mount } from '@vue/test-utils'
 import ToolCallCard from './ToolCallCard.vue'
-import { setLocale } from '@/i18n'
 import type { ToolCallRecord } from '@/types'
 
 function makeCall(tool: string, status: ToolCallRecord['status'] = 'done'): ToolCallRecord {
@@ -58,17 +57,13 @@ describe('ToolCallCard', () => {
 })
 
 describe('ToolCallCard — delegation', () => {
-  // The app defaults to zh-CN; the labels below are asserted in English, and
-  // one test switches back to prove the keys exist in both locales.
-  beforeAll(() => setLocale('en-US'))
-  afterAll(() => setLocale('zh-CN'))
-
+  // 平台固定简体中文，卡片文案一律断言中文。
   it('shows who was asked and what was asked of them, without expanding', () => {
     const wrapper = mount(ToolCallCard, { props: { call: makeDelegation() } })
 
     // The raw tool name would tell the user nothing; the target slug is the
     // conversation's agent prefix stripped down to the agent's own name.
-    expect(wrapper.find('.tool-call-name').text()).toBe('→ Delegated to demo--tech-lead')
+    expect(wrapper.find('.tool-call-name').text()).toBe('→ 委派给 demo--tech-lead')
     const text = wrapper.text()
     expect(text).toContain('I have no repository access.')
     expect(text).toContain('Review PR #12 and report the blocking issues.')
@@ -94,8 +89,8 @@ describe('ToolCallCard — delegation', () => {
     })
 
     // The display name replaces the slug as soon as the result carries one.
-    expect(wrapper.find('.tool-call-name').text()).toBe('→ Delegated to Tech Lead')
-    expect(wrapper.find('.tool-call-badge').text()).toBe('done')
+    expect(wrapper.find('.tool-call-name').text()).toBe('→ 委派给 Tech Lead')
+    expect(wrapper.find('.tool-call-badge').text()).toBe('已完成')
     expect(wrapper.text()).toContain('Found two blocking issues in the migration.')
     expect(wrapper.find('.tool-call-meta').text()).toBe('1200 tokens · 42s')
   })
@@ -110,7 +105,7 @@ describe('ToolCallCard — delegation', () => {
       },
     })
 
-    expect(wrapper.find('.tool-call-badge').text()).toBe('refused')
+    expect(wrapper.find('.tool-call-badge').text()).toBe('已拒绝')
     expect(wrapper.find('.delegation-error').text()).toBe('unknown agent')
   })
 
@@ -124,8 +119,8 @@ describe('ToolCallCard — delegation', () => {
       },
     })
 
-    expect(wrapper.find('.tool-call-badge').text()).toBe('stopped')
-    expect(wrapper.text()).toContain('The agent stopped before reporting back.')
+    expect(wrapper.find('.tool-call-badge').text()).toBe('已停止')
+    expect(wrapper.text()).toContain('该智能体在汇报前已停止。')
   })
 
   it('keeps the raw tool name when the target is unknown', () => {
@@ -149,24 +144,5 @@ describe('ToolCallCard — delegation', () => {
     })
 
     expect(wrapper.find('.tool-call-badge').text()).toBe('exploded')
-  })
-
-  it('renders the card in the active locale', () => {
-    setLocale('zh-CN')
-    try {
-      const wrapper = mount(ToolCallCard, {
-        props: {
-          call: makeDelegation({
-            status: 'done',
-            output: { status: 'refused', agent: 'demo--tech-lead' },
-          }),
-        },
-      })
-
-      expect(wrapper.find('.tool-call-name').text()).toBe('→ 委派给 demo--tech-lead')
-      expect(wrapper.find('.tool-call-badge').text()).toBe('已拒绝')
-    } finally {
-      setLocale('en-US')
-    }
   })
 })
