@@ -1,15 +1,11 @@
-# Test fixtures
+# 测试夹具
 
-Upload assets referenced by generated specs live here. `playwright test` runs
-with `tests/` as the working directory, so a fixture is addressed as
-`fixtures/<name>` — never with `__dirname` (the specs are ESM, where it does
-not exist).
+生成的测试用例所引用的上传素材放在这里。`playwright test` 以 `tests/` 为工作目录
+运行，因此夹具按 `fixtures/<名称>` 引用，不要使用 `__dirname`（用例是 ESM 模块，
+其中没有这个变量）。
 
-Prefer generating the payload inline in the spec (`content` / `content_base64`
-on the case's `uploads` entry) when it is small and synthetic: the test then
-carries its own data and cannot rot when a file is moved. Put a file here when
-it is large (over ~512KB), shared by several cases, or must be byte-identical
-to a real-world sample.
+如果素材很小且是合成数据，优先在用例里内联生成（用例 `uploads` 项的 `content` /
+`content_base64` 字段）：这样数据跟着用例走，文件被移动也不会失效。只有素材较大
+（约 512KB 以上）、被多个用例共用，或必须与真实样本逐字节一致时，才放到这里。
 
-Fixtures are inputs, not results — Playwright writes screenshots, videos and
-traces to `test-results/`.
+夹具是输入而不是产物——Playwright 的截图、录像与 trace 会写到 `test-results/`。

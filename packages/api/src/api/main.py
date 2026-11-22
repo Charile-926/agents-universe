@@ -238,21 +238,45 @@ def create_app() -> FastAPI:
     from fastapi import Request
     from fastapi.responses import JSONResponse
 
+    # 接口文档默认关闭：/docs 会完整列出内部 API 路径与参数结构。
+    _docs = settings.api_docs_enabled
     app = FastAPI(
         title="Agents Universe API",
         version="0.1.0",
         root_path=settings.app_root_path,
         lifespan=lifespan,
+        docs_url="/docs" if _docs else None,
+        redoc_url="/redoc" if _docs else None,
+        openapi_url="/openapi.json" if _docs else None,
     )
 
     _app_log = _logging.getLogger("agents_universe.http")
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
+        # 堆栈只进服务端日志；响应体给用户可理解的中文提示，且带稳定错误码，
+        # 便于前端映射，不泄露内部实现（表名、路径、异常类型）。
         _app_log.error(
             "Unhandled exception on %s %s", request.method, request.url.path, exc_info=exc
         )
-        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+        return JSONResponse(
+            status_code=500,
+            content={"detail": {"code": "INTERNAL_ERROR", "message": "服务器内部错误，请稍后重试。"}},
+        )
+
+    from fastapi.exceptions import RequestValidationError
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        # Pydantic 的原始错误包含字段路径与类型名，属于内部结构；日志留全量，
+        # 响应只给一句中文提示。
+        _app_log.info(
+            "Validation failed on %s %s: %s", request.method, request.url.path, exc.errors()
+        )
+        return JSONResponse(
+            status_code=422,
+            content={"detail": {"code": "REQUEST_INVALID", "message": "请求参数不合法，请检查后重试。"}},
+        )
 
     app.add_middleware(StructuredLoggingMiddleware)
 
@@ -295,12 +319,19 @@ def create_app() -> FastAPI:
     from .routers.auth import router as auth_router
     app.include_router(auth_router)
 
+    # Local username/password auth (register/login/logout) — shares the SSO
+    # Redis session + cookie, so it works alongside or instead of OAuth.
+    from .routers.auth_local import router as auth_local_router
+    app.include_router(auth_local_router)
+
     # API routers
-    from .routers import agents, api_keys, conversations, integrations, knowledge, mcp_servers, media, memories, model_configs, preferences, project_members, project_secrets, projects, publish, schedules, script_runs, scripts, tier_models, tokens, workspace_files
+    from .routers import agents, api_keys, conversations, integrations, knowledge, mcp_servers, media, memories, model_configs, preferences, project_members, project_secrets, projects, publish, schedules, script_runs, scripts, skills_distill, tier_models, tokens, workspace_files
 
     app.include_router(agents.router, tags=["agents"])
     app.include_router(projects.router, tags=["projects"])
     app.include_router(conversations.router, tags=["conversations"])
+    # 聊天记录/工具调用炼化为 Skill —— 只读当前账号自己的数据。
+    app.include_router(skills_distill.router)
     app.include_router(knowledge.router, tags=["knowledge"])
     app.include_router(tokens.router, prefix="/api/tokens", tags=["tokens"])
     app.include_router(api_keys.router, prefix="/api/api-keys", tags=["api-keys"])

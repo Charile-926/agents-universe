@@ -14,10 +14,11 @@ from .publish import AgentPublish, PublishKey
 from .schedule import ScheduledTask, ScheduledTaskRun
 from .task_event import TaskEvent
 from .script import AutomationScript, ScriptRun
-from .user import UserApiKey, UserModelConfig, UserPreference, UserTierModel, UserToken
+from .user import UserAccount, UserApiKey, UserModelConfig, UserPreference, UserTierModel, UserToken
 
 __all__ = [
     "Base",
+    "UserAccount",
     "UserToken", "UserApiKey", "UserTierModel", "UserModelConfig", "UserPreference",
     "Project", "ProjectDeletionJob",
     "ProjectSecret", "ProjectMember",

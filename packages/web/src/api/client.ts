@@ -1,4 +1,4 @@
-import { withApi } from '@/utils/basePath'
+import { withApi, withBase } from '@/utils/basePath'
 
 export class ApiError extends Error {
   /** Partial assistant text received before a streaming error killed the run. */
@@ -28,7 +28,7 @@ let redirectingToLogin = false
 function redirectToLogin(): void {
   if (redirectingToLogin) return
   redirectingToLogin = true
-  window.location.href = withApi('/auth/login')
+  window.location.href = withBase('/login')
 }
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
@@ -62,7 +62,7 @@ export async function apiFetch<T>(url: string, options?: RequestInit, expectedSt
         : typeof source?.message === 'string'
           ? source.message
           : `${res.status} ${res.statusText}`
-    if (res.status === 401 && url !== '/api/me') {
+    if (res.status === 401 && url !== '/api/me' && !url.startsWith('/api/auth/')) {
       redirectToLogin()
     }
     throw new ApiError(
@@ -91,7 +91,7 @@ export async function apiFetchRaw(url: string, options?: RequestInit): Promise<R
     ...options,
     credentials: 'include',
   })
-  if (res.status === 401 && url !== '/api/me') {
+  if (res.status === 401 && url !== '/api/me' && !url.startsWith('/api/auth/')) {
     redirectToLogin()
   }
   return res

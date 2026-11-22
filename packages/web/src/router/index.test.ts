@@ -1,63 +1,39 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-const projectStore = vi.hoisted(() => ({
-  currentProject: null as { project_id: string } | null,
-  projects: [] as Array<{ project_id: string }>,
-  getSavedProjectId: vi.fn(),
-}))
-vi.mock('@/stores/project', () => ({ useProjectStore: () => projectStore }))
-
-// Stub the lazy route components so navigation resolves without pulling in
-// the real AppLayout/PublishesPage dependency graphs.
-vi.mock('@/layouts/AppLayout.vue', () => ({ default: { name: 'AppLayoutStub', template: '<div />' } }))
-vi.mock('@/pages/PublishesPage.vue', () => ({ default: { name: 'PublishesPageStub', template: '<div />' } }))
-vi.mock('@/pages/EmptyProjectPage.vue', () => ({ default: { name: 'EmptyProjectPageStub', template: '<div />' } }))
+// 桩掉懒加载页面，避免导航时拉入真实布局依赖
+vi.mock('@/layouts/AppShell.vue', () => ({ default: { name: 'AppShellStub', template: '<div />' } }))
+vi.mock('@/pages/DistillPage.vue', () => ({ default: { name: 'DistillPageStub', template: '<div />' } }))
+vi.mock('@/pages/LoginPage.vue', () => ({ default: { name: 'LoginPageStub', template: '<div />' } }))
 
 import router from './index'
 
-// The auth guard calls /api/me on first navigation; stub it so navigation
-// proceeds without a real network round trip.
 beforeEach(() => {
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, status: 200 }))
-  projectStore.currentProject = null
-  projectStore.projects = []
-  projectStore.getSavedProjectId.mockReturnValue(null)
 })
 
-function project(id: string) {
-  return { project_id: id }
-}
-
-describe('router publish routes', () => {
-  it('serves /projects/:id/publishes directly', async () => {
-    await router.push('/projects/p1/publishes')
-    expect(router.currentRoute.value.path).toBe('/projects/p1/publishes')
+describe('router — 单页路由表', () => {
+  it('根路径进入炼化工作台', async () => {
+    await router.push('/')
+    expect(router.currentRoute.value.path).toBe('/')
   })
 
-  it('redirects /settings/publishes to the current project publishes tab', async () => {
-    projectStore.projects = [project('p1'), project('p2')]
-    projectStore.getSavedProjectId.mockReturnValue('p1')
-    await router.push('/settings/publishes')
-    expect(router.currentRoute.value.path).toBe('/projects/p1/publishes')
+  it('/app 进入炼化工作台', async () => {
+    await router.push('/app')
+    expect(router.currentRoute.value.path).toBe('/app')
   })
 
-  it('falls back to the first project when the saved id is stale', async () => {
-    projectStore.projects = [project('p1'), project('p2')]
-    projectStore.getSavedProjectId.mockReturnValue('ghost')
-    await router.push('/settings/publishes')
-    expect(router.currentRoute.value.path).toBe('/projects/p1/publishes')
+  it('登录页可直接访问', async () => {
+    await router.push('/login')
+    expect(router.currentRoute.value.path).toBe('/login')
   })
 
-  it('prefers the open project over the saved one', async () => {
-    projectStore.projects = [project('p1'), project('p2')]
-    projectStore.currentProject = project('p2')
-    projectStore.getSavedProjectId.mockReturnValue('p1')
-    await router.push('/settings/publishes')
-    expect(router.currentRoute.value.path).toBe('/projects/p2/publishes')
+  it('已下线的项目/对话路径回到工作台', async () => {
+    await router.push('/projects/p1/chat')
+    expect(router.currentRoute.value.path).toBe('/app')
   })
 
-  it('lands on /app when there is no project to target', async () => {
-    await router.push('/settings/publishes')
+  it('未知路径回到工作台', async () => {
+    await router.push('/settings/tokens')
     expect(router.currentRoute.value.path).toBe('/app')
   })
 })

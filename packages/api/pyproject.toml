@@ -17,6 +17,11 @@ dependencies = [
     "python-multipart>=0.0.12",
     # DB
     "sqlalchemy[asyncio]>=2.0.0",
+    # 默认存储：PostgreSQL（账号、项目、会话、工具调用记录）
+    "asyncpg>=0.29.0",
+    # Alembic 走同步驱动（postgresql+asyncpg → postgresql+psycopg2）
+    "psycopg2-binary>=2.9.9",
+    # 旧部署回退：SQL Server 驱动（DATABASE_URL 指向 mssql 时才需要）
     "aioodbc>=0.5.0",
     "pyodbc>=5.1.0",
     "alembic>=1.13.0",

@@ -25,28 +25,24 @@ _ENV_FILES = (str(_PROJECT_ROOT / ".env"), ".env")
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=_ENV_FILES, env_file_encoding="utf-8", extra="ignore")
 
-    # Database — individual fields (preferred over MSSQL_CONNECTION_STRING)
+    # Database — PostgreSQL 是默认存储（账号、项目、会话、工具调用记录）。
+    # 完整的 DATABASE_URL 优先级最高；未设置时用下面这些字段拼 postgresql+asyncpg。
     db_host: str = "127.0.0.1"
-    db_port: int = 1433
+    db_port: int = 5432
     db_name: str = "agentsuniverse"
-    db_user: str = "sa"
-    db_password: str = "YourPassword"
-    db_driver: str = "ODBC Driver 17 for SQL Server"
-    db_trust_cert: bool = True
+    db_user: str = "agents"
+    db_password: str = "agents"
 
     # DB connection pool (tune for expected concurrent users)
     db_pool_size: int = 10
     db_max_overflow: int = 20
     db_pool_timeout: int = 30
 
-    # Fallback: full connection string (used only when db_host is left at default
-    # AND this env var is explicitly set, e.g. for Docker or SQLite test overrides)
+    # 兼容旧部署的整串连接（例如迁移前的 SQL Server 实例）。仅在 DATABASE_URL
+    # 未设置时作为回退，值可以是任意 SQLAlchemy URL。
     mssql_connection_string: str = ""
 
-    # Full connection URL — highest-priority override for multi-database support.
-    # Takes precedence over MSSQL_CONNECTION_STRING and the DB_* fields; accepts
-    # any SQLAlchemy URL (mssql+aioodbc / postgresql+asyncpg / mysql+aiomysql /
-    # sqlite+aiosqlite). Unset in production means "SQL Server via DB_* fields".
+    # 完整连接 URL，优先级最高。默认形态：postgresql+asyncpg://user:pass@host:5432/db
     database_url: str = ""
 
     # Security
@@ -126,6 +122,10 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
     log_format: str = "json"  # "json" | "human"
+
+    # OpenAPI 文档（/docs、/redoc、/openapi.json）。默认关闭：接口清单与
+    # 内部路径不应暴露给普通用户；本地调试时显式设为 true。
+    api_docs_enabled: bool = False
 
     # Auth bypass (local dev only — never enable in production)
     auth_bypass_enabled: bool = False
@@ -222,18 +222,16 @@ class Settings(BaseSettings):
             return self.test_database_url
         if self.database_url:
             return self.database_url
-        # DB_* individual fields are the primary path.
-        # mssql_connection_string is a last-resort legacy override (e.g. non-standard drivers).
-        if not self.mssql_connection_string:
-            driver = quote_plus(self.db_driver)
-            password = quote_plus(self.db_password)
-            trust = "&TrustServerCertificate=yes" if self.db_trust_cert else ""
-            return (
-                f"mssql+aioodbc://{self.db_user}:{password}"
-                f"@{self.db_host}:{self.db_port}/{self.db_name}"
-                f"?driver={driver}{trust}"
-            )
-        return self.mssql_connection_string
+        # DB_* 字段拼 PostgreSQL URL（默认存储形态）。
+        # mssql_connection_string 是旧部署的回退覆盖。
+        if self.mssql_connection_string:
+            return self.mssql_connection_string
+        user = quote_plus(self.db_user)
+        password = quote_plus(self.db_password)
+        return (
+            f"postgresql+asyncpg://{user}:{password}"
+            f"@{self.db_host}:{self.db_port}/{self.db_name}"
+        )
 
 
 @lru_cache

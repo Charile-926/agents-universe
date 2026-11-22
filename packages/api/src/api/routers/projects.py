@@ -108,8 +108,10 @@ def _serialize_project(
         "parent_id": str(project.parent_id) if project.parent_id else None,
         "can_delete": is_owner
             and (child_ids is None or project.project_id not in child_ids),
-        "fs_path": str(_project_fs_path(project, parent_slug)),
-        "created_by": project.created_by,
+        # fs_path intentionally omitted: the on-disk workspace path is internal
+        # server information and must never reach the browser.
+        # created_by is omitted for the same reason — it is an internal account
+        # id. Ownership is expressed by the boolean flags below.
         "visibility": project.visibility,
         "is_owner": is_owner,
         "can_manage": is_owner or (

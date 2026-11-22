@@ -3,11 +3,32 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, Integer, String, Unicode, UniqueConstraint
+from sqlalchemy import Boolean, Integer, String, Text, Unicode, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..database import Base
 from ._compat import UTCDateTime, new_uuid as _new_uuid, now_utc as _now_utc
+
+
+class UserAccount(Base):
+    """本地账号：账号 + 密码登录，敏感字段加密落库。
+
+    库里不保存用户名/显示名明文：``username_hash`` 是 HMAC 摘要（唯一约束 +
+    登录查找），``username_enc`` / ``display_name_enc`` 是 Fernet 密文；
+    ``password_hash`` 是 PBKDF2 单向哈希。加解密实现见
+    ``api.services.user_crypto``。
+    """
+    __tablename__ = "user_accounts"
+    __table_args__ = (
+        UniqueConstraint("username_hash", name="uq_user_account_username_hash"),
+    )
+
+    user_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    username_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    username_enc: Mapped[str] = mapped_column(Text, nullable=False)
+    display_name_enc: Mapped[str | None] = mapped_column(Text)
+    password_hash: Mapped[str] = mapped_column(String(500), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=_now_utc)
 
 
 class UserToken(Base):
@@ -54,9 +75,6 @@ class UserPreference(Base):
     user_id: Mapped[str] = mapped_column(String(100), primary_key=True)
     onboarding_completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     onboarding_completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
-    # UI locale ('zh-CN' | 'en-US'); None = never chosen (frontend falls back
-    # to localStorage / zh-CN default).
-    locale: Mapped[str | None] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=_now_utc)
     updated_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 

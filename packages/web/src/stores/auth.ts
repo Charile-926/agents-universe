@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { apiFetch } from '@/api/client'
 
 export const useAuthStore = defineStore('auth', () => {
   const userId = ref<string | null>(null)
@@ -23,5 +24,21 @@ export const useAuthStore = defineStore('auth', () => {
     isAuthenticated.value = false
   }
 
-  return { userId, displayName, isAuthenticated, activeUsersCount, setUser, setActiveUsersCount, logout }
+  async function login(username: string, password: string) {
+    const data = await apiFetch<{ user_id: string; display_name: string }>(
+      '/api/auth/login',
+      { method: 'POST', body: JSON.stringify({ username, password }) },
+    )
+    setUser({ userId: data.user_id, displayName: data.display_name })
+  }
+
+  async function register(username: string, password: string, displayName?: string) {
+    const data = await apiFetch<{ user_id: string; display_name: string }>(
+      '/api/auth/register',
+      { method: 'POST', body: JSON.stringify({ username, password, display_name: displayName }) },
+    )
+    setUser({ userId: data.user_id, displayName: data.display_name })
+  }
+
+  return { userId, displayName, isAuthenticated, activeUsersCount, setUser, setActiveUsersCount, logout, login, register }
 })

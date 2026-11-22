@@ -47,7 +47,7 @@ Web UI / API: http://localhost:8000（`/api`、`/ws` 同源反代）· 热重载
 
 ```bash
 # 依赖服务（compose 文件同上，从 example 复制）
-docker compose up -d sqlserver redis
+docker compose up -d postgres redis
 
 # 环境变量：cp .env.example .env，生成 SECRET_KEY（同上），
 # 并把 PROJECTS_ROOT 设为已存在的绝对路径

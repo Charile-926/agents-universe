@@ -16,13 +16,8 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DB_HOST=sqlserver
-      - DB_PORT=1433
-      - DB_NAME=agentsuniverse
-      - DB_USER=sa
-      - DB_PASSWORD=${DB_PASSWORD:-YourPassword}
-      - DB_DRIVER=ODBC Driver 17 for SQL Server
-      - DB_TRUST_CERT=true
+      # PostgreSQL 是默认存储（账号、项目、会话、工具调用记录）
+      - DATABASE_URL=postgresql+asyncpg://agents:${DB_PASSWORD:-agents}@postgres:5432/agentsuniverse
       - REDIS_URL=redis://redis:6379/0
       # ${VAR:-default} interpolation reads .env — so these stay editable in
       # .env (plain FOO= entries under `environment:` would override env_file)
@@ -48,7 +43,7 @@ services:
       - ${DOCKER_VOLUME_ROOT:-./data}/maven:/home/appuser/.m2
       - ${DOCKER_VOLUME_ROOT:-./data}/gradle:/home/appuser/.gradle
     depends_on:
-      sqlserver:
+      postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -98,20 +93,19 @@ services:
       api:
         condition: service_healthy
 
-  sqlserver:
-    image: mcr.microsoft.com/mssql/server:2019-latest
+  postgres:
+    image: postgres:16-alpine
     environment:
-      - ACCEPT_EULA=Y
-      - SA_PASSWORD=${DB_PASSWORD:-YourPassword}
-      - MSSQL_PID=Express
+      - POSTGRES_DB=agentsuniverse
+      - POSTGRES_USER=agents
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-agents}
     ports:
-      - "1433:1433"
+      - "5432:5432"
     volumes:
-      # Named volume, NOT a bind mount: SQL Server's PAL crashes on Windows
-      # bind mounts (Docker Desktop gRPC-FUSE incompatibility).
-      - sqlserver_data:/var/opt/mssql
+      # Named volume: 数据库文件不放进项目目录，避免误删与权限问题。
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "${DB_PASSWORD:-YourPassword}" -C -Q "SELECT 1" || exit 1
+      test: ["CMD-SHELL", "pg_isready -U agents -d agentsuniverse"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -128,8 +122,7 @@ services:
       timeout: 5s
       retries: 5
 
-# Persistent data: bind mounts under DOCKER_VOLUME_ROOT (see .env) for
-# everything EXCEPT SQL Server — which uses a named volume because its PAL
-# crashes on Windows bind mounts (Docker Desktop gRPC-FUSE incompatibility).
+# Persistent data: 项目工作区等用 DOCKER_VOLUME_ROOT 下的 bind mount；
+# PostgreSQL 数据用命名卷，随 `docker compose down -v` 一并清理。
 volumes:
-  sqlserver_data:
+  postgres_data:

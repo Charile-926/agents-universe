@@ -36,5 +36,4 @@ def serialize_preferences(row: UserPreference) -> dict:
     return {
         "onboarding_completed": row.onboarding_completed,
         "onboarding_completed_at": row.onboarding_completed_at,
-        "locale": row.locale,
     }

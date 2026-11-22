@@ -7,8 +7,9 @@ tags: ["database", "sql-server", "schema"]
 
 # Database Schema Reference
 
-The schema below is written in SQL Server terms (the production dialect).
-Since the multi-database rollout the same ORM model runs on four dialects —
+The schema below is written in SQL Server terms; PostgreSQL is the default
+production dialect for this build (accounts, projects, conversations and tool
+call records all live there). The same ORM model still runs on four dialects —
 see [Supported Databases](#supported-databases) for the type mapping.
 
 ## Supported Databases
@@ -18,8 +19,8 @@ All four are first-class citizens, switched via `DATABASE_URL` (see
 
 | Dialect | App driver (async) | Alembic driver (sync) | Notes |
 |---|---|---|---|
-| SQL Server | `mssql+aioodbc` | `mssql+pyodbc` | Default production DB; DB_* fields build its URL |
-| PostgreSQL | `postgresql+asyncpg` | `postgresql+psycopg2` | CI live-job dialect |
+| SQL Server | `mssql+aioodbc` | `mssql+pyodbc` | Legacy deployments only (`MSSQL_CONNECTION_STRING` fallback) |
+| PostgreSQL | `postgresql+asyncpg` | `postgresql+psycopg2` | **Default**: DB_* fields build its URL; CI live-job dialect |
 | MySQL | `mysql+aiomysql` | `mysql+pymysql` | Create DB with `utf8mb4` + `utf8mb4_0900_bin` (case-sensitive slug uniqueness) |
 | SQLite | `sqlite+aiosqlite` | `sqlite` | Test suite runs the real alembic chain per session |
 
