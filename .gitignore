@@ -78,3 +78,6 @@ packages/api/alembic/__pycache__/
 
 # Local dev startup script (machine-specific overrides)
 /dev-start.ps1
+
+# WorkBuddy AI local state (memory/artifacts, not repo content)
+.workbuddy-ai/
