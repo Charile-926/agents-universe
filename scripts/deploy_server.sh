@@ -176,7 +176,10 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   git status --short --untracked-files=no | sed 's/^/         /'
 fi
 log "拉取 origin/$BRANCH"
-run "git fetch origin '$BRANCH'"
+# 显式 refspec：只写 `git fetch origin main` 时，若服务器没有配置
+# remote.origin.fetch，只会更新 FETCH_HEAD 而不更新 origin/main，
+# 后面的 reset 就会停在旧提交（部署"成功"却还是旧代码）。
+run "git fetch origin '$BRANCH:refs/remotes/origin/$BRANCH'"
 run "git reset --hard 'origin/$BRANCH'"
 
 # ── 4. 构建镜像（--target final 不能省）────────────────────────────────────
