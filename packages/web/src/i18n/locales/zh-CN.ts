@@ -461,6 +461,7 @@ export default {
     tabPublishes: '发布',
     tabSchedules: '定时任务',
     newChat: '新建对话',
+    projectRequiredHint: '请先新建或选择一个项目，再使用该功能',
     selectAgent: '选择智能体',
     selectModel: '选择模型',
     openKnowledge: '知识面板',

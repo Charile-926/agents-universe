@@ -461,6 +461,7 @@ export default {
     tabPublishes: 'Publishes',
     tabSchedules: 'Scheduled Tasks',
     newChat: 'New chat',
+    projectRequiredHint: 'Create or select a project before using this feature',
     selectAgent: 'Select agent',
     selectModel: 'Select model',
     openKnowledge: 'Knowledge panel',

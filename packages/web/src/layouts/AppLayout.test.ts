@@ -6,7 +6,7 @@ import AppLayout from './AppLayout.vue'
 const routerPush = vi.hoisted(() => vi.fn())
 const routeState = vi.hoisted(() => ({
   path: '/projects/p-1/publishes',
-  params: { projectId: 'p-1' },
+  params: { projectId: 'p-1' } as Record<string, string>,
   fullPath: '/projects/p-1/publishes',
 }))
 vi.mock('vue-router', () => ({
@@ -23,7 +23,7 @@ vi.mock('@/pages/ChatPage.vue', () => ({
 }))
 
 const projectStore = vi.hoisted(() => ({
-  currentProject: { project_id: 'p-1' },
+  currentProject: { project_id: 'p-1' } as { project_id: string } | null,
   projects: [],
   setCurrentProject: vi.fn(),
   setProjects: vi.fn(),
@@ -69,6 +69,9 @@ vi.mock('@/components/memory/MemoryPanel.vue', () => ({ default: { name: 'ChildS
 // topnav reads so no test inherits the previous one's ledger/conversation.
 beforeEach(() => {
   Object.defineProperty(window, 'innerWidth', { value: 1280, configurable: true })
+  routeState.params = { projectId: 'p-1' }
+  projectStore.currentProject = { project_id: 'p-1' }
+  routerPush.mockClear()
   conversationStore.conversationId = null
   conversationStore.tokensUsed = 0
   conversationStore.messages = []
@@ -134,6 +137,18 @@ describe('AppLayout panel toggles', () => {
       .toBe(i18n.global.t('layout.toggleSidebar'))
     expect(wrapper.find('.panel-right .sidebar-toggle').attributes('title'))
       .toBe(i18n.global.t('layout.togglePanel'))
+  })
+
+  it('clicking a project entry without a project shows a usage hint', async () => {
+    routeState.path = '/app'
+    routeState.params = {}
+    projectStore.currentProject = null
+    const wrapper = mount(AppLayout)
+    await wrapper.findAll('.sidebar-nav-item')[1].trigger('click')
+    expect(routerPush).not.toHaveBeenCalled()
+    expect(wrapper.find('.app-hint-toast').text())
+      .toBe(i18n.global.t('layout.projectRequiredHint'))
+    projectStore.currentProject = { project_id: 'p-1' }
   })
 
   it('offers an expand button once the sidebar is collapsed', async () => {

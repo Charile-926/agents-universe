@@ -9,28 +9,6 @@
         <p class="empty-project-tagline">{{ t('emptyProject.tagline') }}</p>
       </div>
 
-      <div class="feature-cards">
-        <div class="feature-card">
-          <span class="feature-card-icon">
-            <MessageSquare :size="20" />
-          </span>
-          <div class="feature-card-body">
-            <h3 class="feature-card-title">{{ t('emptyProject.featureChatTitle') }}</h3>
-            <p class="feature-card-desc">{{ t('emptyProject.featureChatDesc') }}</p>
-          </div>
-        </div>
-
-        <div class="feature-card">
-          <span class="feature-card-icon">
-            <Brain :size="20" />
-          </span>
-          <div class="feature-card-body">
-            <h3 class="feature-card-title">{{ t('emptyProject.featureMemoryTitle') }}</h3>
-            <p class="feature-card-desc">{{ t('emptyProject.featureMemoryDesc') }}</p>
-          </div>
-        </div>
-      </div>
-
       <div class="empty-project-cta">
         <p class="empty-project-hint">{{ t('emptyProject.hint') }}</p>
         <button class="btn-primary empty-project-btn" @click="showCreate = true">
@@ -49,7 +27,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { useT } from '@/i18n'
-import { Bot, MessageSquare, Brain, Plus } from 'lucide-vue-next'
+import { Bot, Plus } from 'lucide-vue-next'
 import CreateProjectDialog from '@/components/sidebar/CreateProjectDialog.vue'
 
 const { t } = useT()

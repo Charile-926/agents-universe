@@ -53,6 +53,8 @@
 }
 .new-chat-btn:hover:not(:disabled) { background: var(--bg-secondary); }
 .new-chat-btn:disabled { background: var(--bg-primary); }
+/* Still clickable so the click can explain why it is unavailable. */
+.new-chat-btn.is-inactive { color: var(--text-secondary); }
 
 .sidebar-nav {
   display: flex;
@@ -83,6 +85,8 @@
 .sidebar-nav-item.active { background: var(--bg-tertiary); font-weight: 600; }
 .sidebar-nav-item:disabled { opacity: 0.45; cursor: not-allowed; }
 .sidebar-nav-item:disabled:hover { background: transparent; }
+.sidebar-nav-item.is-inactive { opacity: 0.45; }
+.sidebar-nav-item.is-inactive:hover { background: var(--bg-tertiary); }
 .sidebar-nav-item svg { flex: 0 0 auto; color: var(--text-secondary); }
 .sidebar-nav-item.active svg { color: var(--text-primary); }
 
@@ -330,3 +334,21 @@
   .chat-agent-strip { width: 100%; justify-content: center; }
   .composer-chip-text { max-width: 110px; }
 }
+
+/* 项目相关入口在没有项目时的点击提示：白底细边框，无阴影 */
+.app-hint-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  z-index: 300;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+

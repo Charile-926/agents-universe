@@ -32,7 +32,7 @@
       <template v-if="!leftCollapsed">
         <button
           class="new-chat-btn"
-          :disabled="!projectStore.currentProject"
+          :class="{ 'is-inactive': !projectStore.currentProject }"
           @click="handleNewConversation"
         >
           <SquarePen :size="16" />
@@ -51,16 +51,14 @@
           </button>
           <button
             class="sidebar-nav-item"
-            :class="{ active: pageSegment === 'workspace' }"
-            :disabled="!currentProjectId"
+            :class="{ active: pageSegment === 'workspace', 'is-inactive': !currentProjectId }"
             @click="goToPage('workspace')"
           >
             <LayoutGrid :size="15" /><span>{{ t('layout.tabWorkspace') }}</span>
           </button>
           <button
             class="sidebar-nav-item"
-            :class="{ active: pageSegment === 'schedules' }"
-            :disabled="!currentProjectId"
+            :class="{ active: pageSegment === 'schedules', 'is-inactive': !currentProjectId }"
             @click="goToPage('schedules')"
           >
             <Clock :size="15" /><span>{{ t('layout.tabSchedules') }}</span>
@@ -136,6 +134,10 @@
         </Transition>
       </template>
     </aside>
+
+    <Transition name="fade">
+      <div v-if="navHint" class="app-hint-toast" role="status">{{ navHint }}</div>
+    </Transition>
   </div>
 </template>
 
@@ -167,6 +169,15 @@ const leftCollapsed = ref(false)
 const rightCollapsed = ref(true)
 const isMobile = ref(false)
 const activeTab = ref<'memory'>('memory')
+const navHint = ref('')
+let navHintTimer: ReturnType<typeof setTimeout> | undefined
+
+/** Show a short inline hint when a project-scoped entry is clicked without a project. */
+function showNavHint(message: string) {
+  navHint.value = message
+  if (navHintTimer) clearTimeout(navHintTimer)
+  navHintTimer = setTimeout(() => { navHint.value = '' }, 2600)
+}
 
 /** Sync isMobile flag and auto-collapse sidebars when entering mobile. */
 function checkMobile() {
@@ -249,6 +260,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('resize', checkMobile)
   window.visualViewport?.removeEventListener('resize', updateAppHeight)
+  if (navHintTimer) clearTimeout(navHintTimer)
 })
 
 /* ── Auto-close sidebars on navigation (mobile) ───────────────── */
@@ -302,7 +314,10 @@ const pageSegment = computed(() => {
 
 function goToPage(segment: 'chat' | 'workspace' | 'schedules') {
   const pid = route.params.projectId
-  if (!pid) return
+  if (!pid) {
+    showNavHint(t('layout.projectRequiredHint'))
+    return
+  }
   // No query forwarding: ?new=1 belongs to a specific entry flow
   // and must not leak into a tab switch (a stale ?new=1 would silently reset
   // the conversation). The mobile sidebar auto-close is handled by the
@@ -350,6 +365,10 @@ function handleNewConversation() {
   // from auto-restoring the latest conversation after a non-chat-page click.
   invalidateLatestConversation()
   const id = projectStore.currentProject?.project_id
-  if (id) router.push(`/projects/${id}/chat?new=1`)
+  if (!id) {
+    showNavHint(t('layout.projectRequiredHint'))
+    return
+  }
+  router.push(`/projects/${id}/chat?new=1`)
 }
 </script>
