@@ -52,6 +52,7 @@ const projectStore = useProjectStore()
 const favoritesStore = useFavoritesStore()
 const router = useRouter()
 const showPicker = ref(false)
+const emit = defineEmits<{ navigate: [] }>()
 
 /** 公共项目默认直接出现在侧栏；只有项目列表尚未加载时才回退到收藏缓存。 */
 const listedProjects = computed<Project[]>(() => {
@@ -65,6 +66,7 @@ function selectProject(project: Project) {
   // clicking it must still navigate into its chat page (setCurrentProject is
   // idempotent).
   projectStore.setCurrentProject(project)
+  emit('navigate')
   router.push(`/projects/${project.project_id}/chat`)
 }
 </script>

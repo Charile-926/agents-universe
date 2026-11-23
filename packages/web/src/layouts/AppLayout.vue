@@ -73,7 +73,7 @@
           </button>
         </nav>
 
-        <ProjectTree />
+        <ProjectTree @navigate="closeMobilePanels" />
 
         <div class="sidebar-conversations" data-tour-target="panel-tab-conversations">
           <ConversationTreePanel
@@ -99,9 +99,7 @@
         <PanelLeft :size="17" />
       </button>
       <div class="center-content">
-        <Transition name="route-fade" mode="out-in">
-          <RouterView />
-        </Transition>
+        <RouterView />
       </div>
     </main>
 
