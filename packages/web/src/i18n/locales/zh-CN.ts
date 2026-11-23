@@ -488,6 +488,8 @@ export default {
   workspace: {
     title: '工作区',
     refresh: '刷新文件树',
+    collapseTree: '收起文件树',
+    expandTree: '展开文件树',
     emptyTree: '暂无文件',
     loadFailed: '加载文件树失败',
     loadFileFailed: '读取文件失败',

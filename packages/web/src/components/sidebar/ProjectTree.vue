@@ -8,12 +8,12 @@
     </div>
 
     <div class="project-list">
-      <div v-if="favoritesStore.resolvedFavoriteProjects.length === 0" class="empty-hint empty-state">
+      <div v-if="listedProjects.length === 0" class="empty-hint empty-state">
         <span class="empty-state-icon"><Folder :size="16" /></span>
         <span>{{ t('sidebar.projects.emptyHint') }}</span>
       </div>
       <div
-        v-for="project in favoritesStore.resolvedFavoriteProjects"
+        v-for="project in listedProjects"
         :key="project.project_id"
         class="project-item"
         :class="{ active: projectStore.currentProject?.project_id === project.project_id }"
@@ -37,7 +37,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { useT } from '@/i18n'
 import { useRouter } from 'vue-router'
 import { Plus, Folder } from 'lucide-vue-next'
@@ -52,6 +52,12 @@ const projectStore = useProjectStore()
 const favoritesStore = useFavoritesStore()
 const router = useRouter()
 const showPicker = ref(false)
+
+/** 公共项目默认直接出现在侧栏；只有项目列表尚未加载时才回退到收藏缓存。 */
+const listedProjects = computed<Project[]>(() => {
+  if (projectStore.projects.length > 0) return projectStore.projects
+  return favoritesStore.resolvedFavoriteProjects
+})
 
 function selectProject(project: Project) {
   // No early-return on the current project — after a browser back/refresh the

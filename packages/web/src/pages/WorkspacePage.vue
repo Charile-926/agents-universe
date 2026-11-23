@@ -1,27 +1,42 @@
 <template>
-  <div class="workspace-page">
-    <!-- Left: file tree -->
-    <div class="workspace-sidebar">
-      <div class="workspace-header">
+  <div class="workspace-page" :class="{ 'tree-collapsed': treeCollapsed }">
+    <!-- Left: file tree (collapsible) -->
+    <div class="workspace-sidebar" :class="{ 'is-collapsed': treeCollapsed }">
+      <div v-if="!treeCollapsed" class="workspace-header">
         <h2 class="page-title">{{ t('workspace.title') }}</h2>
-        <button class="workspace-refresh" :title="t('workspace.refresh')" @click="reloadTree">
-          <RefreshCw :size="13" :class="{ spin: loadingRoot }" />
-        </button>
+        <div class="workspace-header-actions">
+          <button class="workspace-refresh" :title="t('workspace.refresh')" @click="reloadTree">
+            <RefreshCw :size="13" :class="{ spin: loadingRoot }" />
+          </button>
+          <button class="workspace-refresh" :title="t('workspace.collapseTree')" @click="treeCollapsed = true">
+            <PanelLeftClose :size="13" />
+          </button>
+        </div>
       </div>
-      <div v-if="error" class="workspace-error">{{ error }}</div>
-      <div v-if="loadingRoot && !nodes.length" class="workspace-loading skeleton">
-        <Loader2 :size="16" class="spin" />
-      </div>
-      <FileTree
-        v-if="nodes.length"
-        :nodes="nodes"
-        @select="onSelect"
-        @toggle="onToggle"
-      />
-      <div v-else-if="!loadingRoot" class="workspace-empty empty-state">
-        <span class="empty-state-icon"><FolderTree :size="16" /></span>
-        <span>{{ t('workspace.emptyTree') }}</span>
-      </div>
+      <button
+        v-else
+        class="workspace-tree-expand"
+        :title="t('workspace.expandTree')"
+        @click="treeCollapsed = false"
+      >
+        <PanelLeft :size="15" />
+      </button>
+      <template v-if="!treeCollapsed">
+        <div v-if="error" class="workspace-error">{{ error }}</div>
+        <div v-if="loadingRoot && !nodes.length" class="workspace-loading skeleton">
+          <Loader2 :size="16" class="spin" />
+        </div>
+        <FileTree
+          v-if="nodes.length"
+          :nodes="nodes"
+          @select="onSelect"
+          @toggle="onToggle"
+        />
+        <div v-else-if="!loadingRoot" class="workspace-empty empty-state">
+          <span class="empty-state-icon"><FolderTree :size="16" /></span>
+          <span>{{ t('workspace.emptyTree') }}</span>
+        </div>
+      </template>
     </div>
 
     <!-- Right: content -->
@@ -128,7 +143,7 @@
 import { ref, computed, watch, onMounted } from 'vue'
 import { useT } from '@/i18n'
 import { useRoute } from 'vue-router'
-import { FileText, FolderTree, Loader2, Pencil, Play, RefreshCw, Terminal, FlaskConical } from 'lucide-vue-next'
+import { FileText, FolderTree, Loader2, Pencil, Play, RefreshCw, Terminal, FlaskConical, PanelLeft, PanelLeftClose } from 'lucide-vue-next'
 import { apiFetch } from '@/api/client'
 import { scriptsApi } from '@/api/scripts'
 import { workspaceApi } from '@/api/workspace'
@@ -152,6 +167,7 @@ const projectId = computed(() => route.params.projectId as string)
 const nodes = ref<WorkspaceTreeNode[]>([])
 const loadingRoot = ref(false)
 const error = ref<string | null>(null)
+const treeCollapsed = ref(false)
 let loadSeq = 0
 
 // Selection

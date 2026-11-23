@@ -488,6 +488,8 @@ export default {
   workspace: {
     title: 'Workspace',
     refresh: 'Refresh file tree',
+    collapseTree: 'Collapse file tree',
+    expandTree: 'Expand file tree',
     emptyTree: 'No files yet',
     loadFailed: 'Failed to load file tree',
     loadFileFailed: 'Failed to read file',

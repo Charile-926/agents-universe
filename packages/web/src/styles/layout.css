@@ -5153,6 +5153,7 @@ textarea:focus-visible {
   height: 100%;
   overflow: hidden;
 }
+.workspace-page.tree-collapsed { grid-template-columns: 48px 1fr; }
 
 .workspace-sidebar {
   border-right: 1px solid var(--border);
@@ -5160,6 +5161,28 @@ textarea:focus-visible {
   padding: 12px 0;
   background: var(--bg-secondary);
 }
+.workspace-sidebar.is-collapsed {
+  padding: 10px 0 0;
+  display: flex;
+  justify-content: center;
+  overflow: hidden;
+}
+.workspace-tree-expand {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.workspace-tree-expand:hover { color: var(--text-primary); background: var(--bg-tertiary); }
+
+.workspace-header-actions { display: flex; align-items: center; gap: 2px; }
 
 .workspace-header {
   display: flex;

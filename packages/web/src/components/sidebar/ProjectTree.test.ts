@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount } from '@vue/test-utils'
 import ProjectTree from './ProjectTree.vue'
 import type { Project } from '@/types'
@@ -8,6 +8,7 @@ vi.mock('vue-router', () => ({ useRouter: () => router }))
 
 const projectStore = vi.hoisted(() => ({
   currentProject: null as Project | null,
+  projects: [] as Project[],
   setCurrentProject: vi.fn(),
 }))
 vi.mock('@/stores/project', () => ({ useProjectStore: () => projectStore }))
@@ -36,6 +37,11 @@ function makeProject(over: Partial<Project> = {}): Project {
 }
 
 describe('ProjectTree', () => {
+  beforeEach(() => {
+    projectStore.projects = []
+    favorites.resolvedFavoriteProjects = []
+  })
+
   it('renders the category tag for favorited projects', () => {
     favorites.resolvedFavoriteProjects = [makeProject()]
     const wrapper = mount(ProjectTree)
@@ -82,6 +88,13 @@ describe('ProjectTree', () => {
     favorites.resolvedFavoriteProjects = []
     const wrapper = mount(ProjectTree)
     expect(wrapper.find('.empty-hint').text()).toContain('收藏项目')
+  })
+
+  it('lists all available projects without requiring a favorite', () => {
+    projectStore.projects = [makeProject({ project_id: 'p-1' }), makeProject({ project_id: 'p-2', display_name: '官网改版' })]
+    const wrapper = mount(ProjectTree)
+    expect(wrapper.findAll('.project-item').length).toBe(2)
+    expect(wrapper.find('.empty-hint').exists()).toBe(false)
   })
 
   it('selects the project and navigates on click', async () => {
