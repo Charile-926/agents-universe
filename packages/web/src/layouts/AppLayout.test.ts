@@ -63,12 +63,12 @@ vi.mock('@/components/sidebar/AgentPickerDialog.vue', () => ({ default: { name: 
 vi.mock('@/components/sidebar/SidebarFooter.vue', () => ({ default: { name: 'ChildStub', template: '<div />' } }))
 vi.mock('@/components/knowledge/ContextMeter.vue', () => ({ default: { name: 'ChildStub', template: '<div />' } }))
 vi.mock('@/components/conversations/ConversationTreePanel.vue', () => ({ default: { name: 'ChildStub', template: '<div />' } }))
-vi.mock('@/components/knowledge/KnowledgePanel.vue', () => ({ default: { name: 'ChildStub', template: '<div />' } }))
 vi.mock('@/components/memory/MemoryPanel.vue', () => ({ default: { name: 'ChildStub', template: '<div />' } }))
 
 // The conversation store mock is shared mutable state — reset the fields the
 // topnav reads so no test inherits the previous one's ledger/conversation.
 beforeEach(() => {
+  Object.defineProperty(window, 'innerWidth', { value: 1280, configurable: true })
   conversationStore.conversationId = null
   conversationStore.tokensUsed = 0
   conversationStore.messages = []
@@ -78,12 +78,12 @@ beforeEach(() => {
 })
 
 describe('AppLayout sidebar primary navigation', () => {
-  it('renders 炼化 Skill 在最上，其后是工作区 / 发布 / 定时任务 / 知识 / 记忆', () => {
-    routeState.path = '/projects/p-1/publishes'
+  it('renders 炼化 Skill 在最上，其后是工作区 / 定时任务 / 记忆', () => {
+    routeState.path = '/projects/p-1/schedules'
     const wrapper = mount(AppLayout)
     const items = wrapper.findAll('.sidebar-nav-item')
     expect(items.map(t => t.text().trim())).toEqual([
-      '炼化 Skill', '工作区', '发布', '定时任务', '知识', '记忆',
+      '炼化 Skill', '工作区', '定时任务', '记忆',
     ])
     expect(items[2].classes()).toContain('active')
     expect(items[1].classes()).not.toContain('active')
@@ -93,8 +93,8 @@ describe('AppLayout sidebar primary navigation', () => {
     routeState.path = '/projects/p-1/schedules'
     const wrapper = mount(AppLayout)
     const items = wrapper.findAll('.sidebar-nav-item')
-    expect(items[3].classes()).toContain('active')
-    expect(items[2].classes()).not.toContain('active')
+    expect(items[2].classes()).toContain('active')
+    expect(items[1].classes()).not.toContain('active')
   })
 
   it('navigates to the workspace page when 工作区 is clicked', async () => {
@@ -111,13 +111,16 @@ describe('AppLayout sidebar primary navigation', () => {
     expect(routerPush).toHaveBeenCalledWith('/distill')
   })
 
-  it('no longer renders the retired top bar or its pickers', () => {
+  it('no longer renders the retired top bar, pickers or deleted 发布/知识 entries', () => {
     routeState.path = '/projects/p-1/chat'
     const wrapper = mount(AppLayout)
     expect(wrapper.find('.main-topbar').exists()).toBe(false)
     expect(wrapper.find('.center-topnav').exists()).toBe(false)
     expect(wrapper.find('.model-picker').exists()).toBe(false)
     expect(wrapper.find('.agent-picker-btn').exists()).toBe(false)
+    const labels = wrapper.findAll('.sidebar-nav-item').map(i => i.text().trim())
+    expect(labels).not.toContain('发布')
+    expect(labels).not.toContain('知识')
   })
 })
 
@@ -133,12 +136,21 @@ describe('AppLayout panel toggles', () => {
       .toBe(i18n.global.t('layout.togglePanel'))
   })
 
-  it('right drawer only carries 知识 / 记忆 tabs now that 炼化 moved to the sidebar', () => {
+  it('offers an expand button once the sidebar is collapsed', async () => {
     routeState.path = '/projects/p-1/chat'
     const wrapper = mount(AppLayout)
-    // Drawer starts collapsed, so open it via the 知识 nav entry first.
+    expect(wrapper.find('.sidebar-expand-btn').exists()).toBe(false)
+    await wrapper.find('.sidebar-left .sidebar-toggle').trigger('click')
+    const expand = wrapper.find('.sidebar-expand-btn')
+    expect(expand.exists()).toBe(true)
+    await expand.trigger('click')
+    expect(wrapper.find('.sidebar-left').classes()).not.toContain('collapsed')
+  })
+
+  it('right drawer only carries 记忆 now that 知识/炼化 were removed from it', () => {
+    routeState.path = '/projects/p-1/chat'
+    const wrapper = mount(AppLayout)
     const items = wrapper.findAll('.sidebar-nav-item')
-    expect(items[4].text().trim()).toBe('知识')
-    expect(items[5].text().trim()).toBe('记忆')
+    expect(items[3].text().trim()).toBe('记忆')
   })
 })

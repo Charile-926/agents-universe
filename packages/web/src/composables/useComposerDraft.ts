@@ -17,9 +17,28 @@ import { ref } from 'vue'
 /** Pending chip text; null = nothing to apply. */
 export const pendingDraft = ref<string | null>(null)
 
+/**
+ * Files picked on the pre-conversation screen. They cannot be uploaded there
+ * (the upload URL needs a conversation id), so the raw File objects are
+ * carried over and uploaded by the real Composer once it mounts.
+ */
+export const pendingFiles = ref<File[]>([])
+
 /** Stage a prompt for the composer to pick up. */
 export function applyComposerDraft(text: string): void {
   pendingDraft.value = text
+}
+
+/** Stage attachments picked before a conversation exists. */
+export function applyComposerFiles(files: File[]): void {
+  pendingFiles.value = files
+}
+
+/** Read-and-clear the staged files. */
+export function takeComposerFiles(): File[] {
+  const files = pendingFiles.value
+  pendingFiles.value = []
+  return files
 }
 
 /** Read-and-clear the pending text (null when nothing is staged).

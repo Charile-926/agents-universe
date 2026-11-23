@@ -325,7 +325,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_local_router)
 
     # API routers
-    from .routers import agents, api_keys, conversations, integrations, knowledge, mcp_servers, media, memories, model_configs, preferences, project_members, project_secrets, projects, publish, schedules, script_runs, scripts, skills_distill, tier_models, tokens, workspace_files
+    from .routers import agents, api_keys, conversations, integrations, knowledge, mcp_servers, media, memories, model_configs, preferences, project_members, project_secrets, projects, schedules, script_runs, scripts, skills_distill, tier_models, tokens, workspace_files
 
     app.include_router(agents.router, tags=["agents"])
     app.include_router(projects.router, tags=["projects"])
@@ -351,7 +351,6 @@ def create_app() -> FastAPI:
     app.include_router(mcp_servers.router, tags=["mcp-servers"])
     app.include_router(project_secrets.router, prefix="/api/projects/{project_id}/secrets", tags=["project-secrets"])
     app.include_router(project_members.router, tags=["project-members"])
-    app.include_router(publish.router, tags=["publish"])
 
     # WebSocket
     from .websocket import handlers

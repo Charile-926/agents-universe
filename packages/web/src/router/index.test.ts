@@ -8,10 +8,8 @@ vi.mock('@/pages/DistillPage.vue', () => ({ default: { name: 'DistillPageStub', 
 vi.mock('@/pages/EmptyProjectPage.vue', () => ({ default: { name: 'EmptyProjectStub', template: '<div />' } }))
 vi.mock('@/pages/ChatPage.vue', () => ({ default: { name: 'ChatPageStub', template: '<div />' }, invalidateLatestConversation: vi.fn() }))
 vi.mock('@/pages/WorkspacePage.vue', () => ({ default: { name: 'WorkspacePageStub', template: '<div />' } }))
-vi.mock('@/pages/PublishesPage.vue', () => ({ default: { name: 'PublishesPageStub', template: '<div />' } }))
 vi.mock('@/pages/SchedulesPage.vue', () => ({ default: { name: 'SchedulesPageStub', template: '<div />' } }))
 vi.mock('@/pages/TokenConfigPage.vue', () => ({ default: { name: 'TokenConfigPageStub', template: '<div />' } }))
-vi.mock('@/pages/PublishPage.vue', () => ({ default: { name: 'PublishPageStub', template: '<div />' } }))
 vi.mock('@/stores/project', () => ({
   useProjectStore: () => ({
     currentProject: null,
@@ -47,13 +45,16 @@ describe('router — 工作台 + 炼化入口', () => {
     expect(router.currentRoute.value.path).toBe('/projects/p1/chat')
   })
 
-  it('工作区、发布、定时任务页保留', async () => {
+  it('工作区、定时任务页保留，发布与知识入口已删除', async () => {
     await router.push('/projects/p1/workspace')
     expect(router.currentRoute.value.path).toBe('/projects/p1/workspace')
-    await router.push('/projects/p1/publishes')
-    expect(router.currentRoute.value.path).toBe('/projects/p1/publishes')
     await router.push('/projects/p1/schedules')
     expect(router.currentRoute.value.path).toBe('/projects/p1/schedules')
+    // 已删除的功能落到兜底路由
+    await router.push('/projects/p1/publishes')
+    expect(router.currentRoute.value.path).toBe('/app')
+    await router.push('/p/abc')
+    expect(router.currentRoute.value.path).toBe('/app')
   })
 
   it('API Key / Token 配置页保留', async () => {

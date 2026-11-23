@@ -1,6 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { basePath, withApi } from '@/utils/basePath'
-import { useProjectStore } from '@/stores/project'
 
 /**
  * 路由表：基础工作台（项目 / 对话 / 工作区 / 发布 / 定时任务 / API Key 配置）
@@ -53,18 +52,10 @@ const router = createRouter({
           component: () => import('@/pages/WorkspacePage.vue'),
         },
         {
-          path: 'publishes',
-          component: () => import('@/pages/PublishesPage.vue'),
-        },
-        {
           path: 'schedules',
           component: () => import('@/pages/SchedulesPage.vue'),
         },
-        // 知识库与脚本已并入统一工作区 tab，旧链接重定向以保住书签。
-        {
-          path: 'knowledge',
-          redirect: (to) => ({ path: `/projects/${to.params.projectId}/workspace` }),
-        },
+        // 脚本已并入统一工作区 tab，旧链接重定向以保住书签。
         {
           path: 'scripts',
           redirect: (to) => ({ path: `/projects/${to.params.projectId}/workspace` }),
@@ -82,24 +73,6 @@ const router = createRouter({
           component: () => import('@/pages/TokenConfigPage.vue'),
         },
       ],
-    },
-    {
-      // 发布管理已并入项目布局，旧书签落到当前项目的 publishes。
-      path: '/settings/publishes',
-      redirect: () => {
-        const store = useProjectStore()
-        const wanted = store.currentProject?.project_id ?? store.getSavedProjectId()
-        if (store.projects.length > 0) {
-          const match = store.projects.find(p => p.project_id === wanted) ?? store.projects[0]
-          return { path: `/projects/${match.project_id}/publishes` }
-        }
-        return wanted ? { path: `/projects/${wanted}/publishes` } : '/app'
-      },
-    },
-    {
-      // 对外已发布智能体的独立对话页，刻意放在 AppLayout 之外。
-      path: '/p/:publishId',
-      component: () => import('@/pages/PublishPage.vue'),
     },
     {
       path: '/',

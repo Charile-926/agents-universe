@@ -7,10 +7,25 @@
       rows="1"
       @keydown.enter.exact.prevent="start"
     />
+    <div v-if="files.length" class="composer-attachments">
+      <div v-for="(f, i) in files" :key="`${f.name}-${i}`" class="composer-attachment">
+        <span class="attachment-name">{{ f.name }}</span>
+        <button class="attachment-remove" type="button" :title="t('composer.remove')" @click="removeFile(i)">
+          <X :size="11" />
+        </button>
+      </div>
+    </div>
     <div class="composer-toolbar">
-      <button class="composer-attach" type="button" :title="t('composer.attach')" disabled>
+      <label class="composer-attach" :title="t('composer.attach')">
         <Plus :size="18" />
-      </button>
+        <input
+          type="file"
+          multiple
+          class="composer-file-input"
+          accept="image/*,text/*,.md,.csv,.json,.log,.xlsx,.xls,.pdf,.zip,.docx,.doc"
+          @change="onFileInput"
+        />
+      </label>
 
       <div class="composer-project-wrap">
         <button class="composer-chip" type="button" :title="t('composer.projectSwitch')" @click="projectOpen = !projectOpen">
@@ -48,7 +63,7 @@
       <button
         class="submit-btn"
         type="button"
-        :disabled="!text.trim()"
+        :disabled="!text.trim() && !files.length"
         :title="t('composer.sendTitle')"
         @click="start"
       >
@@ -68,9 +83,10 @@
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useT } from '@/i18n'
-import { Plus, Folder, ChevronDown, ArrowUp } from 'lucide-vue-next'
+import { Plus, Folder, ChevronDown, ArrowUp, X } from 'lucide-vue-next'
 import { useAgentStore, AUTO_MODEL_CONFIG_ID } from '@/stores/agent'
 import { useProjectStore } from '@/stores/project'
+import { applyComposerFiles } from '@/composables/useComposerDraft'
 import { localizedText } from '@/utils/localize'
 import type { Project } from '@/types'
 
@@ -82,8 +98,23 @@ const agentStore = useAgentStore()
 const projectStore = useProjectStore()
 
 const text = ref('')
+const files = ref<File[]>([])
 const projectOpen = ref(false)
 const modelOpen = ref(false)
+
+function onFileInput(e: Event) {
+  const input = e.target as HTMLInputElement
+  if (input.files?.length) {
+    files.value = [...files.value, ...Array.from(input.files)]
+    applyComposerFiles(files.value)
+  }
+  input.value = ''
+}
+
+function removeFile(index: number) {
+  files.value = files.value.filter((_, i) => i !== index)
+  applyComposerFiles(files.value)
+}
 
 const placeholderText = computed(() =>
   localizedText(
@@ -131,8 +162,11 @@ function pickProject(p: Project) {
 
 function start() {
   const value = text.value.trim()
-  if (!value) return
+  if (!value && !files.value.length) return
+  // 附件随草稿一起交给正式 Composer；文本为空时只建会话、不发送
+  applyComposerFiles(files.value)
   emit('start', value)
   text.value = ''
+  files.value = []
 }
 </script>

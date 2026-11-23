@@ -14,7 +14,28 @@
   display: flex;
   flex-direction: column;
   min-width: 0;
+  position: relative;
 }
+
+/* 侧栏折叠后主区左上角留一个展开按钮，否则没有任何入口能把它打开 */
+.sidebar-expand-btn {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  z-index: 20;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background var(--dur-fast);
+}
+.sidebar-expand-btn:hover { background: var(--bg-secondary); }
 .center-content {
   flex: 1;
   min-height: 0;
@@ -278,13 +299,26 @@
 .composer-toolbar .submit-btn,
 .composer-toolbar .submit-btn.abort { margin-left: 0; }
 
+/* 附件按钮改成 label 包 input，指针表现为可点击 */
+.composer-attach { cursor: pointer; }
+
+/* CodeMirror 默认给聚焦的编辑器画一圈 dotted outline，用户看到的就是那个黑框 */
+.composer .cm-editor,
+.composer .cm-editor.cm-focused {
+  outline: none !important;
+  border: none;
+}
+
 /* ── /distill 复用工作台外壳后仍需页面留白 ─────────────────────────────── */
 .distill-page {
   padding: 28px 32px 48px;
+  max-width: 900px;
+  margin: 0 auto;
   flex: 1;
   min-height: 0;
   overflow-y: auto;
 }
+.distill-page-head { text-align: center; }
 
 /* ── fresh 会话的居中分组：消息区 + 智能体条 + 输入框 ───────────────────── */
 .chat-panel.is-fresh .composer { margin-bottom: auto; }

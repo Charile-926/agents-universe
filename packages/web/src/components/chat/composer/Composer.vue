@@ -34,17 +34,17 @@
 
     <!-- Actions — 参考 DeepSeek：左下角加号 + 工作区，右下角模型 + 圆形发送 -->
     <div class="composer-toolbar">
-      <button class="composer-attach" type="button" :title="t('composer.attach')" @click="fileInput?.click()">
+      <!-- label 包住 input：点击由浏览器原生触发文件选择，比 JS .click() 稳 -->
+      <label class="composer-attach" :title="t('composer.attach')">
         <Plus :size="18" />
-      </button>
-      <input
-        ref="fileInput"
-        type="file"
-        multiple
-        class="composer-file-input"
-        accept="image/*,text/*,.md,.csv,.json,.log,.xlsx,.xls,.pdf,.zip,.docx,.doc"
-        @change="onFileInput"
-      />
+        <input
+          type="file"
+          multiple
+          class="composer-file-input"
+          accept="image/*,text/*,.md,.csv,.json,.log,.xlsx,.xls,.pdf,.zip,.docx,.doc"
+          @change="onFileInput"
+        />
+      </label>
 
       <div class="composer-project-wrap">
         <button class="composer-chip" type="button" :title="t('composer.projectSwitch')" @click="projectMenu = !projectMenu">
@@ -64,7 +64,7 @@
       </div>
 
       <button
-        v-if="props.conversationId"
+        v-if="props.conversationId && (convStore.messages?.length ?? 0) > 0"
         class="composer-icon-btn"
         type="button"
         :disabled="props.isStreaming"
@@ -129,7 +129,7 @@ import { mediaApi } from '@/api/media'
 import { ApiError } from '@/api/client'
 import { localizedText } from '@/utils/localize'
 import { translateApiError } from '@/utils/apiError'
-import { pendingDraft, takeComposerDraft } from '@/composables/useComposerDraft'
+import { pendingDraft, takeComposerDraft, takeComposerFiles } from '@/composables/useComposerDraft'
 import type { AttachmentRecord } from '@/types'
 import MentionPopup from './MentionPopup.vue'
 import SlashPopup from './SlashPopup.vue'
@@ -259,7 +259,6 @@ const modelOptions = computed<Array<{ id: string; label: string; auto?: boolean 
 // --- Attachments -----------------------------------------------------------
 
 const attachments = ref<PendingAttachment[]>([])
-const fileInput = ref<HTMLInputElement | null>(null)
 // Only in-flight uploads block sending — failed attachments are excluded from
 // the submit payload and must not keep the send button disabled forever.
 const hasPending = computed(() => attachments.value.some(a => a.status === 'uploading'))
@@ -576,6 +575,10 @@ onMounted(() => {
   const staged = takeComposerDraft()
   if (staged != null) setDraft(staged)
   else restoreStoredDraft(props.conversationId)
+
+  // 空会话页面选好的附件，到这里才拿得到 conversationId，可以真正上传
+  const stagedFiles = takeComposerFiles()
+  if (stagedFiles.length) addFiles(stagedFiles)
 })
 
 // Chip clicked while the Composer is already mounted (zero-message card).

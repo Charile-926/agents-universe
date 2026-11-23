@@ -46,7 +46,7 @@ vi.mock('@/stores/project', () => ({
   }),
 }))
 vi.mock('@/stores/conversation', () => ({
-  useConversationStore: () => ({ loadHistory: vi.fn() }),
+  useConversationStore: () => ({ loadHistory: vi.fn(), messages: [] }),
 }))
 vi.mock('@/api/conversations', () => ({
   conversationsApi: { compress: vi.fn() },

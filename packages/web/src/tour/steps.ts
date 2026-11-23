@@ -183,16 +183,6 @@ export const TOUR_STEPS: TourStep[] = [
     skipOnMobile: true,
   },
   {
-    id: 'right-knowledge',
-    titleKey: 'tour.rightKnowledge.title',
-    bodyKey: 'tour.rightKnowledge.body',
-    target: '.knowledge-panel',
-    action: () => clickRightPanelTab('knowledge'),
-    waitFor: '.knowledge-panel',
-    condition: hasProject,
-    skipOnMobile: true,
-  },
-  {
     id: 'right-memory',
     titleKey: 'tour.rightMemory.title',
     bodyKey: 'tour.rightMemory.body',

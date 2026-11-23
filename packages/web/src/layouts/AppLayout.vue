@@ -59,27 +59,11 @@
           </button>
           <button
             class="sidebar-nav-item"
-            :class="{ active: pageSegment === 'publishes' }"
-            :disabled="!currentProjectId"
-            @click="goToPage('publishes')"
-          >
-            <Upload :size="15" /><span>{{ t('layout.tabPublishes') }}</span>
-          </button>
-          <button
-            class="sidebar-nav-item"
             :class="{ active: pageSegment === 'schedules' }"
             :disabled="!currentProjectId"
             @click="goToPage('schedules')"
           >
             <Clock :size="15" /><span>{{ t('layout.tabSchedules') }}</span>
-          </button>
-          <button
-            class="sidebar-nav-item"
-            :class="{ active: !rightCollapsed && activeTab === 'knowledge' }"
-            data-tour-target="panel-tab-knowledge"
-            @click="openPanel('knowledge')"
-          >
-            <BookOpen :size="15" /><span>{{ t('layout.tabKnowledge') }}</span>
           </button>
           <button
             class="sidebar-nav-item"
@@ -108,6 +92,14 @@
 
     <!-- Center panel -->
     <main class="center-panel">
+      <button
+        v-if="leftCollapsed && !isMobile"
+        class="sidebar-expand-btn"
+        @click="toggleLeft"
+        :title="t('layout.toggleSidebar')"
+      >
+        <PanelLeft :size="17" />
+      </button>
       <div class="center-content">
         <Transition name="route-fade" mode="out-in">
           <RouterView />
@@ -151,7 +143,7 @@
 import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useT } from '@/i18n'
 import { RouterView, useRouter, useRoute } from 'vue-router'
-import { ChevronLeft, ChevronRight, Bot, Menu, PanelRight, BookOpen, Brain, SquarePen, Wand2, LayoutGrid, Upload, Clock } from 'lucide-vue-next'
+import { ChevronLeft, ChevronRight, Bot, Menu, PanelRight, PanelLeft, Brain, SquarePen, Wand2, LayoutGrid, Clock } from 'lucide-vue-next'
 import { useProjectStore } from '@/stores/project'
 import { useAgentStore } from '@/stores/agent'
 import { useConversationStore } from '@/stores/conversation'
@@ -160,7 +152,6 @@ import ProjectTree from '@/components/sidebar/ProjectTree.vue'
 import SidebarFooter from '@/components/sidebar/SidebarFooter.vue'
 import ContextMeter from '@/components/knowledge/ContextMeter.vue'
 import ConversationTreePanel from '@/components/conversations/ConversationTreePanel.vue'
-import KnowledgePanel from '@/components/knowledge/KnowledgePanel.vue'
 import MemoryPanel from '@/components/memory/MemoryPanel.vue'
 import { closeAllConnections } from '@/composables/useWebSocket'
 import { invalidateLatestConversation } from '@/pages/ChatPage.vue'
@@ -175,7 +166,7 @@ const leftCollapsed = ref(false)
 // closed and opens from the top-bar icons.
 const rightCollapsed = ref(true)
 const isMobile = ref(false)
-const activeTab = ref<'knowledge' | 'memory'>('knowledge')
+const activeTab = ref<'memory'>('memory')
 
 /** Sync isMobile flag and auto-collapse sidebars when entering mobile. */
 function checkMobile() {
@@ -231,8 +222,8 @@ function toggleRight() {
   }
 }
 
-/** Open the right drawer on a specific tab (left nav knowledge/memory entries). */
-function openPanel(tab: 'knowledge' | 'memory') {
+/** Open the right drawer on a specific tab (left nav memory entry). */
+function openPanel(tab: 'memory') {
   if (!rightCollapsed.value && activeTab.value === tab) {
     rightCollapsed.value = true
     return
@@ -269,7 +260,6 @@ watch(() => route.fullPath, () => {
 /* ── Panel tabs & content ─────────────────────────────────────── */
 const { t } = useT()
 const tabs = computed(() => [
-  { id: 'knowledge' as const, label: t('layout.tabKnowledge'), icon: BookOpen },
   { id: 'memory' as const, label: t('layout.tabMemory'), icon: Brain },
 ])
 
@@ -304,13 +294,13 @@ watch(
 // into the unified workspace tab, so their old segments also count as workspace
 // (they redirect to it).
 const pageSegment = computed(() => {
-  const m = route.path.match(/^\/projects\/[^/]+\/(chat|workspace|knowledge|scripts|publishes|schedules)(?:\/|$)/)
+  const m = route.path.match(/^\/projects\/[^/]+\/(chat|workspace|knowledge|scripts|schedules)(?:\/|$)/)
   if (!m) return null
-  if (m[1] === 'chat' || m[1] === 'publishes' || m[1] === 'schedules') return m[1]
+  if (m[1] === 'chat' || m[1] === 'schedules') return m[1]
   return 'workspace'
 })
 
-function goToPage(segment: 'chat' | 'workspace' | 'publishes' | 'schedules') {
+function goToPage(segment: 'chat' | 'workspace' | 'schedules') {
   const pid = route.params.projectId
   if (!pid) return
   // No query forwarding: ?new=1 belongs to a specific entry flow
@@ -348,15 +338,8 @@ watch(routePid, async (pid) => {
 
 const currentProjectId = computed(() => projectStore.currentProject?.project_id)
 
-const panelComponent = computed(() => {
-  if (activeTab.value === 'memory') return MemoryPanel
-  return KnowledgePanel
-})
-
-const panelProps = computed(() => {
-  if (activeTab.value === 'memory') return {}
-  return { projectId: currentProjectId.value }
-})
+const panelComponent = computed(() => MemoryPanel)
+const panelProps = computed(() => ({}))
 
 function handleNewConversation() {
   closeAllConnections()
