@@ -12,13 +12,11 @@
     </div>
 
     <!-- Mobile Backdrop — tap to close any open sidebar -->
-    <Transition name="fade">
-      <div
-        v-if="showBackdrop"
-        class="mobile-backdrop"
-        @click="closeMobilePanels"
-      />
-    </Transition>
+    <div
+      v-if="showBackdrop"
+      class="mobile-backdrop"
+      @click="closeMobilePanels"
+    />
 
     <!-- Left Sidebar — ChatGPT style: new chat, projects, conversation history -->
     <aside class="sidebar-left" :class="{ collapsed: leftCollapsed }">
