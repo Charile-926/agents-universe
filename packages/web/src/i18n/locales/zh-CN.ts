@@ -320,6 +320,7 @@ export default {
     uploadTimeout: '上传超时，请重试',
     mentionMultiple: '一次只能提及一个智能体',
     defaultPlaceholder: '输入消息…',
+    projectSwitch: '切换工作区',
   },
   agentCard: {
     starterLabel: '你可以这样用我：',

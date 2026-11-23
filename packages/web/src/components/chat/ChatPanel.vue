@@ -115,6 +115,7 @@
     </div>
 
     <!-- Composer -->
+    <AgentStrip class="chat-agent-strip" />
     <Composer
       ref="composerRef"
       :is-streaming="convStore.isStreaming || convStore.isThinking"
@@ -155,6 +156,7 @@ import ToolCallCard from './ToolCallCard.vue'
 import TaskPlanCard from './TaskPlanCard.vue'
 import SelectionDialog from './SelectionDialog.vue'
 import Composer from './composer/Composer.vue'
+import AgentStrip from './AgentStrip.vue'
 import AgentCapabilitiesCard from './AgentCapabilitiesCard.vue'
 import RunNotice from './RunNotice.vue'
 

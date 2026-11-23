@@ -13,8 +13,16 @@ vi.mock('vue-router', () => ({
 
 const agentStore = vi.hoisted(() => ({
   currentAgent: { slug: 'helper', display_name: 'Helper' },
+  agents: [],
+  modelConfigs: [],
+  selectedConfigId: null as string | null,
+  setSelectedConfigId: vi.fn(),
+  setCurrentAgent: vi.fn(),
 }))
-vi.mock('@/stores/agent', () => ({ useAgentStore: () => agentStore }))
+vi.mock('@/stores/agent', () => ({
+  useAgentStore: () => agentStore,
+  AUTO_MODEL_CONFIG_ID: 'auto',
+}))
 
 const conversationsApi = vi.hoisted(() => ({
   getLatest: vi.fn(),

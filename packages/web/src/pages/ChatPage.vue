@@ -11,7 +11,10 @@
         <span class="thinking-dot" /><span class="thinking-dot" /><span class="thinking-dot" />
       </div>
       <template v-else>
-        <h1 class="chat-greeting">{{ t('chatPage.greeting') }}</h1>
+        <div class="chat-hero">
+          <span class="chat-hero-mark"><Bot :size="22" /></span>
+          <h1 class="chat-greeting">{{ t('chatPage.greeting') }}</h1>
+        </div>
         <p v-if="loadError" class="chat-empty-error">{{ loadError }}</p>
         <AgentCapabilitiesCard
           v-if="agentStore.currentAgent"
@@ -19,10 +22,9 @@
           @apply-prompt="handleApplyPrompt"
         />
         <p v-else class="chat-empty-hint">{{ t('chatPage.newConversationHint') }}</p>
-        <!-- without !agentSlug the button stayed clickable with no
-        agent selected and created an agent-less conversation that the
-        backend could never run. (loading already hides the button entirely.) -->
-        <button class="btn-primary" :disabled="!agentSlug" @click="startChat()">{{ t('chatPage.startChat') }}</button>
+        <!-- 十个智能体横排在输入框上方，点选即切换当前智能体 -->
+        <AgentStrip class="chat-empty-agents" />
+        <ChatStartComposer @start="handleStart" />
       </template>
     </div>
   </div>
@@ -82,6 +84,9 @@ import {
 } from '@/composables/useLatestConversation'
 import ChatPanel from '@/components/chat/ChatPanel.vue'
 import AgentCapabilitiesCard from '@/components/chat/AgentCapabilitiesCard.vue'
+import AgentStrip from '@/components/chat/AgentStrip.vue'
+import ChatStartComposer from '@/components/chat/ChatStartComposer.vue'
+import { Bot } from 'lucide-vue-next'
 
 const route = useRoute()
 const router = useRouter()
@@ -251,6 +256,13 @@ function maybeAutoStartChat() {
 function handleApplyPrompt(prompt: string) {
   applyComposerDraft(prompt)
   startChat(prompt)
+}
+
+// 空会话输入框的首条消息：暂存草稿并创建会话，挂载后的 Composer 接管草稿。
+function handleStart(text: string) {
+  if (!agentSlug.value) return
+  applyComposerDraft(text)
+  startChat(text)
 }
 
 // `stagedDraft` is the chip text this call put in the composer slot. Only

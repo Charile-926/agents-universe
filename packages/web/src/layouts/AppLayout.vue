@@ -39,6 +39,58 @@
           <span>{{ t('layout.newChat') }}</span>
         </button>
 
+        <!-- 一级导航：炼化 Skill 固定在最上，是核心功能入口 -->
+        <nav class="sidebar-nav">
+          <button
+            class="sidebar-nav-item"
+            :class="{ active: route.path === '/distill' }"
+            data-tour-target="nav-distill"
+            @click="goDistill"
+          >
+            <Wand2 :size="15" /><span>{{ t('skillDistill.title') }}</span>
+          </button>
+          <button
+            class="sidebar-nav-item"
+            :class="{ active: pageSegment === 'workspace' }"
+            :disabled="!currentProjectId"
+            @click="goToPage('workspace')"
+          >
+            <LayoutGrid :size="15" /><span>{{ t('layout.tabWorkspace') }}</span>
+          </button>
+          <button
+            class="sidebar-nav-item"
+            :class="{ active: pageSegment === 'publishes' }"
+            :disabled="!currentProjectId"
+            @click="goToPage('publishes')"
+          >
+            <Upload :size="15" /><span>{{ t('layout.tabPublishes') }}</span>
+          </button>
+          <button
+            class="sidebar-nav-item"
+            :class="{ active: pageSegment === 'schedules' }"
+            :disabled="!currentProjectId"
+            @click="goToPage('schedules')"
+          >
+            <Clock :size="15" /><span>{{ t('layout.tabSchedules') }}</span>
+          </button>
+          <button
+            class="sidebar-nav-item"
+            :class="{ active: !rightCollapsed && activeTab === 'knowledge' }"
+            data-tour-target="panel-tab-knowledge"
+            @click="openPanel('knowledge')"
+          >
+            <BookOpen :size="15" /><span>{{ t('layout.tabKnowledge') }}</span>
+          </button>
+          <button
+            class="sidebar-nav-item"
+            :class="{ active: !rightCollapsed && activeTab === 'memory' }"
+            data-tour-target="panel-tab-memory"
+            @click="openPanel('memory')"
+          >
+            <Brain :size="15" /><span>{{ t('layout.tabMemory') }}</span>
+          </button>
+        </nav>
+
         <ProjectTree />
 
         <div class="sidebar-conversations" data-tour-target="panel-tab-conversations">
@@ -56,116 +108,6 @@
 
     <!-- Center panel -->
     <main class="center-panel">
-      <!-- ChatGPT-style minimal top bar: agent + model pickers on the left,
-           page tabs in the middle, panel actions on the right. -->
-      <header class="main-topbar">
-        <div class="topbar-left">
-          <button
-            v-if="leftCollapsed && !isMobile"
-            class="topbar-icon-btn"
-            @click="toggleLeft"
-            :title="t('layout.toggleSidebar')"
-          >
-            <PanelLeft :size="18" />
-          </button>
-          <button
-            class="agent-picker-btn"
-            :title="t('layout.selectAgent')"
-            @click="showAgentPicker = true"
-          >
-            <span class="agent-picker-name">{{ currentAgentName || t('layout.selectAgent') }}</span>
-            <ChevronDown :size="14" />
-          </button>
-          <div class="model-picker">
-            <button
-              class="model-picker-btn"
-              :title="t('layout.selectModel')"
-              @click="modelMenuOpen = !modelMenuOpen"
-            >
-              <Sparkles v-if="selectedModelIsAuto" :size="12" />
-              <span>{{ selectedModelLabel }}</span>
-              <ChevronDown :size="12" />
-            </button>
-            <div v-if="modelMenuOpen" class="model-menu-backdrop" @click="modelMenuOpen = false" />
-            <div v-if="modelMenuOpen" class="model-menu">
-              <button
-                v-for="opt in modelOptions"
-                :key="opt.id"
-                class="model-menu-item"
-                :class="{ active: agentStore.selectedConfigId === opt.id }"
-                @click="selectModel(opt.id)"
-              >
-                <Sparkles v-if="opt.auto" :size="13" />
-                <span>{{ opt.label }}</span>
-                <Check v-if="agentStore.selectedConfigId === opt.id" :size="13" class="model-menu-check" />
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <!-- Page-level navigation between chat / workspace / publishes /
-             schedules — hidden on non-project routes (/app, /settings). -->
-        <nav v-if="pageSegment" class="center-topnav">
-          <button
-            v-for="nav in navTabs"
-            :key="nav.id"
-            class="center-tab"
-            :class="{ active: pageSegment === nav.id }"
-            :data-tour-target="`center-nav-${nav.id}`"
-            @click="goToPage(nav.id)"
-          >{{ nav.label }}</button>
-        </nav>
-
-        <div class="topbar-right">
-          <span
-            v-if="pageSegment === 'chat' && convStore.conversationId && convStore.tokensUsed > 0"
-            class="nav-tokens"
-          >{{ t('layout.sessionTokens', { count: convStore.tokensUsed.toLocaleString() }) }}</span>
-          <button
-            v-if="pageSegment === 'chat' && convStore.messages.length > 0"
-            class="topbar-icon-btn nav-compress"
-            :disabled="isCompressDisabled"
-            :title="compressing ? t('chatPanel.compressing') : t('chatPanel.compressContext')"
-            @click="handleCompress"
-          >
-            <Shrink :size="16" />
-          </button>
-          <button
-            class="topbar-icon-btn"
-            :class="{ active: !rightCollapsed && activeTab === 'knowledge' }"
-            :title="t('layout.openKnowledge')"
-            data-tour-target="panel-tab-knowledge"
-            @click="openPanel('knowledge')"
-          >
-            <BookOpen :size="17" />
-          </button>
-          <button
-            class="topbar-icon-btn"
-            :class="{ active: !rightCollapsed && activeTab === 'memory' }"
-            :title="t('layout.openMemory')"
-            data-tour-target="panel-tab-memory"
-            @click="openPanel('memory')"
-          >
-            <Brain :size="17" />
-          </button>
-          <button
-            class="topbar-icon-btn"
-            :class="{ active: !rightCollapsed && activeTab === 'distill' }"
-            :title="t('skillDistill.title')"
-            @click="openPanel('distill')"
-          >
-            <Wand2 :size="17" />
-          </button>
-          <button
-            class="topbar-icon-btn"
-            :title="t('layout.togglePanel')"
-            @click="toggleRight"
-          >
-            <PanelRight :size="17" />
-          </button>
-        </div>
-      </header>
-
       <div class="center-content">
         <Transition name="route-fade" mode="out-in">
           <RouterView />
@@ -202,11 +144,6 @@
         </Transition>
       </template>
     </aside>
-
-    <!-- Agent picker (reuses the favorites/selection dialog) -->
-    <Transition name="modal">
-      <AgentPickerDialog v-if="showAgentPicker" @close="showAgentPicker = false" />
-    </Transition>
   </div>
 </template>
 
@@ -214,21 +151,17 @@
 import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useT } from '@/i18n'
 import { RouterView, useRouter, useRoute } from 'vue-router'
-import { ChevronLeft, ChevronRight, ChevronDown, Bot, Menu, PanelRight, PanelLeft, BookOpen, Brain, Shrink, SquarePen, Sparkles, Check, Wand2 } from 'lucide-vue-next'
+import { ChevronLeft, ChevronRight, Bot, Menu, PanelRight, BookOpen, Brain, SquarePen, Wand2, LayoutGrid, Upload, Clock } from 'lucide-vue-next'
 import { useProjectStore } from '@/stores/project'
-import { useAgentStore, AUTO_MODEL_CONFIG_ID } from '@/stores/agent'
+import { useAgentStore } from '@/stores/agent'
 import { useConversationStore } from '@/stores/conversation'
-import { conversationsApi } from '@/api/conversations'
 import { projectsApi } from '@/api/projects'
-import { localizedText } from '@/utils/localize'
 import ProjectTree from '@/components/sidebar/ProjectTree.vue'
 import SidebarFooter from '@/components/sidebar/SidebarFooter.vue'
-import AgentPickerDialog from '@/components/sidebar/AgentPickerDialog.vue'
 import ContextMeter from '@/components/knowledge/ContextMeter.vue'
 import ConversationTreePanel from '@/components/conversations/ConversationTreePanel.vue'
 import KnowledgePanel from '@/components/knowledge/KnowledgePanel.vue'
 import MemoryPanel from '@/components/memory/MemoryPanel.vue'
-import SkillDistillPanel from '@/components/skills/SkillDistillPanel.vue'
 import { closeAllConnections } from '@/composables/useWebSocket'
 import { invalidateLatestConversation } from '@/pages/ChatPage.vue'
 import { useProjectData } from '@/composables/useProjectData'
@@ -242,7 +175,7 @@ const leftCollapsed = ref(false)
 // closed and opens from the top-bar icons.
 const rightCollapsed = ref(true)
 const isMobile = ref(false)
-const activeTab = ref<'knowledge' | 'memory' | 'distill'>('knowledge')
+const activeTab = ref<'knowledge' | 'memory'>('knowledge')
 
 /** Sync isMobile flag and auto-collapse sidebars when entering mobile. */
 function checkMobile() {
@@ -298,8 +231,8 @@ function toggleRight() {
   }
 }
 
-/** Open the right drawer on a specific tab (top-bar knowledge/memory icons). */
-function openPanel(tab: 'knowledge' | 'memory' | 'distill') {
+/** Open the right drawer on a specific tab (left nav knowledge/memory entries). */
+function openPanel(tab: 'knowledge' | 'memory') {
   if (!rightCollapsed.value && activeTab.value === tab) {
     rightCollapsed.value = true
     return
@@ -338,7 +271,6 @@ const { t } = useT()
 const tabs = computed(() => [
   { id: 'knowledge' as const, label: t('layout.tabKnowledge'), icon: BookOpen },
   { id: 'memory' as const, label: t('layout.tabMemory'), icon: Brain },
-  { id: 'distill' as const, label: t('skillDistill.title'), icon: Wand2 },
 ])
 
 const projectStore = useProjectStore()
@@ -346,34 +278,15 @@ const agentStore = useAgentStore()
 const convStore = useConversationStore()
 const router = useRouter()
 
-/* ── Top-bar agent picker ─────────────────────────────────────── */
-const showAgentPicker = ref(false)
-const currentAgentName = computed(() => {
-  const a = agentStore.currentAgent
-  return a ? localizedText(a.label, a.i18n?.display_name) : ''
-})
+/* ── 一级导航 ────────────────────────────────────────────────── */
+// 智能体由对话框上方的 AgentStrip 选择、模型由 Composer 的 chip 选择，
+// 原先常驻顶栏的两个选择器因此下线。
 
-/* ── Top-bar model picker ─────────────────────────────────────── */
-const modelMenuOpen = ref(false)
-const modelOptions = computed<Array<{ id: string; label: string; auto?: boolean }>>(() => [
-  { id: AUTO_MODEL_CONFIG_ID, label: t('composer.autoModel'), auto: true },
-  ...agentStore.modelConfigs.map((c): { id: string; label: string; auto?: boolean } => ({
-    id: c.config_id,
-    label: c.is_system ? `${c.model_id} Default` : c.model_id,
-  })),
-])
-const selectedModelIsAuto = computed(
-  () => !agentStore.selectedConfigId || agentStore.selectedConfigId === AUTO_MODEL_CONFIG_ID,
-)
-const selectedModelLabel = computed(() => {
-  const found = modelOptions.value.find((o) => o.id === agentStore.selectedConfigId)
-  return found?.label ?? modelOptions.value[0]?.label ?? ''
-})
-function selectModel(id: string) {
-  agentStore.setSelectedConfigId(id)
-  modelMenuOpen.value = false
-}
 onMounted(() => { agentStore.fetchModelConfigs() })
+
+function goDistill() {
+  router.push('/distill')
+}
 
 // Project agents are scoped to the current project; refetch when it changes.
 // Previously triggered by AgentSwitcher's mount — the ChatGPT layout retired
@@ -396,34 +309,6 @@ const pageSegment = computed(() => {
   if (m[1] === 'chat' || m[1] === 'publishes' || m[1] === 'schedules') return m[1]
   return 'workspace'
 })
-
-const navTabs = computed(() => [
-  { id: 'chat' as const, label: t('layout.tabConversations') },
-  { id: 'workspace' as const, label: t('layout.tabWorkspace') },
-  { id: 'publishes' as const, label: t('layout.tabPublishes') },
-  { id: 'schedules' as const, label: t('layout.tabSchedules') },
-])
-
-// Compress targets the active conversation; lives in the top bar's right group.
-const compressing = ref(false)
-const isCompressDisabled = computed(
-  () => convStore.isStreaming || convStore.isThinking || compressing.value,
-)
-
-async function handleCompress() {
-  const id = convStore.conversationId
-  if (!id || compressing.value) return
-  if (!window.confirm(t('chatPanel.compressConfirm'))) return
-  compressing.value = true
-  try {
-    const res = await conversationsApi.compress(id)
-    convStore.loadHistory(res.messages, id)
-  } catch (e) {
-    window.alert(e instanceof Error ? e.message : t('chatPanel.compressFailed'))
-  } finally {
-    compressing.value = false
-  }
-}
 
 function goToPage(segment: 'chat' | 'workspace' | 'publishes' | 'schedules') {
   const pid = route.params.projectId
@@ -465,12 +350,11 @@ const currentProjectId = computed(() => projectStore.currentProject?.project_id)
 
 const panelComponent = computed(() => {
   if (activeTab.value === 'memory') return MemoryPanel
-  if (activeTab.value === 'distill') return SkillDistillPanel
   return KnowledgePanel
 })
 
 const panelProps = computed(() => {
-  if (activeTab.value === 'memory' || activeTab.value === 'distill') return {}
+  if (activeTab.value === 'memory') return {}
   return { projectId: currentProjectId.value }
 })
 

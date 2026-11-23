@@ -6,8 +6,8 @@ import { useProjectStore } from '@/stores/project'
  * 路由表：基础工作台（项目 / 对话 / 工作区 / 发布 / 定时任务 / API Key 配置）
  * + 本地账号登录 + 炼化 Skill。
  *
- * 炼化 Skill 只是工作台里的一个核心能力：它挂在右栏 tab 上（AppLayout），
- * 同时保留 /distill 独立页面，便于直接分发入口。
+ * 炼化 Skill 只是工作台里的一个核心能力：它是左侧栏的一级导航入口，
+ * /distill 页面复用工作台外壳（AppLayout），不再单独套一层 AppShell。
  */
 const router = createRouter({
   history: createWebHistory(basePath || '/'),
@@ -18,7 +18,7 @@ const router = createRouter({
     },
     {
       path: '/distill',
-      component: () => import('@/layouts/AppShell.vue'),
+      component: () => import('@/layouts/AppLayout.vue'),
       children: [
         {
           path: '',

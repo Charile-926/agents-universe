@@ -32,7 +32,7 @@
     <SlashPopup v-if="showSlash" @select="insertSlash" @close="showSlash = false" />
     <div v-if="mentionHint" class="composer-mention-hint">{{ mentionHint }}</div>
 
-    <!-- Actions — ChatGPT style: attach on the left, round send on the right -->
+    <!-- Actions — 参考 DeepSeek：左下角加号 + 工作区，右下角模型 + 圆形发送 -->
     <div class="composer-toolbar">
       <button class="composer-attach" type="button" :title="t('composer.attach')" @click="fileInput?.click()">
         <Plus :size="18" />
@@ -45,6 +45,51 @@
         accept="image/*,text/*,.md,.csv,.json,.log,.xlsx,.xls,.pdf,.zip,.docx,.doc"
         @change="onFileInput"
       />
+
+      <div class="composer-project-wrap">
+        <button class="composer-chip" type="button" :title="t('composer.projectSwitch')" @click="projectMenu = !projectMenu">
+          <Folder :size="13" />
+          <span class="composer-chip-text">{{ projectName }}</span>
+          <ChevronDown :size="12" />
+        </button>
+        <div v-if="projectMenu" class="composer-menu">
+          <button
+            v-for="p in projects"
+            :key="p.project_id"
+            class="composer-menu-item"
+            :class="{ active: p.project_id === currentProjectId }"
+            @click="pickProject(p)"
+          >{{ projectLabel(p) }}</button>
+        </div>
+      </div>
+
+      <button
+        v-if="props.conversationId"
+        class="composer-icon-btn"
+        type="button"
+        :disabled="props.isStreaming"
+        :title="t('chatPanel.compressContext')"
+        @click="compressContext"
+      >
+        <Shrink :size="14" />
+      </button>
+
+      <div class="composer-providers">
+        <button class="composer-chip" type="button" :title="t('layout.selectModel')" @click="modelMenu = !modelMenu">
+          <span class="composer-chip-text">{{ modelLabel }}</span>
+          <ChevronDown :size="12" />
+        </button>
+        <div v-if="modelMenu" class="composer-menu composer-menu-right">
+          <button
+            v-for="opt in modelOptions"
+            :key="opt.id"
+            class="composer-menu-item"
+            :class="{ active: selectedConfigId === opt.id || (opt.auto && !selectedConfigId) }"
+            @click="selectConfig(opt.id)"
+          >{{ opt.label }}</button>
+        </div>
+      </div>
+
       <button
         v-if="isStreaming"
         class="submit-btn abort"
@@ -70,12 +115,16 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch, reactive } from 'vue'
 import { useT } from '@/i18n'
-import { Square, FileText, X, Plus, ArrowUp } from 'lucide-vue-next'
+import { useRouter } from 'vue-router'
+import { Square, FileText, X, Plus, ArrowUp, Folder, ChevronDown, Shrink } from 'lucide-vue-next'
 import { EditorView, keymap, placeholder as cmPlaceholder } from '@codemirror/view'
 import { EditorState } from '@codemirror/state'
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
 import { markdown } from '@codemirror/lang-markdown'
 import { useAgentStore, AUTO_MODEL_CONFIG_ID } from '@/stores/agent'
+import { useProjectStore } from '@/stores/project'
+import { useConversationStore } from '@/stores/conversation'
+import { conversationsApi } from '@/api/conversations'
 import { mediaApi } from '@/api/media'
 import { ApiError } from '@/api/client'
 import { localizedText } from '@/utils/localize'
@@ -146,6 +195,56 @@ const placeholderEl = document.createElement('span')
 watch(placeholderText, (txt) => { placeholderEl.textContent = txt }, { immediate: true })
 
 const selectedConfigId = ref<string | null>(null)
+
+// 模型 chip 与工作区 chip 的浮层开关
+const modelMenu = ref(false)
+const projectMenu = ref(false)
+
+const modelLabel = computed(() => {
+  const found = modelOptions.value.find((opt) => opt.id === selectedConfigId.value)
+  return found?.label ?? modelOptions.value[0]?.label ?? ''
+})
+
+const projectStore = useProjectStore()
+const router = useRouter()
+const convStore = useConversationStore()
+const compressing = ref(false)
+
+const projects = computed(() => projectStore.projects)
+const currentProjectId = computed(() => projectStore.currentProject?.project_id ?? null)
+const projectName = computed(() => {
+  const p = projectStore.currentProject
+  return p ? projectLabel(p) : t('layout.tabWorkspace')
+})
+
+function projectLabel(p: { display_name?: string | null; slug: string }): string {
+  return p.display_name || p.slug
+}
+
+// 切工作区走整页跳转：当前会话属于旧工作区，不能在这里就地替换。
+function pickProject(p: { project_id: string }) {
+  projectMenu.value = false
+  if (p.project_id === currentProjectId.value) return
+  const target = projectStore.projects.find((item) => item.project_id === p.project_id)
+  if (target) projectStore.setCurrentProject(target)
+  router.push(`/projects/${p.project_id}/chat`)
+}
+
+// 压缩上下文原来在顶栏，顶栏取消后落到输入框工具条。
+async function compressContext() {
+  const id = props.conversationId
+  if (!id || compressing.value || props.isStreaming) return
+  if (!window.confirm(t('chatPanel.compressConfirm'))) return
+  compressing.value = true
+  try {
+    const res = await conversationsApi.compress(id)
+    convStore.loadHistory(res.messages, id)
+  } catch (e) {
+    window.alert(e instanceof Error ? e.message : t('chatPanel.compressFailed'))
+  } finally {
+    compressing.value = false
+  }
+}
 
 const modelOptions = computed<Array<{ id: string; label: string; auto?: boolean }>>(() => [
   // "auto" always sits first; the sentinel flows through localStorage and the
@@ -495,6 +594,7 @@ onBeforeUnmount(() => {
 function selectConfig(configId: string) {
   selectedConfigId.value = configId
   agentStore.setSelectedConfigId(configId)
+  modelMenu.value = false
 }
 
 function submit() {

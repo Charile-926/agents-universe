@@ -1,0 +1,279 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   Workbench layout — 参考桌面端极简布局的最后一道覆盖层。
+
+   在 layout.css 之后引入，只做「结构换了位置」的补偿：
+   1) 顶栏下线 → 主区从顶部开始；
+   2) 左侧栏新增一级导航（炼化 Skill / 工作区 / 发布 / 定时任务 / 知识 / 记忆）；
+   3) 智能体横排成 chip 条，贴在输入框上方；
+   4) 输入框工具条：+ / 工作区 chip / 压缩 / 模型 chip / 圆形发送。
+   纯白底、细边框、无渐变与阴影。
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── 主区 ──────────────────────────────────────────────────────────────── */
+.center-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.center-content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── 左侧栏一级导航 ────────────────────────────────────────────────────── */
+.sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 8px 10px;
+}
+
+.sidebar-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--dur-fast);
+}
+
+.sidebar-nav-item:hover { background: var(--bg-tertiary); }
+.sidebar-nav-item.active { background: var(--bg-tertiary); font-weight: 600; }
+.sidebar-nav-item:disabled { opacity: 0.45; cursor: not-allowed; }
+.sidebar-nav-item:disabled:hover { background: transparent; }
+.sidebar-nav-item svg { flex: 0 0 auto; color: var(--text-secondary); }
+.sidebar-nav-item.active svg { color: var(--text-primary); }
+
+/* ── 空会话：标题 + 智能体条 + 一体化输入框 ───────────────────────────── */
+.chat-empty {
+  padding: 24px 24px 8vh;
+  justify-content: center;
+  gap: 18px;
+  color: var(--text-primary);
+}
+
+.chat-hero {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  width: 100%;
+  max-width: 768px;
+  margin: 0 auto;
+}
+
+.chat-hero-mark {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  flex: 0 0 auto;
+}
+
+.chat-hero .chat-greeting {
+  margin: 0;
+  font-size: 26px;
+  line-height: 1.3;
+}
+
+/* 空状态保持参考图那种干净的一屏，能力卡片留给会话内的 fresh 状态展示 */
+.chat-empty .agent-capabilities-card { display: none; }
+.chat-empty .chat-empty-hint { text-align: center; }
+
+/* ── 智能体 chip 条 ────────────────────────────────────────────────────── */
+.agent-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.chat-empty-agents {
+  width: 100%;
+  max-width: 768px;
+  margin: 2px auto 0;
+}
+
+.chat-agent-strip {
+  width: calc(100% - 32px);
+  max-width: 768px;
+  margin: 0 auto 8px;
+  flex: 0 0 auto;
+  justify-content: flex-start;
+}
+
+.agent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 11px 4px 4px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background var(--dur-fast), color var(--dur-fast), border-color var(--dur-fast);
+}
+
+.agent-chip:hover { background: var(--bg-secondary); color: var(--text-primary); }
+.agent-chip.active {
+  background: var(--bg-tertiary);
+  border-color: var(--text-secondary);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.agent-chip-avatar {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 10.5px;
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+
+.agent-chip.active .agent-chip-avatar { background: var(--text-primary); color: var(--bg-primary); }
+
+/* ── 输入框工具条 ──────────────────────────────────────────────────────── */
+/* 空状态起始输入框复用正式 Composer 的外观 */
+.composer-start { flex: 0 0 auto; }
+
+.composer-start-input {
+  display: block;
+  width: 100%;
+  min-height: 48px;
+  max-height: 200px;
+  padding: 6px 2px;
+  border: none;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--text-md, 15px);
+  line-height: 1.55;
+}
+.composer-start-input::placeholder { color: var(--text-muted); }
+
+.composer-toolbar {
+  gap: 6px;
+}
+
+.composer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background var(--dur-fast), color var(--dur-fast);
+}
+.composer-chip:hover { background: var(--bg-secondary); color: var(--text-primary); }
+.composer-chip-text {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background var(--dur-fast), color var(--dur-fast);
+}
+.composer-icon-btn:hover { background: var(--bg-secondary); color: var(--text-primary); }
+.composer-icon-btn:disabled { opacity: 0.4; cursor: not-allowed; background: transparent; }
+
+.composer-project-wrap { position: relative; }
+.composer-providers {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.composer-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  min-width: 190px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: none;
+  z-index: 40;
+}
+.composer-menu-right { left: auto; right: 0; }
+
+.composer-menu-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.composer-menu-item:hover { background: var(--bg-secondary); }
+.composer-menu-item.active { background: var(--bg-tertiary); font-weight: 600; }
+
+/* 发送键固定在工具条最右，不再被 auto margin 挤开 */
+.composer-toolbar .submit-btn,
+.composer-toolbar .submit-btn.abort { margin-left: 0; }
+
+/* ── fresh 会话的居中分组：消息区 + 智能体条 + 输入框 ───────────────────── */
+.chat-panel.is-fresh .composer { margin-bottom: auto; }
+.chat-panel.is-fresh .chat-agent-strip { margin-top: 8px; }
+
+@media (max-width: 1024px) {
+  .chat-empty { padding: 20px 16px 6vh; gap: 14px; }
+  .chat-hero .chat-greeting { font-size: 22px; }
+  .chat-agent-strip { width: 100%; justify-content: center; }
+  .composer-chip-text { max-width: 110px; }
+}

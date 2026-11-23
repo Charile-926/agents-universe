@@ -36,6 +36,25 @@ vi.mock('@/api/media', () => ({
   mediaApi: mediaMock,
 }))
 
+// Composer 现在自带工作区 chip 与模型 chip，需要 project / conversation 两个
+// store 和路由；这里给最小桩，避免测试环境要求完整 Pinia 与路由实例。
+vi.mock('@/stores/project', () => ({
+  useProjectStore: () => ({
+    projects: [{ project_id: 'p-1', slug: 'demo', display_name: '演示项目' }],
+    currentProject: { project_id: 'p-1', slug: 'demo', display_name: '演示项目' },
+    setCurrentProject: vi.fn(),
+  }),
+}))
+vi.mock('@/stores/conversation', () => ({
+  useConversationStore: () => ({ loadHistory: vi.fn() }),
+}))
+vi.mock('@/api/conversations', () => ({
+  conversationsApi: { compress: vi.fn() },
+}))
+vi.mock('vue-router', () => ({
+  useRouter: () => ({ push: vi.fn() }),
+}))
+
 function makeProps() {
   return {
     isStreaming: false,
@@ -139,7 +158,7 @@ describe('Composer attachments', () => {
   })
 })
 
-describe('Composer model selection (top-bar driven)', () => {
+describe('Composer model selection (inline chip)', () => {
   beforeEach(() => {
     agentState.modelConfigs = [
       { config_id: 'm1', model_id: 'gpt-4o', is_system: false },
@@ -149,11 +168,19 @@ describe('Composer model selection (top-bar driven)', () => {
     agentState.setSelectedConfigId.mockClear()
   })
 
-  it('no longer renders model pills — selection lives in the top bar', async () => {
+  it('renders the selected model on an inline chip instead of old provider pills', async () => {
+    // 模型选择随顶栏下线搬进输入框工具条：按钮显示当前模型，点开是浮层列表。
+    agentState.selectedConfigId = 'm2'
     const wrapper = mount(Composer, { props: makeProps() })
     await nextTick()
 
     expect(wrapper.findAll('.provider-pill')).toHaveLength(0)
+    expect(wrapper.find('.composer-providers .composer-chip-text').text()).toBe('claude-sonnet')
+
+    await wrapper.find('.composer-providers .composer-chip').trigger('click')
+    const items = wrapper.findAll('.composer-menu-item')
+    expect(items[0].text()).toBe('自动')
+    expect(items.map((i) => i.text())).toContain('claude-sonnet')
   })
 
   it('submits the config selected through the store', async () => {
