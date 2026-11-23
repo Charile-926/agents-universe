@@ -49,6 +49,10 @@ dist/
 .ruff_cache/
 htmlcov/
 .coverage
+# pip build scratch created when installing from the source tree
+packages/api/pip-*/
+packages/api/tmp*
+packages/api/*.whl
 
 # Node
 node_modules/
