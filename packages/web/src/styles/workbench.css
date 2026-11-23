@@ -23,6 +23,16 @@
 }
 
 /* ── 左侧栏一级导航 ────────────────────────────────────────────────────── */
+/* 新对话做成参考图里的白色胶囊：浅色侧栏上靠一条细边框立起来 */
+.new-chat-btn {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin: 4px 10px 10px;
+}
+.new-chat-btn:hover:not(:disabled) { background: var(--bg-secondary); }
+.new-chat-btn:disabled { background: var(--bg-primary); }
+
 .sidebar-nav {
   display: flex;
   flex-direction: column;
