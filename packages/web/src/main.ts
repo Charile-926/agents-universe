@@ -4,9 +4,8 @@ import App from './App.vue'
 import router from './router'
 import { i18n } from './i18n'
 import './index.css'
-// 工作台与引导的全部样式：layout.css 是主布局，tour.css 是引导浮层。
+// 工作台样式：layout.css 是主布局。
 import './styles/layout.css'
-import './styles/tour.css'
 // 单页外壳（登录后的 /distill 独立页）补充样式。
 import './styles/app.css'
 // 工作台排版覆盖层：顶栏下线后的输入框 / 智能体条 / 左侧一级导航，必须最后引入。

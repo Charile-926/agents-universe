@@ -12,8 +12,6 @@ const authStore = vi.hoisted(() => ({
 }))
 vi.mock('@/stores/auth', () => ({ useAuthStore: () => authStore }))
 
-vi.mock('@/stores/tour', () => ({ useTourStore: () => ({ start: vi.fn() }) }))
-
 describe('SidebarFooter', () => {
   it('no longer offers the publish-settings entry', () => {
     const wrapper = mount(SidebarFooter)
@@ -26,7 +24,7 @@ describe('SidebarFooter', () => {
   it('keeps the remaining entries and token-settings navigation', async () => {
     const wrapper = mount(SidebarFooter)
     const buttons = wrapper.findAll('button')
-    expect(buttons.length).toBeGreaterThanOrEqual(3) // tour / settings / logout
+    expect(buttons.length).toBe(2) // settings / logout
 
     const settingsBtn = buttons.find(b => b.attributes('title') === '密钥配置')
     expect(settingsBtn).toBeDefined()
@@ -49,9 +47,9 @@ describe('SidebarFooter', () => {
     authStore.displayName = original
   })
 
-  it('keeps all three action buttons in the actions row', () => {
+  it('keeps the settings and logout actions', () => {
     const wrapper = mount(SidebarFooter)
-    expect(wrapper.findAll('.user-info-actions button').length).toBe(3)
+    expect(wrapper.findAll('.user-info-actions button').length).toBe(2)
   })
 
   it('no longer offers a language switcher (single-language UI)', () => {

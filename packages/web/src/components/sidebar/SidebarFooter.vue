@@ -8,9 +8,6 @@
         }}</span>
       </div>
       <div class="user-info-actions">
-        <button class="settings-btn" :title="t('sidebar.footer.takeTour')" @click="startTour">
-          <Compass :size="12" />
-        </button>
         <button class="settings-btn" :title="t('sidebar.footer.tokenSettings')" @click="goSettings">
           <Settings :size="12" />
         </button>
@@ -29,14 +26,12 @@
 import { computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { useT } from '@/i18n'
-import { Settings, LogOut, Compass } from 'lucide-vue-next'
+import { Settings, LogOut } from 'lucide-vue-next'
 import { useAuthStore } from '@/stores/auth'
-import { useTourStore } from '@/stores/tour'
 import { withBase } from '@/utils/basePath'
 import { apiFetch } from '@/api/client'
 
 const authStore = useAuthStore()
-const tourStore = useTourStore()
 const router = useRouter()
 const { t } = useT()
 
@@ -48,10 +43,6 @@ const initials = computed(() => {
 
 function goSettings() {
   router.push('/settings/tokens')
-}
-
-function startTour() {
-  void tourStore.start(0, router)
 }
 
 async function handleLogout() {
