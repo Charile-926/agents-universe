@@ -72,8 +72,16 @@ const router = createRouter({
       ],
     },
     {
+      // 密钥配置是工作台的一部分：挂进 AppLayout，弹窗后面仍有侧栏上下文，
+      // 不再是一张浮在灰色空底上的孤岛。
       path: '/settings/tokens',
-      component: () => import('@/pages/TokenConfigPage.vue'),
+      component: () => import('@/layouts/AppLayout.vue'),
+      children: [
+        {
+          path: '',
+          component: () => import('@/pages/TokenConfigPage.vue'),
+        },
+      ],
     },
     {
       // 发布管理已并入项目布局，旧书签落到当前项目的 publishes。
