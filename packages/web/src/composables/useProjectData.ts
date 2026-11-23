@@ -30,9 +30,13 @@ export function useProjectData() {
         const savedId = store.getSavedProjectId()
         const saved = savedId ? projects.find(p => p.project_id === savedId) : null
         const favorited = favoritesStore.resolvedFavoriteProjects
-        const target = saved ?? (favorited.length > 0 ? favorited[0] : projects[0])
-        store.setCurrentProject(target)
-        router.push(`/projects/${target.project_id}/chat`)
+        // 只在「上次用过的」或「收藏过的」项目之间自动进入。服务端还有项目
+        // 但用户没收藏时保持工作台为空，而不是硬塞一个 projects[0]。
+        const target = saved ?? favorited[0]
+        if (target) {
+          store.setCurrentProject(target)
+          router.push(`/projects/${target.project_id}/chat`)
+        }
       }
     } catch (e) {
       console.error('Failed to load project data', e)
