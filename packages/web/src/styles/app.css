@@ -108,32 +108,7 @@
   margin: 0;
 }
 
-/* 主按钮（原 layout.css 中定义，随多面板样式一并精简到这里） */
-.btn-primary {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  padding: 9px 16px;
-  font-size: var(--text-md);
-  font-weight: 500;
-  color: #fff;
-  background: var(--accent);
-  border: none;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  transition: background var(--dur-fast) var(--ease-out);
-}
-
-.btn-primary:hover:not(:disabled) {
-  background: var(--accent-hover);
-}
-
-.btn-primary:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-
+/* 主按钮的样式由 layout.css 统一提供，这里不再重复定义。 */
 @media (max-width: 900px) {
   .app-main { padding: 20px 14px 40px; }
   .app-brand-sub { display: none; }
