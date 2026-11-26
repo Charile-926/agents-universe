@@ -2,8 +2,11 @@
 FROM node:22-slim AS web-build
 WORKDIR /app
 COPY packages/web/package*.json ./
-# package-lock.json has internal Nexus URLs unreachable outside corp network.
-# Use --no-package-lock to resolve from the npm registry instead.
+# Reproducible install: keep the committed lockfile and use `npm ci` (same as
+# CI). The lockfile resolves against registry.npmjs.org; the sed below rewrites
+# those URLs to the configured mirror so builds work where only the mirror is
+# reachable (npm's own replace-registry-host is not relied on — explicit is
+# safer across npm versions).
 # Defaults to the China mirror (npmmirror) for fast CN builds; override with
 # --build-arg NPM_REGISTRY=https://registry.npmjs.org for other environments.
 ARG NPM_REGISTRY=https://registry.npmmirror.com
@@ -11,9 +14,8 @@ ARG NPM_REGISTRY=https://registry.npmmirror.com
 # builds only download what changed (keeps even cache-invalidated layers cheap).
 ENV npm_config_cache=/root/.npm
 RUN --mount=type=cache,target=/root/.npm \
-    npm install -g npm@latest --registry=$NPM_REGISTRY \
-    && rm -f package-lock.json \
-    && npm install --registry=$NPM_REGISTRY
+    sed -i "s|https://registry.npmjs.org|$NPM_REGISTRY|g" package-lock.json \
+    && npm ci --registry=$NPM_REGISTRY
 COPY packages/web/ ./
 ARG VITE_BASE_PATH=/
 ARG VITE_API_BASE_PATH=
@@ -31,6 +33,12 @@ ARG http_proxy
 ARG https_proxy
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
+# TLS verification for apt and the Microsoft key download is ON by default.
+# An SSL-inspecting corporate proxy presents its own certs, so builds that pass
+# a proxy build-arg (http_proxy/HTTP_PROXY) switch verification off
+# automatically; set INSECURE_TLS=true to force it off, or INSECURE_TLS=false
+# to keep verification on even behind a proxy that uses a trusted CA.
+ARG INSECURE_TLS=auto
 
 # China build mirrors (override with --build-arg for other environments).
 ARG APT_MIRROR_HOST=mirrors.tuna.tsinghua.edu.cn
@@ -44,8 +52,9 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     PLAYWRIGHT_DOWNLOAD_HOST=$PLAYWRIGHT_DOWNLOAD_HOST
 
 # Install ODBC Driver 17 for SQL Server, Java, Maven, nginx and common tools.
-# Corporate SSL-inspection proxy presents self-signed certs - disable
-# verification for curl and apt so the Microsoft package repo can be fetched.
+# Proxy config and the TLS relaxation below are written only when a proxy
+# build-arg is set (or INSECURE_TLS=true) - a plain build keeps apt/curl
+# verification on.
 RUN if [ -n "$http_proxy" ]; then \
         echo "Acquire::http::Proxy \"$http_proxy\";" > /etc/apt/apt.conf.d/99proxy; \
         echo "Acquire::https::Proxy \"$http_proxy\";" >> /etc/apt/apt.conf.d/99proxy; \
@@ -57,14 +66,23 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     --mount=type=cache,target=/tmp/ms-keys \
     set -eu \
+    && insecure=0 \
+    && if [ -n "$http_proxy" ] || [ -n "$HTTP_PROXY" ] || [ "$INSECURE_TLS" = "true" ]; then insecure=1; fi \
+    && if [ "$INSECURE_TLS" = "false" ]; then insecure=0; fi \
+    && if [ "$insecure" = "1" ]; then \
+        printf 'Acquire::https::Verify-Peer "false";\nAcquire::https::Verify-Host "false";\nAcquire::Retries "3";\n' \
+            > /etc/apt/apt.conf.d/99no-verify; \
+        CURL_INSECURE="-k"; \
+    else \
+        printf 'Acquire::Retries "3";\n' > /etc/apt/apt.conf.d/99no-verify; \
+        CURL_INSECURE=""; \
+    fi \
     && sed -i 's|deb.debian.org|'"$APT_MIRROR_HOST"'|g' \
         /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true \
-    && printf 'Acquire::https::Verify-Peer "false";\nAcquire::https::Verify-Host "false";\nAcquire::Retries "3";\n' \
-        > /etc/apt/apt.conf.d/99no-verify \
     && apt-get update && apt-get install -y --no-install-recommends \
         bash curl git gnupg jq unixodbc-dev maven nginx \
     && if [ ! -f /tmp/ms-keys/microsoft.asc ]; then \
-        curl -fsSLk $MS_REPO/keys/microsoft.asc -o /tmp/ms-keys/microsoft.asc; \
+        curl -fsSL $CURL_INSECURE $MS_REPO/keys/microsoft.asc -o /tmp/ms-keys/microsoft.asc; \
     fi \
     # gpg 2.2 dearmor mode rejects `-o` alongside a file arg ("usage:" error,
     # exit 2) - read from stdin and redirect to the keyring instead.
@@ -92,8 +110,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # Cache the tarball in BuildKit's cache store so repeated builds skip the download.
 RUN --mount=type=cache,target=/tmp/node-dl \
     NODE_TAR=node-v22.23.4-linux-x64.tar.gz \
+    && insecure=0 \
+    && if [ -n "$http_proxy" ] || [ -n "$HTTP_PROXY" ] || [ "$INSECURE_TLS" = "true" ]; then insecure=1; fi \
+    && if [ "$INSECURE_TLS" = "false" ]; then insecure=0; fi \
+    && if [ "$insecure" = "1" ]; then CURL_INSECURE="-k"; else CURL_INSECURE=""; fi \
     && if [ ! -f "/tmp/node-dl/$NODE_TAR" ]; then \
-        curl -fsSLk "$NODE_BASE_URL/v22.23.4/$NODE_TAR" -o "/tmp/node-dl/$NODE_TAR"; \
+        curl -fsSL $CURL_INSECURE "$NODE_BASE_URL/v22.23.4/$NODE_TAR" -o "/tmp/node-dl/$NODE_TAR"; \
     fi \
     && tar -xz -C /usr/local --strip-components=1 -f "/tmp/node-dl/$NODE_TAR" \
     && node --version && npm --version
@@ -185,7 +207,23 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "semgrep==$SEMGREP_VERSION" \
     && /opt/semgrep-venv/bin/semgrep --version
 
-# ── Stage 4: Final combined image (API + Web) ─────────────────────────────
+# ── Stage 4: Web dev server (local dev only; `docker compose --profile dev`) ──
+# Deliberately placed BEFORE `final`: the last stage of a Dockerfile is the
+# default build target, so a plain `docker build .` must land on the production
+# image, never on a vite dev server.
+FROM node:22-slim AS web-dev
+WORKDIR /app
+COPY packages/web/package*.json ./
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+ENV npm_config_cache=/root/.npm
+RUN --mount=type=cache,target=/root/.npm \
+    sed -i "s|https://registry.npmjs.org|$NPM_REGISTRY|g" package-lock.json \
+    && npm ci --registry=$NPM_REGISTRY
+COPY packages/web/ ./
+EXPOSE 5173
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+
+# ── Stage 5: Final combined image (API + Web) — the default target ────────
 FROM python-base AS final
 RUN groupadd -r appuser && useradd -r -m -d /home/appuser -g appuser appuser
 WORKDIR /app
@@ -241,6 +279,7 @@ RUN set -eux; \
     mvn --version; \
     test -x /ms-playwright/chromium-*/chrome-linux/chrome \
         || test -x /ms-playwright/chromium-*/chrome-linux64/chrome; \
+    (cd /opt/ts-grammars && sha256sum -c SHA256SUMS); \
     python -m pytest --version; \
     pip check; \
     python -m sqlmap.sqlmap --version; \
@@ -302,16 +341,3 @@ RUN mkdir -p /home/appuser/.m2 /home/appuser/.gradle /app/projects /tmp/npm-cach
 EXPOSE 8000
 USER appuser
 CMD ["/docker-entrypoint.sh"]
-
-# ── Stage 5: Web dev server (local dev only) ──────────────────────────────
-FROM node:22-slim AS web-dev
-WORKDIR /app
-COPY packages/web/package*.json ./
-# package-lock.json has internal Nexus URLs unreachable outside corp network.
-ARG NPM_REGISTRY=https://registry.npmmirror.com
-ENV npm_config_cache=/root/.npm
-RUN --mount=type=cache,target=/root/.npm \
-    rm -f package-lock.json && npm install --registry=$NPM_REGISTRY
-COPY packages/web/ ./
-EXPOSE 5173
-CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]

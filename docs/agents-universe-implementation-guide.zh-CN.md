@@ -174,7 +174,7 @@ tools = 当前 Agent 实际可用工具的名称、说明、参数 JSON Schema
 另有两个容易误解的边界：
 
 - `knowledge_level: detail`，以及 `knowledge_level: auto` 且有 `parent` 的文件属于延迟知识；`knowledge_role: log` 或规范日志 slug `system/history` 默认既不发送正文，也不进入 detail 目录，只有显式读取或加载后才可能进入上下文。
-- 数据库 session、完整 `ToolContext`、用户 JWT、模型 API Key、密钥保险库对象不会被整体序列化进 messages。它们留在后端执行工具或完成鉴权；但写入知识正文、聊天或工具返回值的业务数据，确实可能随上下文发给所选模型服务。
+- 数据库 session、完整 `ToolContext`、会话 Cookie、模型 API Key、密钥保险库对象不会被整体序列化进 messages。它们留在后端执行工具或完成鉴权；但写入知识正文、聊天或工具返回值的业务数据，确实可能随上下文发给所选模型服务。
 
 ### 5.3 system 消息内部是什么样
 
@@ -613,7 +613,7 @@ MCP（Model Context Protocol）用于把外部工具服务器接入平台：
 | Python 3.12 | Agent Core 与 API 运行时 | `agent-core`、`api` |
 | FastAPI / Uvicorn | REST API、WebSocket 服务 | `packages/api` |
 | SQLAlchemy 2 / Alembic | ORM 和多数据库迁移 | `packages/api` |
-| Redis | OAuth 会话与活跃用户等短期状态 | API 服务 |
+| Redis | 登录会话（不透明 Cookie 对应的状态）与活跃用户等短期状态 | API 服务 |
 | OpenAI / Anthropic / Google GenAI SDK | 多厂商模型调用 | `agent_core/providers` |
 | MCP Python SDK | 外部 MCP 工具服务器连接 | `tools/mcp_client.py` |
 | Playwright | 浏览器自动化 | `browser_playwright.py` |

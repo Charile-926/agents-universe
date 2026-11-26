@@ -20,9 +20,11 @@
 #   KEEP_BACKUPS=5                  保留最近几份备份
 #
 # 设计要点：
-# 1. 前端与后端都打进镜像，所以必须 docker build --target final，不能只重启容器。
-# 2. 升级会跑 alembic 迁移（删列、重建表）。回滚必须"旧镜像 + 旧库文件"一起恢复，
-#    只回滚镜像会因为缺列而 500。
+# 1. 前端与后端都打进镜像，所以必须重新 docker build，不能只重启容器。
+#    镜像的 `final` 阶段是 Dockerfile 的最后一个 stage（默认 target），脚本仍显式
+#    写 --target final 作为双保险。
+# 2. 升级会跑 alembic 迁移（删列、重建表）。SQLite 部署的回滚必须"旧镜像 + 旧库文件"
+#    一起恢复，只回滚镜像会因为缺列而 500；PostgreSQL 部署请自行确认数据库已有快照。
 # 3. SQLite 库文件必须在挂载卷里。脚本会核对容器路径与宿主机路径的映射，
 #    对不上就中止，避免容器重建把库文件一起删掉。
 
@@ -58,7 +60,7 @@ run() {
 }
 
 usage() {
-  sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed '${/^$/d;}'
   exit 0
 }
 
@@ -182,7 +184,7 @@ log "拉取 origin/$BRANCH"
 run "git fetch origin '$BRANCH:refs/remotes/origin/$BRANCH'"
 run "git reset --hard 'origin/$BRANCH'"
 
-# ── 4. 构建镜像（--target final 不能省）────────────────────────────────────
+# ── 4. 构建镜像（final 是 Dockerfile 的默认 target；显式写出作为双保险）──────
 log "构建镜像（前端与后端都打进镜像，首次约 10–30 分钟）"
 run "docker build --target final -t '$IMAGE' ."
 

@@ -54,6 +54,8 @@ test = [
     "vcrpy>=6.0.0",
     "pytest-mock>=3.14.0",
     "aiosqlite>=0.20.0",
+    # Differential reference for the stdlib cron evaluator (tests/test_cron_parity.py).
+    "croniter>=6.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]

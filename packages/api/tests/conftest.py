@@ -57,7 +57,9 @@ def _fresh_schema():
     if _PROJECTS_ROOT.exists():
         import shutil
         shutil.rmtree(_PROJECTS_ROOT)
-    _PROJECTS_ROOT.mkdir(parents=True)
+    # exist_ok: a run killed mid-setup (CI timeout, Ctrl-C) leaves the dir
+    # behind; without this every later session fails at setup with WinError 183.
+    _PROJECTS_ROOT.mkdir(parents=True, exist_ok=True)
 
     from alembic import command
     if not os.environ.get("TEST_DATABASE_URL", "").startswith("sqlite"):

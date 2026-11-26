@@ -1,96 +1,100 @@
-Scheduled background tasks (running plus queued) are capped at 64 per process. Scheduled fires over capacity are persisted as `skipped`; manual launches return busy without creating a pending row. Per-schedule launch locks are removed after their final waiter exits.
+# CLAUDE.md
 
-# Agents Universe — Enterprise AI Agent Framework
+本文件为 Claude Code (claude.ai/code) 在本仓库工作时提供指导。它只描述**稳定的、读代码一眼看不出来的**约定；会变的事实（文件清单、功能列表、运行命令）放 README，不在这里重复。
 
-## Project Overview
+## 项目一句话
 
-Full-stack enterprise AI agent framework running in Linux containers: autonomous planning, multi-LLM providers (Anthropic / OpenAI / Azure OpenAI / Google Gemini), on-demand knowledge loading, Codex-style web UI.
+Agents Universe 是一个多智能体平台：后端 Python（FastAPI + SQLAlchemy 2 + Alembic），前端 Vue 3 + TypeScript，单仓库 `packages/` 下三个包（`agent-core`、`api`、`web`）。生产形态是一个 Docker 镜像（nginx 同时托管前端静态文件和 `/api`、`/ws` 反向代理）。
 
-**Core principle:** project knowledge loads in full on project selection. No embedding model — context via MD cross-references (`[[slug]]`).
-
-## Monorepo Layout
-
-- `packages/agent-core/` — Python 3.12 LLM orchestration engine (pure library, no HTTP)
-- `packages/api/` — Python 3.12 FastAPI web service: auth, DB, WebSocket
-- `packages/web/` — TypeScript + Vue 3 Codex-style browser UI
-- `agents/` — agent definitions (`*.agent.md`) and skills (`skills/**/*.md`)
-- `knowledge/` — global framework knowledge base (system/, technical/, _template/); `categories.yaml` — project category registry (template subsets per category)
-- `workflows/` — workflow definitions (`*.workflow.md`); agent reads and follows
-
-## Development Commands
+## 命令
 
 ```bash
-# API (from packages/api/)
-PYTHONPATH=src python -m uvicorn api.main:app --port 8000
+# 后端
+pip install -e "packages/agent-core[dev]" -e "packages/api[dev]"   # 或用 .venv
+pytest packages/agent-core/tests -q        # agent-core 单测（含 browser_* 需 Playwright）
+pytest packages/api/tests -q               # api 单测（SQLite 跑完整 alembic 链）
+cd packages/api && alembic upgrade head    # 本地迁移（DATABASE_URL 指向目标库）
 
-# Frontend (from packages/web/)
-npm run dev
+# 前端
+cd packages/web && npm ci && npm run dev    # http://localhost:5173，代理 /api、/ws 到 8000
+cd packages/web && npm run build            # vue-tsc 类型检查 + vite 构建（dist/）
+cd packages/web && npm test -- --run        # vitest
 
-# Knowledge indexer (global tier / one project's workspace)
-python -m agent_core.knowledge.index --global-dir ./knowledge
-python -m agent_core.knowledge.index --project-dir <project_root> --project-id <uuid>
-
-# DB migrations (from packages/api/)
-alembic upgrade head
-alembic revision --autogenerate -m "description"
-
-# Docker local stack (fresh clone first: cp docker-compose.example.yml docker-compose.yml)
-docker compose up
-docker compose up --build
+# 提交前
+python scripts/check_commit_hygiene.py urls --all-files   # URL 主机白名单（.commit-hygiene.toml）
+python scripts/check_commit_hygiene.py identity    # 提交身份邮箱策略
+pre-commit run --all-files                         # 全套本地钩子（gitleaks、空白、YAML/TOML 等）
 ```
 
-## Key Conventions
+`pytest -m "not browser"` 跳过需要 Playwright/Chromium 的用例。
 
-1. **Token security** — Encrypted tokens are never logged, printed, or included in error messages. AES-256-GCM in `token_vault.py`.
-2. **Knowledge cross-links** — `[[slug]]` inside Markdown files; resolved to `knowledge_id` at index time.
-3. **Project context loading** — `knowledge/loader.py` two-tier model on project selection: primary files load in full from disk; `knowledge_level: detail` files are indexed in DB (metadata + summary only) and loaded on demand via `knowledge_rw`. `knowledge_role: log` files (`system/history`) load into neither tier — not even the deferred listing; read on demand only.
-4. **DB primary keys** — Model layer always client-side `String(36)` + `uuid4()` (`models/_compat.py::new_uuid`), portable across all dialects. Never `IDENTITY`; `UNIQUEIDENTIFIER DEFAULT NEWID()` appears only in MSSQL-only migration DDL branches.
-5. **DB drivers** — Four first-class dialects, switched via `DATABASE_URL` (async app driver → sync alembic driver): SQL Server `mssql+aioodbc` → `mssql+pyodbc` (never `pymssql`), PostgreSQL `postgresql+asyncpg` → `postgresql+psycopg2`, MySQL `mysql+aiomysql` → `mysql+pymysql`, SQLite `sqlite+aiosqlite` → `sqlite`. DB_* fields build the default MSSQL URL; `MSSQL_CONNECTION_STRING` is legacy fallback. T-SQL-only DDL must be guarded by dialect branches; SQLite table rewrites use `op.batch_alter_table`; data backfills guard `context.is_offline_mode()`.
-6. **Project isolation** — Knowledge queries always scope to `project_id = :current OR project_id IS NULL`. No cross-project queries.
-7. **Agent definitions** — Markdown frontmatter + body in `agents/*.agent.md` (global, synced at startup). **Project-scoped agents** live in `{PROJECTS_ROOT}/{slug}/agents/{project_slug}--{name}.agent.md` with matching `skills/` and `workflows/` dirs; lazily synced to the `agents` table (column `project_id`), selectable only within their project, shadowing global skills/workflows of the same slug at runtime. Created/deleted via the 智能体定制专家 conversation (file write/delete + lazy sync) — no restart needed. Models are NOT defined per-agent: configured in Settings → AI Models (`user_model_configs` table), one per conversation. `model_low/mid/high` on the `agents` table and `complexity.py` are legacy — no complexity-based routing at runtime. **@-mention agent routing**: typing `@` in the composer lists agents only (popup-driven; hand-typed `@name` stays plain text); selecting one inserts `@{display_name}` and routes that single turn to the mentioned agent (per-message `agent_id` is a slug, resolved per turn in `handlers.py`). The conversation's default agent is unchanged. Attribution is stored on `messages.agent_slug`; `_load_history` prefixes other agents' replies with `[display_name]:` so the mentioned agent can tell whose output is whose. Mid-run injections cannot switch agents (the running agent owns the turn).
-8. **Skill types** — `guidance` (LLM instructions), `template` (code templates), `executable` (runnable code blocks), `composite` (chains other skills).
-9. **Workflow definitions** — Same format as skills; files end in `.workflow.md`. No YAML engine — agent reads and executes.
-10. **Image outputs** — Stored in `{PROJECTS_ROOT}/{slug}/.tmp/media/{conversation_id}/`; served via `/api/media/` with JWT auth. Never stored as DB blobs.
-11. **Secret management** - Two-tier encrypted storage: `user_tokens` (per-user, cross-project), `project_secrets` (per-project); both AES-256-GCM in `token_vault.py`. `secret_vault` manages the user vault (list/save/delete); `api_request` resolves secrets via `secret_ref`/`secret_refs` + `secret_scope` (project->user fallback). Secret prompts (`user_confirm` / `api_request`) use `save_to_project_secrets` or `save_to_user_tokens` (mutually exclusive) - plaintext never reaches the LLM. Secrets never stored in `personal_memories` (`memory_rw` rejects them). Keys never put in URL query parameters.
-12. **MCP integration** - Agents connect to external MCP (Model Context Protocol) servers declared in `knowledge/integrations/mcp-servers.md` (project-level YAML catalog). Agent frontmatter `tools:` list declares `mcp` (all enabled servers) or `mcp:<slug>` (specific). Tools discovered at runtime, injected as `mcp__<server>__<tool>` via `attach_mcp_tools()` in `handlers.py` (before `agent.run()`). Transport: Streamable HTTP with SSE fallback. Secrets reuse `project_secrets`/`user_tokens` via `secret_ref`; SSRF validation, header blacklist, destructive-tool confirmation gate, and response redaction are built in. `MCPConnectionManager` holds connections per `ToolContext` (cleaned up in `ToolContext.cleanup()`). MCP failures never block the conversation (degraded to warning).
-13. **Scheduled tasks** - Fourth top-level tab (`/projects/:id/schedules`); tables `scheduled_tasks` + `scheduled_task_runs`, three target types: `script` / `playwright` / `agent` (prompt handed to an agent). Cron parsing lives in `agent_core.scheduling.cron` (5-field, POSIX dom/dow OR semantics, `zoneinfo`) — no `croniter` dependency; API and the `scheduler` tool share it. The loop is **in-process asyncio** (`services/scheduler.py`, `SCHEDULER_ENABLED` to disable) and assumes a **single replica** — multiple workers would need a distributed lock. Due occurrences are claimed with a DB compare-and-swap (`UPDATE ... WHERE next_run_at = :observed`, `rowcount != 1` → skip), **missed runs are skipped, never replayed**, and a startup sweep settles leftover `pending`/`running` rows as `failed`. Script / Playwright targets reuse `script_runs` and `/ws/script-runs/{run_id}` (with `triggered_by` = task creator); agent targets call `run_turn(interactive=False)` under `manager.claim_turn` — losing the claim records `skipped` rather than interrupting a user turn. Results are delivered with `_persist_assistant_message` plus a `conversation_updated` WS event. Tasks store no credentials; prompts are plaintext in the DB and must never contain secrets.
-14. **No corporate identifiers** - Neither commit identity nor file content may carry an employer email domain or an intranet hostname. Set `user.email` to a GitHub noreply address, and use reserved `example.com`-family hosts for every sample URL, hostname, test fixture and knowledge-base example. Self-check before committing: `git log -1 --format='%an <%ae> %cn <%ce>'`, plus a scan of the diff for real internal hosts. Enforced automatically by `scripts/check_commit_hygiene.py` — the `commit-identity` / `url-policy` pre-commit hooks and the CI `hygiene` job, driven by `.commit-hygiene.toml` (banned email substrings, allowed URL hosts). A legitimately public domain needs a reviewed entry in that file; a line carrying `hygiene:allow-url` is exempt.
-15. **Agent delegation is nested, not a handoff** — an agent that lacks a capability calls `delegate_agent`, which runs another agent **inside the same turn** as a nested `run_turn(..., delegation=...)`: the parent blocks on the tool call, gets a result dict back, and writes the final answer itself. The conversation is never moved to another agent (that is @-mention routing, a separate mechanism). The nested turn's events go through a **fail-closed** `DelegationTransport` whitelist — `stream_delta`, `stream_end`, `abort_ack`, `error`, `task_*`, `token_update` are dropped rather than forwarded, or they would hijack the parent's bubble/panel/counters. **A delegated turn must never touch conversation-level state**: no `claim_turn`, no `register_session`, no draining pending injections, no `drop_uploads`, no `release_turn`, no `conversation_runs` row, no `agent_tasks` sweep — those belong to the top-level turn, and `agent_turn.py` guards each with an explicit `nested` condition. Consequences worth knowing: the sub-agent's reply is persisted as its own `messages` row with its own `agent_slug` (the UI's existing attribution badge, and `_load_history` prefixes it `[display_name]:`), while anything the user types *during* the delegation is consumed by the parent at its next step boundary and is invisible to the child. Depth is capped (`AGENT_DELEGATION_MAX_DEPTH`, default 2, `0` disables), a slug already in the chain is refused, and a per-conversation lock serializes concurrent delegations — it must be inherited via `holds_gate` or a grandchild re-enters a lock its ancestor holds. Delegation deliberately widens privilege (a narrow agent borrows a wide one), so the sub-agent's own confirmation gates still apply.
-
-## Sub-project Workspace Structure
-
-`PROJECTS_ROOT` is a **required** env var pointing to an external directory (outside the repo). Sub-projects created via `POST /api/projects` get an isolated workspace:
+## 架构速览
 
 ```
-{PROJECTS_ROOT}/
-└── {slug}/
-    ├── agents/        ← project-scoped agent definitions (*.agent.md)
-    ├── skills/        ← project-scoped skills (shadow global same-slug)
-    ├── workflows/     ← project-scoped workflows (shadow global same-slug)
-    ├── knowledge/      ← initialized from knowledge/_template/ (subset by category, see knowledge/categories.yaml)
-    ├── tests/          ← initialized with Playwright scaffold (scaffold/tests/); QA agent generates test scripts here
-    └── .tmp/
-        ├── media/{conversation_id}/   ← screenshots and generated images
-        └── work/                      ← temporary working files
+packages/
+  agent-core/   纯 Python 库，无 FastAPI 依赖
+    agent.py          Agent 循环：system prompt 组装 → provider 调用 → tool_calls → 压缩 → 循环
+    providers/        anthropic / openai / gemini 三家 SDK 适配 + registry
+    tools/            ~40 个工具，统一 ToolRegistry；工具必须声明 side_effect / degrades_context
+    knowledge/        loader（md+frontmatter → KnowledgeEntry）+ index（SQLite 缓存）+ graph（tree-sitter 代码图谱）
+    skills/ workflows/ 内容注册表（agents/skills/*.md、workflows/*.yaml）
+    scheduling/cron.py 五字段 cron 求值（标准库；tests/test_cron_parity.py 与 croniter 交叉校验）
+    sandbox.py        审计钩子 + 路径白名单；sandbox_guard/sitecustomize.py 是子进程侧 guard
+  api/          FastAPI 应用
+    routers/          HTTP / WebSocket 路由，只做参数校验与鉴权，业务在 services/
+    services/         agent_turn.py（一轮对话的编排）、scheduler.py（进程内调度循环）等
+    models/           SQLAlchemy 模型（_compat.py 提供跨方言 UTCDateTime / uuid）
+    alembic/          迁移链；SQLite/PG/MySQL/MSSQL 四方言都要能跑
+  web/          Vue 3 SPA
+    src/api/          fetch 封装与 SSE/WS 客户端
+    src/stores/       Pinia：conversation（消息流）、auth、settings 等
+    src/composables/  useWebSocket 等
+agents/          *.agent.md 智能体定义 + skills/ 子目录
+workflows/       YAML 工作流
+knowledge/       Markdown 知识库（frontmatter: slug/title/category/tags）
+scaffold/        项目脚手架模板
+docker/          ts-grammars 预编译语法（含 SHA256SUMS）、healthcheck
+scripts/         deploy_server.sh、fetch_ts_grammars.py、check_commit_hygiene.py
 ```
 
-## Architecture Decisions
+一次对话的路径：浏览器 `POST /ws`（`api/websocket.py`）→ `services/agent_turn.py` 组装上下文（知识检索、记忆、技能、计划、模型凭据解密）→ `agent_core.Agent.run()` 循环 → 工具执行（可能落到 `sandbox.py`）→ 事件流回 WebSocket → 前端 store 渲染。
 
-- **Python for agent-core + API**: Richer AI/ML ecosystem (all LLM SDKs).
-- **No embedding model**: knowledge loaded in full per project; no vector search, no sentence-transformers dependency.
-- **CodeMirror 6 in Composer**: Multi-line Markdown input with `@mention` and `/command` support.
-- **Completeness score denormalized**: stored in `knowledge_metadata` to avoid recomputation on every read.
-- **Redis for session + active users**: OAuth session keyed `session:{session_id}` (TTL=24h), active users tracked via sorted set.
-- **Agentic Loop**: `plan_task` tool triggers structured task planning; tasks tracked in `agent_tasks` DB table.
+## 硬性约定
 
-## Files Never to Commit
+### 数据库
+- 主键一律 `String(36)` + 客户端 `uuid4()`（`models/_compat.py:new_uuid`），不用数据库自增或 `NEWID()`。迁移中 T-SQL 专属 DDL 放在 `if op.get_bind().dialect.name == "mssql":` 分支内；SQLite 用 `op.batch_alter_table`；数据回填用 `context.is_offline_mode()` 守卫。
+- PostgreSQL 是默认生产方言（`DB_*` 拼 URL），SQL Server 是遗留部署（`MSSQL_CONNECTION_STRING`），MySQL/SQLite 同样一等公民。新迁移必须四方言可编译。
+- 新模型必须写 UTC（`UTCDateTime` naive UTC），不要用 `datetime.now()`。
+- 迁移文件头部的 Revision ID / Create Date 必须由 alembic 生成，不要手写。
 
-- `.env` — all secrets
-- `.claude/settings.local.json`
-- Anything under `PROJECTS_ROOT` — sub-project workspaces are user data, not application code
+### 认证与安全
+- 会话是 **Redis + HttpOnly 不透明 Cookie**（`dependencies/auth.py`）；没有 JWT，没有 OAuth。登录方式只有用户名 + 密码（`routers/auth_local.py`）。
+- 用户名 / 显示名在库里只有 HMAC 摘要 + Fernet 密文（`services/user_crypto.py`）；API Key 走 AES-256-GCM（`services/token_vault.py`）。新表存敏感字段必须复用这两个模块，不要自造加密。
+- `SECRET_KEY` 为 `change-me` 占位值时 API 拒绝启动（`main.py`），不要绕过。
+- 所有用户数据查询必须带 `user_id` 过滤；跨用户访问返回 404 而不是 403。
+- 智能体发起的 HTTP 请求必须经 `tools/_ssrf.py` 校验（含重定向逐跳）。
+- MCP 工具：头名黑名单、破坏性工具二次确认、`mcp_client.py` 连接超时。新增外部 IO 工具时同步更新这两处。
 
-## Testing Strategy
+### 智能体工具
+- 每个工具在 `ToolRegistry` 注册并声明 `side_effect`（read / write / external）与 `degrades_context`。
+- 工具结果进入模型上下文前必须截断（`agent.py` 的 `_MAX_TOOL_RESULT_CHARS`），大输出落盘并只回传路径。
+- 上下文压缩策略在 `compressor.py`：先丢最旧的工具结果，再摘要，再中断。
+- 沙箱（`sandbox.py`）是**纵深防御而非安全边界**：多租户或不可信代码必须放到独立容器 / microVM 执行。
+- 后台任务（脚本运行、cron 调度）并发上限 64，超出的排队；**排队中的任务不持久化**，重启会丢。
 
-- `agent-core`: pytest + pytest-asyncio; mock LLM providers via recorded VCR cassettes.
-- `api`: pytest + httpx AsyncClient; test DB uses SQLite in-memory (SQLAlchemy 2.x is dialect-agnostic for most queries).
-- `web`: Vitest + Vue Test Utils.
+### 前端
+- 界面文案只维护 `src/i18n/locales/zh-CN.ts`，运行时不存在第二种语言（`category_i18n` 是数据字段，不是 UI 多语言）。
+- 所有 API 调用走 `src/api/` 的封装（统一错误、401 跳登录、request id）。
+- 样式是单一主题：纯白底黑字、无渐变、无阴影特效；按钮字体字号全局统一。改动 `styles/` 时不要引入第二套视觉。
+- 新组件必须带 `__tests__/*.spec.ts`（vitest + @vue/test-utils）。
+
+### 内容文件
+- `agents/*.agent.md` 必须有 `model` 字段；frontmatter 用 `python-frontmatter` 解析。
+- `knowledge/*.md` 的 `slug` 与路径一致，`category` ∈ system / domain / technical / skills / workflows。这份知识库会被索引进智能体上下文，所以**过期的知识文档等同于给模型错误输入**——改了架构或表结构，同步改 `knowledge/technical/`。
+
+## 不要做
+- 不要在 `routers/` 里写业务逻辑；不要在 `agent-core` 里 import `api`。
+- 不要提交 `node_modules`、`.tmp/`、`data/`、`.env`（已在 .gitignore / .dockerignore）。
+- 不要在文档里写未在 `.commit-hygiene.toml` 白名单中的 URL 主机，CI 会拒绝。
+- 不要给 `docker/ts-grammars/*.so` 换版本而不更新 `SHA256SUMS` 与 `fetch_ts_grammars.py` 的 `PACK_VERSION`。
+- 不要为了让 Dockerfile 在某个网络环境跑通而默认关闭 TLS 校验——只在构建参数 `INSECURE_TLS` / 代理构建参数下放行。

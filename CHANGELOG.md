@@ -4,6 +4,37 @@
 
 ## [Unreleased]
 
+> 说明：本分支是上游的精简分支，保留了上游的历史条目。其中涉及 OAuth SSO、
+> 界面多语言切换、workspace 层、Agent 发布入口的条目在本分支**不适用**——这些
+> 能力已移除或只剩数据模型（见 README「架构边界与已知限制」）。新条目只应描述
+> 本分支真实落地的改动。
+
+### 变更（2026-11 架构梳理）
+
+#### 移除
+- **OAuth 残留彻底清理** - 依赖 `authlib`、`python-jose[cryptography]` 已无任何引用，删除；`config.py` 的 8 个 `oauth_*` 配置项与 `oauth_state_ttl` 删除，Cookie `Secure` 改由 `COOKIE_SECURE_OVERRIDE`（留空则按 `WEB_BASE_URL` 推导）；`redis_client.py` 的 OAuth state/session 辅助函数删除；`nginx-combined.conf` 的 Casdoor :8003 反代 server 块删除；`main.py`、`middleware/logging.py`、`docker-entrypoint.sh`、`docker-compose.example.yml` 中的 OAuth/8003 注释改正
+- **`packages/web/src/i18n/locales/en-US.ts`** - 961 行英文文案在「移除多语言」后已无人引用（`i18n/index.ts` 只加载 zh-CN），删除以免与中文文案长期漂移；`AppLocale` 类型保留（`category_i18n` 数据仍在用）
+- **`.env.example` 的 OAuth SSO 段落与 `OAUTH_SECURE_COOKIE`** - 与实际登录方式（账号密码 + Redis 会话）不符，删除
+
+#### 修复
+- **Docker 构建不可复现** - `web-build` / `web-dev` 两个阶段原来 `rm -f package-lock.json && npm install`，依赖版本随上游漂移且与 CI（`npm ci`）不一致；改为读锁文件 `npm ci`，锁文件里 110 条 `registry.npmmirror.com` 解析地址归一为 `registry.npmjs.org`，构建时按 `NPM_REGISTRY` 重写
+- **Dockerfile 默认 target 误指开发服务器** - `web-dev` 原是最后一个 stage，裸 `docker build .` 会产出 vite 开发服务器；`web-dev` 移到 `final` 之前，`final` 成为默认 target（`deploy_server.sh` 仍显式 `--target final` 双保险）
+- **镜像构建不再无条件关闭 TLS 校验** - apt 的 `Verify-Peer false` 与 `curl -k` 改为仅在传入代理构建参数（`http_proxy`/`HTTP_PROXY`）或 `INSECURE_TLS=true` 时生效；新增 `INSECURE_TLS=false` 可强制校验
+- **预编译 tree-sitter 语法补齐可审计性** - `docker/ts-grammars/` 新增 `SHA256SUMS`（7 个 `.so` 逐文件哈希）与 `README.md`（上游版本、资源地址、校验方式）；镜像构建执行 `sha256sum -c`；`scripts/fetch_ts_grammars.py` 改为官方 GitHub Release 优先、公共镜像兜底，并在抓取后自动重写 `SHA256SUMS`
+- **测试夹具不幂等** - `packages/api/tests/conftest.py` 的 `projects` 目录创建改 `exist_ok=True`：一次被中断的测试会话不再让后续每次运行都以 `WinError 183` 全量报错
+- **多用户隔离用例与执行顺序耦合** - `test_distill_sources_only_own_conversations` 断言 `user-a` 恰好 1 条可炼化会话，但同一会话库里其它用例也会给 `user-a` 建会话，整套跑必红（单跑通过，已用 `HEAD` 干净 worktree 复现确认与本轮改动无关）；改为断言「自己那条可见」并按 id 取它的工具调用数，与库中其它数据解耦
+
+#### 新增
+- **cron 求值差分测试** - `packages/agent-core/tests/test_cron_parity.py`：13 条表达式 × 2 个时区 × 6 次触发，与 croniter（MIT，Pallets 维护）逐次比对，另断言非法表达式双方都拒绝；`croniter` 只加入 `[project.optional-dependencies] test`，不增加运行时依赖（设计理由见 README「自研组件 vs 成熟开源方案」）
+
+#### 文档
+- **README 重写** - 按当前分支真实能力重写：架构拓扑与一次对话的路径、三包职责边界、快速开始（含 PowerShell）、配置表、开发与测试、部署/升级/回滚、架构边界（沙箱非安全边界、调度器单副本、发布只剩模型等）、自研组件与开源方案对比
+- **`SECURITY.md` 重写** - 原文档描述 JWT / OAuth 会话，与实现（Redis + 不透明 Cookie、PBKDF2、AES-256-GCM 令牌库）不符；改为真实模型 + 部署基线 + 漏洞报告方式
+- **`CLAUDE.md` 重写** - 去掉错位的首行与过时事实（OAuth、`UNIQUEIDENTIFIER`、MSSQL 默认、`complexity.py` 已废弃），只保留读代码看不出来的稳定约定
+- **`knowledge/technical/db-schema.md` 重写** - 原文档列出的 `users`、`oauth_sessions`、`jwt_sessions`、`workspaces`、`workspace_members` 与 `embedding` 列均已不存在（这份文档会被索引进智能体上下文）；改为「方言类型映射 + 迁移规则 + 表职责清单」，并声明模型与迁移链是唯一权威
+- **`CONTRIBUTING.md` 硬性准则修正** - 主键规则改为 `String(36)` + 客户端 `uuid4()`（原文写 `UNIQUEIDENTIFIER`），本地开发改 `npm ci`，补充 Python ≥ 3.12
+- **`docs/architecture-review-2026-11.zh-CN.md`** - 本次审查的完整记录：发现清单、处理方式、开源方案对比、未排期建议、验证结果
+
 ### 新增
 
 - **新手引导首步显式选择界面语言** - 引导第一步（`language`，居中卡片）渲染「中文 / English」原生语言名按钮（`TourStep.choices` 声明式扩展，无 choices 的步骤渲染不变），点击即切换整个应用与后续引导文案并自动下一步。语言偏好从此离开 localStorage 单机态：`user_preferences` 新增可空 `locale` 列（迁移 `e3f8a1c6d294`），`PATCH /api/preferences` 接受 `zh-CN`/`en-US`（非法值 422，省略字段不清空原值），`/api/me` 序列化带出，前端登录时以服务端值优先回填（跨设备跟随账号）；侧边栏 Languages 切换同步写服务端（失败仅告警，本地切换不受影响，与引导完成补丁同一乐观语义）。智能体回复语言不在本次范围——当前无通道把 locale 传给后端
