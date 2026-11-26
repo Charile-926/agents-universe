@@ -67,7 +67,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/tmp/ms-keys \
     set -eu \
     && insecure=0 \
-    && if [ -n "$http_proxy" ] || [ -n "$HTTP_PROXY" ] || [ "$INSECURE_TLS" = "true" ]; then insecure=1; fi \
+    && if [ -n "${http_proxy:-}" ] || [ -n "${HTTP_PROXY:-}" ] || [ "$INSECURE_TLS" = "true" ]; then insecure=1; fi \
     && if [ "$INSECURE_TLS" = "false" ]; then insecure=0; fi \
     && if [ "$insecure" = "1" ]; then \
         printf 'Acquire::https::Verify-Peer "false";\nAcquire::https::Verify-Host "false";\nAcquire::Retries "3";\n' \
@@ -111,7 +111,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN --mount=type=cache,target=/tmp/node-dl \
     NODE_TAR=node-v22.23.4-linux-x64.tar.gz \
     && insecure=0 \
-    && if [ -n "$http_proxy" ] || [ -n "$HTTP_PROXY" ] || [ "$INSECURE_TLS" = "true" ]; then insecure=1; fi \
+    && if [ -n "${http_proxy:-}" ] || [ -n "${HTTP_PROXY:-}" ] || [ "$INSECURE_TLS" = "true" ]; then insecure=1; fi \
     && if [ "$INSECURE_TLS" = "false" ]; then insecure=0; fi \
     && if [ "$insecure" = "1" ]; then CURL_INSECURE="-k"; else CURL_INSECURE=""; fi \
     && if [ ! -f "/tmp/node-dl/$NODE_TAR" ]; then \
