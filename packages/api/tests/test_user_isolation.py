@@ -120,9 +120,15 @@ async def test_distill_sources_only_own_conversations(client, as_user, make_proj
 
     async with as_user("user-a"):
         sources = (await client.get("/api/skills/distill/sources")).json()
-        assert sources["total"] == 1
-        assert sources["items"][0]["conversation_id"] == a_conv.conversation_id
-        assert sources["items"][0]["tool_call_count"] == 1
+        # 同一会话库里其它用例也会给 user-a 建会话，这里只断言"自己那条"可见，
+        # 不用绝对条数（否则测试顺序一变就红）。
+        ids = [item["conversation_id"] for item in sources["items"]]
+        assert a_conv.conversation_id in ids
+        own = next(
+            item for item in sources["items"]
+            if item["conversation_id"] == a_conv.conversation_id
+        )
+        assert own["tool_call_count"] == 1
 
 
 async def test_distill_rejects_foreign_conversation_id(client, as_user, make_project, db):

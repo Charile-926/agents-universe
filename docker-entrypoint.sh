@@ -136,8 +136,8 @@ while :; do
     if ! kill -0 "$NGINX_PID" 2>/dev/null; then
         echo "[entrypoint] nginx died - status=$_child_status ($(_status_desc "$_child_status")) - stopping orphaned workers, restarting" >&2
         # A master that dies suddenly leaves its workers behind; they get
-        # reparented here and keep listening on 8000/8003, which would make
-        # the new master's bind fail. TERM first (graceful), then KILL.
+        # reparented here and keep listening on 8000, which would make the new
+        # master's bind fail. TERM first (graceful), then KILL.
         for _pid in $(pgrep -P $$ 2>/dev/null || true); do
             [ "$_pid" = "$UV_PID" ] || kill -TERM "$_pid" 2>/dev/null || true
         done

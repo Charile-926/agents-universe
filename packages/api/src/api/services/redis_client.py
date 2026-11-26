@@ -70,59 +70,6 @@ async def delete_session(redis: Redis, session_id: str) -> None:
     await redis.delete(f"session:{session_id}")
 
 
-# ── OAuth state (CSRF nonce) ───────────────────────────────────────────────
-
-async def save_oauth_state(redis: Redis, state: str, ttl: int = 1800) -> None:
-    await redis.setex(f"oauth_state:{state}", ttl, "1")
-
-
-async def validate_and_consume_state(redis: Redis, state: str) -> bool:
-    """Returns True and deletes the nonce if it exists; False if it doesn't.
-
-    Uses GETDEL for atomicity (Redis 6.2+). Falls back to a Lua script on
-    older Redis to avoid a TOCTOU race where two concurrent callbacks could
-    both see the key before either deletes it.
-    """
-    key = f"oauth_state:{state}"
-    try:
-        result = await redis.getdel(key)
-    except Exception:
-        _LUA = (
-            "local v = redis.call('GET', KEYS[1]); "
-            "if v then redis.call('DEL', KEYS[1]) end; "
-            "return v"
-        )
-        result = await redis.eval(_LUA, 1, key)
-    return bool(result)
-
-
-# ── OAuth session cache (duplicate-callback resilience) ────────────────────
-
-async def save_oauth_session(redis: Redis, state: str, session_id: str, ttl: int = 1800) -> None:
-    """Cache the session_id that resulted from an OAuth callback.
-
-    Browsers (speculative prefetch, proxy retries) sometimes fire the
-    callback URL twice: the first request consumes the OAuth state, and
-    when the *real* navigation arrives the state is gone, but the session
-    was already created by the first request.  This cache lets the
-    duplicate callback recover the session_id and re-set the cookie
-    instead of bouncing the user back to the login page.  TTL covers the
-    full OAuth state lifetime (a prefetch can land minutes before the
-    real navigation, e.g. while the user re-enters credentials after an
-    SSO session timeout); the caller's anchor cookie is the replay gate.
-    """
-    await redis.setex(f"oauth_session:{state}", ttl, session_id)
-
-
-async def get_oauth_session(redis: Redis, state: str) -> str | None:
-    """Return the cached session_id for a state, if still valid."""
-    return await redis.get(f"oauth_session:{state}")
-
-
-async def delete_oauth_session(redis: Redis, state: str) -> None:
-    await redis.delete(f"oauth_session:{state}")
-
-
 # ── Active users ───────────────────────────────────────────────────────────
 
 async def track_active_user(redis: Redis, user_id: str, window: int) -> None:

@@ -122,9 +122,9 @@ async def lifespan(app: FastAPI):
 
     # Fail closed on placeholder SECRET_KEYs: any publicly known value (the
     # config default and the .env.example sample both start with "change-me")
-    # would ship forgeable sessions (JWT + OAuth) and a decryptable token
-    # vault. Prefix matching catches the current placeholders and any future
-    # sample value that follows the same convention.
+    # would let anyone decrypt the token vault (user tokens / project secrets)
+    # and forge the HMAC username index. Prefix matching catches the current
+    # placeholders and any future sample value that follows the same convention.
     if settings.secret_key.startswith("change-me"):
         raise RuntimeError(
             "SECRET_KEY is still a placeholder value. Generate a strong secret "
@@ -315,12 +315,12 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Auth (public — login/callback/logout don't require a session)
+    # Auth (public — login/register/logout/me don't require a session)
     from .routers.auth import router as auth_router
     app.include_router(auth_router)
 
-    # Local username/password auth (register/login/logout) — shares the SSO
-    # Redis session + cookie, so it works alongside or instead of OAuth.
+    # Local username/password auth: the only login path. It shares the
+    # Redis session + cookie that auth_router's /api/me and logout read.
     from .routers.auth_local import router as auth_local_router
     app.include_router(auth_local_router)
 

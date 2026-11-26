@@ -19,7 +19,7 @@ _log = logging.getLogger("agents_universe.http")
 # reads are quiet, and only writes, failures and a few audited paths stay at
 # INFO. Failures are checked first, so a broken poller is still visible.
 _ALWAYS_INFO_PATHS = (
-    re.compile(r"^/auth/"),  # login / OAuth callback / logout
+    re.compile(r"^/(?:api/)?auth/"),  # login / register / logout
 )
 
 

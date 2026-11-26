@@ -3,11 +3,11 @@
 The runtime sandbox has no network and the language pack downloads grammars
 lazily at first use, so the image bakes them in from ``docker/ts-grammars/``
 (a plain ``COPY`` in the Dockerfile — the build never touches the network).
-GitHub releases is frequently unreachable from build environments, so this
-script pulls the official pack tarball through a chain of public mirrors,
-verifies its sha256 against the official manifest, and re-extracts the
-grammars the repo graph needs (``libtree_sitter_<lang>.so`` — the name the
-pack expects on Linux).
+GitHub releases is the canonical source; where it is unreachable (build
+environments behind restrictive networks) the same files are pulled through
+public mirrors. Every route is checked: the tarball sha256 is verified against
+the release manifest, and the script rewrites ``docker/ts-grammars/SHA256SUMS``
+so the committed binaries stay auditable.
 
 Usage (needs tar with zstd support — Git Bash on Windows, or any Linux):
     python scripts/fetch_ts_grammars.py
@@ -42,17 +42,20 @@ DEFAULT_LANGS = ["python", "typescript", "tsx", "javascript", "vue", "java", "cs
 # differs from the key get_language() accepts (key "csharp", module "c_sharp").
 KEY_TO_MODULE = {"csharp": "c_sharp"}
 
-# GitHub-release mirrors, tried in order before the direct URL. Public
-# proxies for github.com/release assets; swap freely if one goes away.
+# Fallback routes, tried in order AFTER the official release URL. Public
+# proxies for github.com/release assets; swap freely if one goes away. The
+# sha256 check is what makes a mirror safe to use — a tampered tarball is
+# rejected regardless of which route delivered it.
 MIRRORS = ["https://ghfast.top", "https://gh-proxy.com", "https://ghproxy.net"]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = REPO_ROOT / "docker" / "ts-grammars"
+SUMS_FILE = OUT_DIR / "SHA256SUMS"
 
 
 def _candidates(path: str) -> list[str]:
     url = f"{BASE_URL}/{path}"
-    return [f"{mirror}/{url}" for mirror in MIRRORS] + [url]
+    return [url] + [f"{mirror}/{url}" for mirror in MIRRORS]
 
 
 def _fetch(path: str, expected_sha: str | None, workdir: Path) -> Path:
@@ -112,6 +115,15 @@ def main() -> int:
             dst = OUT_DIR / f"libtree_sitter_{module}.so"
             dst.write_bytes(src.read_bytes())
             print(f"vendored {dst.relative_to(REPO_ROOT)} ({dst.stat().st_size} bytes)")
+
+        # Keep the audit trail in sync with whatever is on disk (including
+        # grammars not part of this run, so a partial refresh never drops them).
+        sums = []
+        for so in sorted(OUT_DIR.glob("libtree_sitter_*.so")):
+            digest = hashlib.sha256(so.read_bytes()).hexdigest()
+            sums.append(f"{digest}  {so.name}\n")
+        SUMS_FILE.write_text("".join(sums), encoding="utf-8")
+        print(f"wrote {SUMS_FILE.relative_to(REPO_ROOT)} ({len(sums)} entries)")
     return 0
 
 

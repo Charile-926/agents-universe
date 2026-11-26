@@ -131,33 +131,15 @@ class Settings(BaseSettings):
     auth_bypass_enabled: bool = False
     auth_bypass_user_id: str = "SYSTEM"
 
-    # OAuth SSO — only the domain/issuer is needed; endpoints are discovered via OIDC
-    oauth_sso_domain: str = ""  # must expose /.well-known/openid-configuration
-    oauth_client_id: str = ""
-    oauth_client_secret: str = ""
-    oauth_redirect_uri: str = "http://localhost:8000/auth/callback"
-    oauth_acr_values: str = ""
-    oauth_scope: str = "openid profile email"
-    # OIDC discovery/token-exchange/revocation calls hardcoded
-    # verify=False. Self-hosted SSO (Keycloak, Casdoor) often uses
-    # self-signed certs, so the default stays False — production can
-    # enforce real TLS verification via this flag.
-    oauth_ssl_verify: bool = False
-    # None → derived from web_base_url (https ⇒ Secure cookie). Explicit
-    # true/false overrides. Defaulting to False leaks the session cookie over
-    # plaintext on HTTPS deployments .
-    oauth_secure_cookie: bool | None = None
-    # Lifetime of the OAuth state nonce, the duplicate-callback recovery cache,
-    # and the signed anchor cookie. All three must outlive a full login
-    # round-trip: a user can sit on the SSO page (or the api container can
-    # restart mid-login) long past 10 minutes, and an expired state bounces
-    # them back to the login page instead of signing them in.
-    oauth_state_ttl: int = 1800
+    # Cookie 安全属性：None → 由 web_base_url 推导（https ⇒ Secure cookie）。
+    # 显式 true/false 覆盖推导结果。会话是 Redis + HttpOnly 不透明 Cookie，
+    # 没有 JWT / OAuth 状态需要签名。
+    cookie_secure_override: bool | None = None
 
     @property
     def cookie_secure(self) -> bool:
-        if self.oauth_secure_cookie is not None:
-            return self.oauth_secure_cookie
+        if self.cookie_secure_override is not None:
+            return self.cookie_secure_override
         return self.web_base_url.startswith("https://")
 
     # Session (Redis-backed)

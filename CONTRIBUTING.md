@@ -25,7 +25,7 @@ Agents Universe 部署在 [agents-universe.com](https://agents-universe.com)，�
 3. **配置 Git Token** — Settings 中添加你自己的 Git Token（支持 GitHub Enterprise 自定义端点），提交以你的身份、进入你授权的仓库
 4. **聊天驱动开发** — 创建或加入项目，用自然语言向 **Product Owner** 描述需求，再让 **Tech Lead** 动手：读代码、写实现、跑测试、提交 commit 并创建 Pull Request
 
-**欢迎修复 bug 和提交小修改** — 遇到 bug、文档笔误、体验问题，不必自己动手：直接把这些需求告诉 Product Owner 和 Tech Lead，由智能体修复并提交 PR；也可以在 [Issues](https://github.com/agents-universe/agents-universe/issues) 里提出来，方便维护者跟进。
+**欢迎修复 bug 和提交小修改** — 遇到 bug、文档笔误、体验问题，不必自己动手：直接把这些需求告诉 Product Owner 和 Tech Lead，由智能体修复并提交 PR；也可以在 [上游 Issues](https://github.com/agents-universe/agents-universe/issues) 里提出来，方便维护者跟进。
 
 > 💡 传统开源贡献流程是 fork → clone → 写代码 → PR；在这里，它变成了一段对话。你负责提需求和评审，代码交给智能体。下面的章节是给想深入开发的人准备的。
 
@@ -52,7 +52,7 @@ docker compose up -d postgres redis
 # 环境变量：cp .env.example .env，生成 SECRET_KEY（同上），
 # 并把 PROJECTS_ROOT 设为已存在的绝对路径
 
-# API (packages/api/)
+# API (packages/api/) — 需要 Python ≥ 3.12
 cd packages/api
 python -m venv .venv && source .venv/bin/activate   # Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ../agent-core -e .
@@ -60,7 +60,7 @@ PYTHONPATH=src python -m uvicorn api.main:app --port 8000 --reload
 
 # Frontend (packages/web/)
 cd packages/web
-npm install
+npm ci
 npm run dev
 
 # 数据库迁移 (packages/api/；API 启动时也会自动执行)
@@ -92,6 +92,6 @@ pre-commit install
 
 1. **不提交任何秘密** — API Key、令牌、域名、内部路径只进 `.env`（已被 gitignore），提交前检查 diff；域名与提交身份另由 pre-commit 与 CI 的 `hygiene` 检查自动拦截
 2. **知识文件用 `[[slug]]` 交叉引用**，不要复制粘贴内容
-3. **DB 主键始终 `UNIQUEIDENTIFIER`**，不用 `IDENTITY`
-4. **SQL Server 驱动用 `mssql+aioodbc`**，不用 `pymssql`
+3. **DB 主键始终 `String(36)` + 客户端 `uuid4()`**（`models/_compat.py:new_uuid`），不用自增、`IDENTITY` 或 `NEWID()`；新迁移必须在 PostgreSQL（默认）/ MySQL / SQLite / SQL Server（遗留）上都能执行
+4. **SQL Server 驱动用 `mssql+aioodbc`**（迁移用 `mssql+pyodbc`），不用 `pymssql`；非 SQL Server 部署不要引入 T-SQL 专属写法
 5. **项目隔离** — 所有知识查询限定 `project_id` 作用域，禁止跨项目访问
