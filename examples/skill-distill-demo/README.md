@@ -1,12 +1,12 @@
 # 五个公共项目 · 前提信息补全与「炼化 Skill」实战
 
-本目录是一次完整的演练产物：先给线上实例里的五个公共项目补齐背景、数据与前提约束，再选其中一个项目模拟一段真实技术人员与 Tech Lead 智能体的多轮对话，最后用平台的「炼化 Skill」能力把对话提炼成一个可复用的项目 Skill。
+本目录是一次完整的演练产物：先给演示实例里的五个公共项目补齐背景、数据与前提约束，再选其中一个项目模拟一段真实技术人员与 Tech Lead 智能体的多轮对话，最后用平台的「炼化 Skill」能力把对话提炼成一个可复用的项目 Skill。
 
 > 所有公司、指标、订单号、故障数据均为**模拟数据**，仅用于演练；真实业务以项目最新知识库为准。
 
 ## 一、五个公共项目
 
-线上实例：<http://8.217.209.59:8000>（账号 `123`）。五个项目均已在实例中补全 `knowledge/domain/context.md` 与新增的 `knowledge/domain/project-brief.md`。
+以下五个项目来自一个演示实例；示例本身不包含实例地址、账号或密码。五个项目均已补全 `knowledge/domain/context.md` 与新增的 `knowledge/domain/project-brief.md`。
 
 | # | 项目 | 分类 | 一句话背景 | 本地前提信息包 |
 | --- | --- | --- | --- | --- |
@@ -18,15 +18,15 @@
 
 每个信息包都包含：项目背景、业务目标与成功标准、范围与边界、用户与角色、核心流程/状态机、数据与容量基线、核心表与接口、技术栈、非功能指标、已知风险、验收关注点、给智能体的前提假设。
 
-### 线上写入清单
+### 写入演示项目的内容
 
-| 项目 | project_id | 写入内容 |
-| --- | --- | --- |
-| 电商商城系统 | `404a63fd-22ac-4183-9656-8311e69337bc` | `knowledge/domain/context.md`、`knowledge/domain/project-brief.md`、`knowledge/technical/technical-stack.md`、`knowledge/technical/api-map.md`、`skills/domain/ecommerce-oversell-incident-response.md`、`docs/conversation-2026-11-11-oversell.md` |
-| CRM 客户管理系统 | `43905d5f-dfc8-41d3-aecd-9916b4d75301` | `knowledge/domain/context.md`、`knowledge/domain/project-brief.md` |
-| 数据分析看板 | `963d871f-a67b-4a75-a9db-f94bbe037f84` | `knowledge/domain/context.md`、`knowledge/domain/project-brief.md` |
-| 智能客服助手 | `ea5c047d-72a9-4cc4-8a72-676fc39560ca` | `knowledge/domain/context.md`、`knowledge/domain/project-brief.md` |
-| 企业官网改版 | `6197e45b-94c6-4140-88ec-ffb355d7cb3d` | `knowledge/domain/context.md`、`knowledge/domain/project-brief.md` |
+| 项目 | 写入内容 |
+| --- | --- |
+| 电商商城系统 | `knowledge/domain/context.md`、`knowledge/domain/project-brief.md`、`knowledge/technical/technical-stack.md`、`knowledge/technical/api-map.md`、`skills/domain/ecommerce-oversell-incident-response.md`、`docs/conversation-2026-11-11-oversell.md` |
+| CRM 客户管理系统 | `knowledge/domain/context.md`、`knowledge/domain/project-brief.md` |
+| 数据分析看板 | `knowledge/domain/context.md`、`knowledge/domain/project-brief.md` |
+| 智能客服助手 | `knowledge/domain/context.md`、`knowledge/domain/project-brief.md` |
+| 企业官网改版 | `knowledge/domain/context.md`、`knowledge/domain/project-brief.md` |
 
 ## 二、选中的项目与对话
 
@@ -67,24 +67,24 @@
 
 与草稿相比，精炼版新增了：check-then-act 判定表、原子扣减 SQL、两个唯一键、Redis Lua、热点分段、补偿/释放、MQ 幂等四件套、四层验证、灰度回滚顺序、复盘模板。
 
-### 3. 已写入线上项目
+### 3. 写回演示项目
 
 - `skills/domain/ecommerce-oversell-incident-response.md`（项目 Skill，Tech Lead 在本项目对话中可被触发词或 `/domain/ecommerce-oversell-incident-response` 加载）
 - `docs/conversation-2026-11-11-oversell.md`（对话记录，供复盘与审计）
 
 Skill 已用 `agent_core.skills.loader.load_skill` 校验：slug、type、双语 description、triggers、tools 均可解析。
 
-### 写入后校验
+### 校验结果
 
 - 五个项目的知识列表均出现 `domain/context`（标题为「项目背景：项目名」）与 `domain/project-brief`（标题为「项目前提信息：项目名」）。
 - 完整度分数（`GET /api/projects/{id}/knowledge`）示例：电商 `domain/context` 61.1、`domain/project-brief` 86.4；其余项目 brief 80.6–84.5，均从 0 提升。
-- 项目 Skill 与本地文件 sha256 一致：`9c4ad6081df6627f2c4731bf6b0e87e3bcfaba4da46b2d809a20b1ad86aaec8c`（12,575 bytes）。
+- 项目 Skill 文件 sha256：`9c4ad6081df6627f2c4731bf6b0e87e3bcfaba4da46b2d809a20b1ad86aaec8c`（12,575 bytes）。
 - Skill 已用 `agent_core.skills.loader.load_skill` 校验：slug、type、双语 description、triggers、tools 均可解析。
 
 ## 四、目录结构
 
 ```
-deliverables/skill-distill-demo/
+examples/skill-distill-demo/
 ├── README.md
 ├── projects/
 │   ├── 01-ecommerce.md
@@ -102,13 +102,13 @@ deliverables/skill-distill-demo/
 
 ## 五、使用建议
 
-1. 在线上实例打开「电商商城系统」→「知识」，可看到 `domain/context` 与 `domain/project-brief` 已补全，完整度分数上升。
+1. 在演示实例打开「电商商城系统」→「知识」，可看到 `domain/context` 与 `domain/project-brief` 已补全，完整度分数上升。
 2. 新建对话选择 Tech Lead，说「大促库存超卖怎么排查」，触发词会命中新 Skill；也可输入 `/domain/ecommerce-oversell-incident-response` 显式加载。
 3. 下次大促前，按 Skill 的 S5 四层验证跑一遍：数据对账 → 并发正确性 → 故障注入 → 大促演练。
 4. 如果要继续炼化其他项目：CRM 适合沉淀「线索去重与权限审计」，看板适合「指标口径对账」，客服适合「政策依据与转人工」，官网适合「性能与 SEO 验收」。
 
 ## 六、说明与边界
 
-- 线上实例的「炼化 Skill」页面只读取数据库中的真实会话；本次对话是模拟记录，因此草稿由平台同一套 `_build_skill` 算法在本地复现生成，最终 Skill 再人工精炼。这样既保留了平台的提炼口径，也避免把模拟数据写进真实会话库。
+- 演示实例的「炼化 Skill」页面只读取数据库中的真实会话；本次对话是模拟记录，因此草稿由平台同一套 `_build_skill` 算法在本地复现生成，最终 Skill 再人工精炼。这样既保留了平台的提炼口径，也避免把模拟数据写进真实会话库。
 - 五个项目的前提信息包是「补全」而非「覆盖真实业务」：所有数字都带「模拟」标记，真实使用时请用项目实际数据替换。
-- 写入线上实例的内容仅限这五个公共项目的知识文件、一个项目 Skill 和一份对话记录，未改动其他项目或账号数据。
+- 写入演示实例的内容仅限这五个公共项目的知识文件、一个项目 Skill 和一份对话记录，未改动其他项目或账号数据。
